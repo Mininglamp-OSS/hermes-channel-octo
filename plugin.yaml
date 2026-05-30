@@ -1,0 +1,38 @@
+name: octo
+label: Octo
+kind: platform
+version: 0.1.0
+description: >
+  Octo (WuKongIM-based) gateway adapter for Hermes Agent.
+  Connects via WebSocket binary protocol with ECDH+AES encryption,
+  enabling bot-to-user and bot-to-group messaging, threads,
+  @mentions, voice/video/file attachments, and streaming responses.
+author: Mininglamp
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: OCTO_API_URL
+    description: "Octo bot API base URL (e.g. https://api.botgate.cn)"
+    prompt: "Octo API URL"
+    password: false
+  - name: OCTO_BOT_TOKEN
+    description: "Octo bot authentication token"
+    prompt: "Octo Bot Token"
+    password: true
+optional_env:
+  - name: OCTO_CDN_URL
+    description: "Optional CDN prefix for media acceleration"
+    prompt: "CDN URL (optional)"
+    password: false
+  - name: OCTO_ALLOWED_USERS
+    description: "Comma-separated Octo user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: OCTO_ALLOW_ALL_USERS
+    description: "Allow any Octo user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: OCTO_HOME_CHANNEL
+    description: "Default group/chat ID for cron / notification delivery"
+    prompt: "Home channel (or empty)"
+    password: false

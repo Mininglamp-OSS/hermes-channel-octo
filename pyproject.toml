@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-channel-octo"
+version = "0.1.0"
+description = "Octo (WuKongIM-based corporate IM) channel plugin for hermes-agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Mininglamp-OSS" }]
+keywords = ["hermes-agent", "hermes", "plugin", "octo", "wukongim", "im", "chatbot"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  # Floor follows hermes-agent's pre-1.0 ceiling rule: <0.(current_minor + 2).
+  # Current minor at split time = 0.14, so ceiling = 0.16. Floor = 0.14 (lowest
+  # version where BasePlatformAdapter, register_platform / register_tool /
+  # register_skill plugin-context APIs are stable, as consumed by the SimpleX
+  # plugin in v2026.5.16).
+  "hermes-agent>=0.14,<0.16",
+  # Octo runtime deps. Floor = current pinned upstream version (known-good);
+  # ceiling = next major (SemVer-respecting libraries).
+  "websockets>=15.0,<16",
+  "aiohttp>=3.13,<4",
+  "cryptography>=46.0,<47",
+  # Required by ``websockets`` when the runtime declares a SOCKS proxy via
+  # ALL_PROXY / HTTPS_PROXY env vars; without it ``websockets.connect``
+  # raises ``ImportError: python-socks is required to use a SOCKS proxy``.
+  "python-socks>=2.8,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0,<10",
+  "pytest-asyncio>=1.3,<2",
+  "pytest-timeout>=2.4,<3",
+  "ruff>=0.15,<0.16",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+# Entry-point target must be the MODULE (not module:register) — hermes_cli's
+# discovery does ep.load() and then looks up `register` as an attribute on the
+# loaded object. Pointing at `:register` would resolve to the function itself,
+# at which point getattr(fn, "register", None) is None and discovery skips us
+# with "Plugin 'octo' has no register() function".
+octo = "hermes_octo_plugin"
+
+[project.urls]
+Homepage = "https://github.com/Mininglamp-OSS/hermes-channel-octo"
+Issues = "https://github.com/Mininglamp-OSS/hermes-channel-octo/issues"
+Source = "https://github.com/Mininglamp-OSS/hermes-channel-octo"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Without this, setuptools' src-layout package finder ships ONLY *.py files,
+# silently dropping plugin.yaml (read by hermes_cli's env-var prompt injector)
+# and the bundled octo-bot-api skill tree (resolved at runtime via
+# Path(__file__).parent / "skills" / ...). Both files live next to the .py
+# modules in the source tree but vanish from the wheel without this stanza.
+hermes_octo_plugin = ["plugin.yaml", "skills/**/*"]
+
+[tool.ruff]
+preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
+
+[tool.ruff.lint]
+# Mirrors hermes-agent upstream: only PLW1514 enforced. Bare open() /
+# read_text() / write_text() in text mode defaults to the system locale
+# encoding on Windows (cp1252 on US-locale installs), silently corrupting
+# non-ASCII content. Everything else is intentionally disabled.
+select = ["PLW1514"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can intentionally exercise locale-encoding edge cases.
+"tests/**" = ["PLW1514"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
