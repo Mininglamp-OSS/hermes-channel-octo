@@ -3014,7 +3014,7 @@ def register(ctx) -> None:
             )
             ctx.register_tool(
                 name="octo_management",
-                toolset="hermes-octo",
+                toolset="octo",
                 schema=TOOL_SCHEMA,
                 handler=octo_management_handler,
                 check_fn=check_octo_requirements,

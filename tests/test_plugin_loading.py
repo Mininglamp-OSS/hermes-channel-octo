@@ -108,7 +108,7 @@ def test_register_with_env_wires_full_surface(monkeypatch):
     assert len(ctx.tools) == 1
     tool = ctx.tools[0]
     assert tool["name"] == "octo_management"
-    assert tool["toolset"] == "hermes-octo"
+    assert tool["toolset"] == "octo"
     assert tool["is_async"] is True
     assert callable(tool["handler"])
 
