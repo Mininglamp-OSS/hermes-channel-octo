@@ -10,4 +10,4 @@ from .adapter import OctoAdapter, register
 from .types import ChannelType, MessageType
 
 __all__ = ["OctoAdapter", "register", "ChannelType", "MessageType"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"
