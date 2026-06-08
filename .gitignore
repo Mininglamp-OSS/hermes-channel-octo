@@ -36,3 +36,6 @@ Thumbs.db
 # Hermes runtime artifacts
 .hermes/
 *.log
+
+# Local Claude Code workspace (skills / worktrees / settings — never push)
+.claude/
