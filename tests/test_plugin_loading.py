@@ -156,3 +156,107 @@ def test_platform_enum_resolves_octo():
 
     p = Platform("octo")
     assert p.value == "octo"
+
+
+# ---------- Regression: issue #2 — toolset fallback must wire core tools ----------
+
+
+def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
+    """Regression for issue #2 (https://github.com/Mininglamp-OSS/hermes-channel-octo/issues/2).
+
+    The plugin's ``octo_management`` tool MUST be registered with
+    ``toolset="octo"`` (the bare platform name), not ``"hermes-octo"``.
+
+    Background: hermes-agent's ``resolve_toolset("hermes-<platform>")`` only
+    injects ``_HERMES_CORE_TOOLS`` via a fallback branch in ``toolsets.py`` —
+    and that fallback is only reached when ``get_toolset("hermes-<platform>")``
+    returns None. If the plugin self-registers a tool with
+    ``toolset="hermes-octo"``, ``get_toolset`` finds a matching plugin toolset,
+    short-circuits the fallback, and the agent ends up with only the
+    plugin-registered tool (no core tools at all).
+
+    This test wires the plugin directly into the real hermes-agent registry
+    (bypassing the entry-point discovery that's unreliable in test envs),
+    then asserts ``resolve_toolset("hermes-octo")`` returns both core tools
+    and ``octo_management``. If anyone reverts adapter.py's tool registration
+    back to ``toolset="hermes-octo"`` (or any non-"octo" string), this test
+    fails immediately.
+
+    Skipped if hermes-agent is not installed (e.g. when running just unit
+    tests in isolation).
+    """
+    try:
+        from gateway.platform_registry import platform_registry  # type: ignore
+        from tools.registry import registry  # type: ignore
+        from toolsets import _HERMES_CORE_TOOLS, resolve_toolset  # type: ignore
+    except ImportError:
+        pytest.skip("hermes-agent not installed in this test environment")
+
+    monkeypatch.setenv("OCTO_API_URL", "http://localhost:1")
+    monkeypatch.setenv("OCTO_BOT_TOKEN", "test-token")
+
+    # Use the plugin's real register() against a context that bridges into
+    # the actual hermes-agent registry / platform_registry. We mirror the
+    # same shim hermes_cli.plugins uses internally, but inline so the test
+    # doesn't depend on entry-point discovery (which is flaky across
+    # editable / wheel install layouts in test environments).
+    captured_platforms: list[dict] = []
+    captured_tools: list[dict] = []
+
+    class _RealCtx:
+        def register_platform(self, **kwargs):
+            captured_platforms.append(kwargs)
+            # Minimal entry shim — platform_registry only needs ``name``
+            # for is_registered() lookup, which is what resolve_toolset's
+            # fallback branch checks.
+            from types import SimpleNamespace
+            platform_registry._entries[kwargs["name"]] = SimpleNamespace(
+                name=kwargs["name"], **{k: v for k, v in kwargs.items() if k != "name"}
+            )
+
+        def register_tool(self, **kwargs):
+            captured_tools.append(kwargs)
+            registry.register(
+                name=kwargs["name"],
+                toolset=kwargs["toolset"],
+                schema=kwargs.get("schema"),
+                handler=kwargs.get("handler"),
+                is_async=kwargs.get("is_async", False),
+            )
+
+        def register_skill(self, **kwargs):
+            pass  # not exercised by this test
+
+        def register_command(self, name, **kwargs):
+            pass  # not exercised by this test
+
+    try:
+        hermes_octo_plugin.register(_RealCtx())
+
+        # Sanity: the plugin actually registered both pieces.
+        assert any(p["name"] == "octo" for p in captured_platforms)
+        assert any(t["name"] == "octo_management" for t in captured_tools)
+        assert platform_registry.is_registered("octo")
+        assert "octo_management" in registry._tools
+
+        resolved = set(resolve_toolset("hermes-octo"))
+
+        # Must contain octo_management (the plugin-specific tool).
+        assert "octo_management" in resolved, (
+            "octo_management missing from resolve_toolset('hermes-octo'); "
+            "check that adapter.py registers it with toolset='octo' (issue #2)"
+        )
+
+        # Must contain the full core toolset — if even one is missing, the
+        # fallback was bypassed and we've regressed issue #2.
+        missing_core = set(_HERMES_CORE_TOOLS) - resolved
+        assert not missing_core, (
+            f"_HERMES_CORE_TOOLS missing from resolve_toolset('hermes-octo'): "
+            f"{sorted(missing_core)[:5]}... — fallback in toolsets.py was "
+            f"bypassed, likely because octo_management was registered with "
+            f"toolset='hermes-octo' instead of 'octo' (issue #2)"
+        )
+    finally:
+        # Clean up so we don't leak global registry state into other tests.
+        registry._tools.pop("octo_management", None)
+        platform_registry._entries.pop("octo", None)
