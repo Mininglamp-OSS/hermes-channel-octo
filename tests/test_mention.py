@@ -114,6 +114,26 @@ class TestConvertContentForLLM:
         result = convert_content_for_llm(content, mention)
         assert result == "@[uid1:张三] 你好"
 
+    @pytest.mark.parametrize(
+        "bad_content",
+        [
+            [{"type": "text", "value": "hi"}],  # rich-text / multipart list payload
+            {"type": "text", "value": "hi"},
+            123,
+            None,
+        ],
+    )
+    def test_non_string_content_returns_empty_without_raising(self, bad_content, caplog):
+        # Regression: Octo history API can surface ``content`` as a non-str
+        # (rich-text payloads come back as ``list``). The pre-fix behavior
+        # raised ``TypeError`` inside ``re.finditer`` and the receive loop
+        # swallowed the entire frame, silently dropping the user's @mention.
+        mention = MentionPayload(uids=["uid1"])
+        with caplog.at_level("WARNING"):
+            result = convert_content_for_llm(bad_content, mention, {"Alice": "uid1"})
+        assert result == ""
+        assert any("non-string content" in r.message for r in caplog.records)
+
 
 class TestBuildEntitiesFromFallback:
     def test_basic(self):
@@ -148,6 +168,25 @@ class TestBuildEntitiesFromFallback:
         assert entities[0].offset == 6
         assert entities[0].length == 6  # "@Alice"
         assert entities[0].uid == "uid1"
+
+    @pytest.mark.parametrize(
+        "bad_content",
+        [
+            [{"type": "text", "value": "hi"}],
+            {"type": "text", "value": "hi"},
+            42,
+            None,
+        ],
+    )
+    def test_non_string_content_returns_empty_without_raising(self, bad_content, caplog):
+        # Regression: mirror of the convert_content_for_llm guard. Both functions
+        # call ``MENTION_PATTERN.finditer(content)`` and must tolerate non-str
+        # inputs the same way so neither path crashes the receive loop.
+        with caplog.at_level("WARNING"):
+            entities, uids = build_entities_from_fallback(bad_content, {"Alice": "uid1"})
+        assert entities == []
+        assert uids == []
+        assert any("non-string content" in r.message for r in caplog.records)
 
 
 class TestMentionPattern:

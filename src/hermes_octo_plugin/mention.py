@@ -186,7 +186,20 @@ def convert_content_for_llm(
     3. no mention → return original content
 
     Replacement proceeds from back to front to avoid offset drift.
+
+    ``content`` is normally a ``str`` returned by the Octo message API. Some
+    history payloads (rich text / multipart messages) surface ``content`` as a
+    ``list`` or other non-string type; in that case we cannot meaningfully
+    rewrite @mentions, so we return an empty string and log a warning rather
+    than letting ``re.finditer`` raise ``TypeError`` and silently drop the
+    surrounding frame upstream.
     """
+    if not isinstance(content, str):
+        logger.warning(
+            "[octo] convert_content_for_llm: non-string content (type=%s); skipping mention rewrite",
+            type(content).__name__,
+        )
+        return ""
     mention = _coerce_mention(mention)
     if not mention:
         return content
@@ -288,9 +301,20 @@ def build_entities_from_fallback(
     This is the fallback path when structured @[uid:name] is not available.
     Uses longest-match-first to handle names with special characters.
 
+    Like :func:`convert_content_for_llm`, this defensively returns empty results
+    when ``content`` is not a ``str`` — some Octo payloads surface ``content``
+    as a ``list`` (rich text / multipart) and ``re.finditer`` would otherwise
+    raise ``TypeError``.
+
     Returns:
         (entities, uids) — lists of MentionEntity and corresponding UIDs.
     """
+    if not isinstance(content, str):
+        logger.warning(
+            "[octo] build_entities_from_fallback: non-string content (type=%s); returning empty",
+            type(content).__name__,
+        )
+        return [], []
     entities: list[MentionEntity] = []
     uids: list[str] = []
 
