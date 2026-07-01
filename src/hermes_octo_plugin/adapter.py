@@ -1384,7 +1384,7 @@ class OctoAdapter(BasePlatformAdapter):
         finally:
             self._connected = False
             if self._need_reconnect:
-                logger.warning("[%s] Receive loop exited — scheduling reconnect", self.name)
+                logger.debug("[%s] Receive loop exited — scheduling reconnect", self.name)
                 asyncio.create_task(self._schedule_reconnect())
 
     async def _handle_frame(self, frame: bytes) -> None:
@@ -1398,7 +1398,7 @@ class OctoAdapter(BasePlatformAdapter):
             # uid+device_flag connected (WuKongIM "kicked by another login").
             # Keep _need_reconnect=True so the bot recovers automatically once
             # the competing connection goes away.
-            logger.warning("[%s] Server sent DISCONNECT — will attempt reconnect", self.name)
+            logger.debug("[%s] Server sent DISCONNECT — will attempt reconnect", self.name)
             self._connected = False
             if self._ws:
                 try:
