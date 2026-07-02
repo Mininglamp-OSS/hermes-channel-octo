@@ -65,6 +65,21 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
+def _infer_image_mime(url: str) -> str:
+    """Derive an image MIME from a URL by extension.
+
+    Strips query/fragment before matching so ``.../foo.png?token=abc``
+    still resolves to ``image/png``. Non-image extensions and unknown
+    types fall back to ``image/jpeg`` — the caller has already
+    committed to a "this URL is an image" branch, so a JPEG guess is
+    the safest downstream (matches the pre-existing single-image path
+    and every consumer we know of gates on ``startswith("image/")``).
+    """
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    guess = api.infer_content_type(path)
+    return guess if guess.startswith("image/") else "image/jpeg"
+
+
 def redact_log(s: str) -> str:
     # Always pass force=True: octo is a safety boundary that must never
     # leak secrets into error returns / logs regardless of the user's
@@ -1588,9 +1603,23 @@ class OctoAdapter(BasePlatformAdapter):
                 or "unknown"
             )
             reply_payload = getattr(payload.reply, "payload", None)
-            reply_content = ""
+            reply_content: str = ""
             if isinstance(reply_payload, dict):
-                reply_content = reply_payload.get("content", "")
+                raw = reply_payload.get("content")
+                if isinstance(raw, str):
+                    # Legacy string-typed content (Text and older RichText):
+                    # keep the existing fast path.
+                    reply_content = raw
+                elif raw is not None:
+                    # Non-str content (e.g. RichText(=14) block array) —
+                    # never interpolate a Python list into the LLM prompt.
+                    # Reparse via MessagePayload so the same type-aware
+                    # renderer used for a live message renders the quote.
+                    try:
+                        quoted = MessagePayload.from_dict(reply_payload)
+                        reply_content = self._resolve_content(quoted)
+                    except Exception:
+                        reply_content = ""
             if reply_content:
                 reply_text = f"[Quoted message from {reply_from}]: {reply_content}"
 
@@ -1701,7 +1730,7 @@ class OctoAdapter(BasePlatformAdapter):
             _, rt_urls = self._resolve_rich_text_content(payload)
             for u in rt_urls:
                 media_urls.append(u)
-                media_types.append("image/jpeg")
+                media_types.append(_infer_image_mime(u))
             if rt_urls:
                 hermes_msg_type = MessageType.PHOTO
 
@@ -2915,8 +2944,19 @@ class OctoAdapter(BasePlatformAdapter):
             # unknown — RichText image blocks reject width/height ≤ 0
             # and would invalidate the whole payload.
             if caption and width and height:
+                # Convert @[uid:name] mentions the same way _send_normal
+                # does, so a caption "@[uid:name] look" ships as a real
+                # mention pill instead of literal template text.
+                caption_text = caption
+                send_uids: list[str] | None = None
+                send_entities: list | None = None
+                structured = parse_structured_mentions(caption)
+                if structured:
+                    caption_text, send_entities, send_uids = convert_structured_mentions(
+                        caption, structured,
+                    )
                 blocks = [
-                    RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=caption),
+                    RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=caption_text),
                     RichTextBlock(
                         type=RICH_TEXT_BLOCK_IMAGE,
                         url=final_url,
@@ -2928,7 +2968,10 @@ class OctoAdapter(BasePlatformAdapter):
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=chat_id, channel_type=channel_type,
                     blocks=blocks,
-                    plain=f"{caption}{RICH_TEXT_IMAGE_PLACEHOLDER}",
+                    plain=f"{caption_text}{RICH_TEXT_IMAGE_PLACEHOLDER}",
+                    mention_uids=send_uids,
+                    mention_entities=send_entities,
+                    reply_msg_id=reply_to,
                 )
                 return SendResult(success=True)
 
