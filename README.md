@@ -10,6 +10,14 @@ WebSocket protocol (ECDH + AES). Supports bot-to-user DMs, group
 messaging, threads, `@`-mentions, voice / video / file attachments, and
 streaming responses.
 
+## Companion X/Twitter Notifications
+
+For corporate monitoring workflows, pair Octo with
+[Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet). Hermes Tweet can
+collect the X/Twitter context inside Hermes, then Octo can route the resulting
+summary or follow-up request to a user, group, or home channel. Hermes Tweet is
+a third-party project maintained by Xquik-dev, not by Mininglamp-OSS.
+
 ## Compatibility
 
 | hermes-agent | hermes-channel-octo |
