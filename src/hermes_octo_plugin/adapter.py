@@ -53,12 +53,31 @@ from .types import (
     BotRegisterResp,
     ChannelType,
     MessagePayload,
+    RichTextBlock,
+    RICH_TEXT_BLOCK_IMAGE,
+    RICH_TEXT_BLOCK_TEXT,
+    RICH_TEXT_IMAGE_PLACEHOLDER,
 )
 from .types import (
     MessageType as OctoMessageType,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_image_mime(url: str) -> str:
+    """Derive an image MIME from a URL by extension.
+
+    Strips query/fragment before matching so ``.../foo.png?token=abc``
+    still resolves to ``image/png``. Non-image extensions and unknown
+    types fall back to ``image/jpeg`` — the caller has already
+    committed to a "this URL is an image" branch, so a JPEG guess is
+    the safest downstream (matches the pre-existing single-image path
+    and every consumer we know of gates on ``startswith("image/")``).
+    """
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    guess = api.infer_content_type(path)
+    return guess if guess.startswith("image/") else "image/jpeg"
 
 
 def redact_log(s: str) -> str:
@@ -1584,9 +1603,23 @@ class OctoAdapter(BasePlatformAdapter):
                 or "unknown"
             )
             reply_payload = getattr(payload.reply, "payload", None)
-            reply_content = ""
+            reply_content: str = ""
             if isinstance(reply_payload, dict):
-                reply_content = reply_payload.get("content", "")
+                raw = reply_payload.get("content")
+                if isinstance(raw, str):
+                    # Legacy string-typed content (Text and older RichText):
+                    # keep the existing fast path.
+                    reply_content = raw
+                elif raw is not None:
+                    # Non-str content (e.g. RichText(=14) block array) —
+                    # never interpolate a Python list into the LLM prompt.
+                    # Reparse via MessagePayload so the same type-aware
+                    # renderer used for a live message renders the quote.
+                    try:
+                        quoted = MessagePayload.from_dict(reply_payload)
+                        reply_content = self._resolve_content(quoted)
+                    except Exception:
+                        reply_content = ""
             if reply_content:
                 reply_text = f"[Quoted message from {reply_from}]: {reply_content}"
 
@@ -1687,6 +1720,19 @@ class OctoAdapter(BasePlatformAdapter):
             if url:
                 media_urls.append(url)
                 media_types.append("application/octet-stream")
+        elif payload.type == OctoMessageType.RichText:
+            # RichText(=14): one payload can carry N images interleaved
+            # with text. Collect ALL image URLs (in block order) and treat
+            # the event as PHOTO when any image is present; else TEXT.
+            # We deliberately don't stream RichText images to /tmp — a
+            # single message may carry many, and pre-download would
+            # multiply latency; agents can fetch on demand via URL.
+            _, rt_urls = self._resolve_rich_text_content(payload)
+            for u in rt_urls:
+                media_urls.append(u)
+                media_types.append(_infer_image_mime(u))
+            if rt_urls:
+                hermes_msg_type = MessageType.PHOTO
 
         # Send typing indicator (fire-and-forget)
         asyncio.create_task(self._send_typing_safe(channel_id, channel_type_enum))
@@ -2086,6 +2132,11 @@ class OctoAdapter(BasePlatformAdapter):
         if msg_type == t.MultipleForward:
             # Nested forward — recurse
             return self._resolve_multiple_forward_text(payload)
+        if msg_type == t.RichText:
+            # Nested RichText inside a forward preview — expand using the
+            # same helper so plain/blocks precedence stays consistent.
+            text, _ = self._resolve_rich_text_content(payload)
+            return text or "[图文消息]"
         return content or "[消息]"
 
     def _resolve_multiple_forward_text(self, payload: Any) -> str:
@@ -2147,6 +2198,87 @@ class OctoAdapter(BasePlatformAdapter):
                 lines.append(f"{sender_name}: {body}")
         return "\n".join(lines)
 
+    def _resolve_rich_text_content(
+        self, payload: MessagePayload | dict[str, Any]
+    ) -> tuple[str, list[str]]:
+        """Expand a RichText(=14) payload into ``(text, media_urls)``.
+
+        Mirrors the MultipleForward(=11) expansion pattern:
+          - Text: prefer top-level ``plain`` (server-authoritative rendered
+            text). Missing → walk the ``content`` block array and stitch
+            (text block → text, image block → "[图片]" placeholder).
+          - Images: always collected by walking image blocks (never
+            trust URLs embedded in ``plain``).
+
+        Also tolerates a legacy ``content`` given as a plain string,
+        which is normalized to a single text block.
+
+        Accepts both MessagePayload (top-level parsed payload) and a raw
+        dict (used from _resolve_inner_message_text / MultipleForward
+        recursion where the wire shape is still a dict).
+        """
+        if isinstance(payload, MessagePayload):
+            raw_blocks = payload.blocks
+            # Fallback: legacy servers may still send a string-typed
+            # content for a RichText message. Normalize to single text
+            # block so the rest of the pipeline is uniform.
+            if raw_blocks is None and payload.content:
+                raw_blocks = [{"type": RICH_TEXT_BLOCK_TEXT, "text": payload.content}]
+            top_plain = payload.plain
+        else:
+            raw_content = payload.get("content")
+            if isinstance(raw_content, list):
+                raw_blocks = [b for b in raw_content if isinstance(b, dict)]
+            elif isinstance(raw_content, str) and raw_content:
+                raw_blocks = [{"type": RICH_TEXT_BLOCK_TEXT, "text": raw_content}]
+            else:
+                raw_blocks = None
+            top_plain = payload.get("plain") if isinstance(payload.get("plain"), str) else None
+
+        blocks = raw_blocks or []
+
+        media_urls: list[str] = []
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            # Defensive: only collect string URLs so a malformed
+            # {type:image, url:{}} doesn't crash _build_media_url.
+            if blk.get("type") == RICH_TEXT_BLOCK_IMAGE:
+                blk_url = blk.get("url")
+                if isinstance(blk_url, str) and blk_url:
+                    full = self._build_media_url(blk_url)
+                    if full:
+                        media_urls.append(full)
+
+        if isinstance(top_plain, str) and top_plain.strip():
+            text = top_plain
+        else:
+            text = self._build_rich_text_plain(blocks)
+
+        return text, media_urls
+
+    @staticmethod
+    def _build_rich_text_plain(blocks: list[dict[str, Any]]) -> str:
+        """Stitch RichText blocks into plain text (aligns with octo-lib
+        BuildRichTextPlain): text → text, image → RICH_TEXT_IMAGE_PLACEHOLDER,
+        unknown type → text if present, else skip."""
+        out: list[str] = []
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            t = blk.get("type")
+            if t == RICH_TEXT_BLOCK_IMAGE:
+                out.append(RICH_TEXT_IMAGE_PLACEHOLDER)
+            elif t == RICH_TEXT_BLOCK_TEXT:
+                txt = blk.get("text")
+                if isinstance(txt, str):
+                    out.append(txt)
+            else:
+                txt = blk.get("text")
+                if isinstance(txt, str) and txt:
+                    out.append(txt)
+        return "".join(out)
+
     def _resolve_content(self, payload: MessagePayload) -> str:
         """Resolve message payload to display text.
 
@@ -2181,6 +2313,9 @@ class OctoAdapter(BasePlatformAdapter):
             return f"[名片: {payload.name or '未知'}]"
         elif payload.type == OctoMessageType.MultipleForward:
             return self._resolve_multiple_forward_text(payload)
+        elif payload.type == OctoMessageType.RichText:
+            text, _ = self._resolve_rich_text_content(payload)
+            return text or "[图文消息]"
         else:
             return payload.content or ""
 
@@ -2800,6 +2935,45 @@ class OctoAdapter(BasePlatformAdapter):
                 except Exception as upload_err:
                     logger.warning("[%s] Image upload failed, using URL directly: %s",
                                    self.name, upload_err)
+
+            # With a caption AND known dimensions, ship as a single
+            # RichText(=14) payload so the image and caption arrive
+            # atomically (aligns with octo-lib's rich-text contract,
+            # matches openclaw-channel-octo). Fall back to the legacy
+            # "Image + separate Text message" path when dimensions are
+            # unknown — RichText image blocks reject width/height ≤ 0
+            # and would invalidate the whole payload.
+            if caption and width and height:
+                # Convert @[uid:name] mentions the same way _send_normal
+                # does, so a caption "@[uid:name] look" ships as a real
+                # mention pill instead of literal template text.
+                caption_text = caption
+                send_uids: list[str] | None = None
+                send_entities: list | None = None
+                structured = parse_structured_mentions(caption)
+                if structured:
+                    caption_text, send_entities, send_uids = convert_structured_mentions(
+                        caption, structured,
+                    )
+                blocks = [
+                    RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=caption_text),
+                    RichTextBlock(
+                        type=RICH_TEXT_BLOCK_IMAGE,
+                        url=final_url,
+                        width=width,
+                        height=height,
+                    ),
+                ]
+                await api.send_rich_text_message(
+                    self._http_session, self._api_url, self._bot_token,
+                    channel_id=chat_id, channel_type=channel_type,
+                    blocks=blocks,
+                    plain=f"{caption_text}{RICH_TEXT_IMAGE_PLACEHOLDER}",
+                    mention_uids=send_uids,
+                    mention_entities=send_entities,
+                    reply_msg_id=reply_to,
+                )
+                return SendResult(success=True)
 
             await api.send_media_message(
                 self._http_session, self._api_url, self._bot_token,

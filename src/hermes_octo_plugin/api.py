@@ -27,6 +27,7 @@ from .types import (
     GroupMember,
     MentionEntity,
     MessageType,
+    RichTextBlock,
 )
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,71 @@ async def send_media_message(
         "channel_type": channel_type,
         "payload": payload,
     })
+
+
+async def send_rich_text_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    channel_id: str,
+    channel_type: ChannelType,
+    blocks: list[RichTextBlock],
+    plain: str | None = None,
+    mention_uids: list[str] | None = None,
+    mention_entities: list[MentionEntity] | None = None,
+    mention_all: bool = False,
+    reply_msg_id: str | None = None,
+) -> None:
+    """
+    Send a RichText(=14) 图文混排 message.
+
+    Replaces the "text sendMessage + loop uploadMedia" pattern with a
+    single POST carrying an ordered ``content`` block array — the caller
+    uploads images first (to obtain url + width + height), assembles a
+    mix of text and image blocks in display order, and passes them here.
+
+    Contract (see octo-lib common/richtext.go):
+      - `blocks` MUST be non-empty; text blocks require non-empty `text`,
+        image blocks require http/https `url` and positive `width`/`height`.
+        Validation is enforced by octo-server; this function only assembles.
+      - `plain` is an optional redundant plain-text rendering for legacy
+        clients; the server regenerates it authoritatively from `content`.
+
+    Args:
+        blocks: Ordered RichText block list (text/image interleaved).
+        plain: Optional redundant plain-text (server-overridden).
+        mention_uids/mention_entities/mention_all: Same shape as send_message.
+        reply_msg_id: Optional message ID to reply to.
+    """
+    payload: dict[str, Any] = {
+        "type": MessageType.RichText,
+        "content": [b.to_dict() for b in blocks],
+    }
+    if plain is not None:
+        payload["plain"] = plain
+
+    if mention_uids or mention_entities or mention_all:
+        mention: dict[str, Any] = {}
+        if mention_uids:
+            mention["uids"] = mention_uids
+        if mention_entities:
+            mention["entities"] = [
+                {"uid": e.uid, "offset": e.offset, "length": e.length}
+                for e in mention_entities
+            ]
+        if mention_all:
+            mention["all"] = 1
+        payload["mention"] = mention
+
+    if reply_msg_id:
+        payload["reply"] = {"message_id": reply_msg_id}
+
+    body: dict[str, Any] = {
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "payload": payload,
+    }
+    await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", body)
 
 
 async def send_read_receipt(
