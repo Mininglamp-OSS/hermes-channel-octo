@@ -39,8 +39,11 @@ class TestMessageType:
     def test_file(self):
         assert MessageType.File == 8
 
+    def test_rich_text(self):
+        assert MessageType.RichText == 14
+
     def test_all_types(self):
-        expected = {1, 2, 3, 4, 5, 6, 7, 8, 11}
+        expected = {1, 2, 3, 4, 5, 6, 7, 8, 11, 14}
         actual = {mt.value for mt in MessageType}
         assert actual == expected
 

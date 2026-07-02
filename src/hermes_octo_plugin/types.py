@@ -30,6 +30,58 @@ class MessageType(IntEnum):
     Card = 7
     File = 8
     MultipleForward = 11
+    # 图文混排 (rich text). Contract defined by octo-lib
+    # common/richtext.go — payload.content carries an ordered array of
+    # {type:text|image} blocks. Field names must match octo-lib.
+    RichText = 14
+
+
+# RichText(=14) block type constants (aligned with octo-lib
+# RichTextBlockText / RichTextBlockImage).
+RICH_TEXT_BLOCK_TEXT = "text"
+RICH_TEXT_BLOCK_IMAGE = "image"
+
+# Placeholder injected when rendering a RichText image block as plain text
+# (aligned with octo-lib RichTextImagePlaceholder).
+RICH_TEXT_IMAGE_PLACEHOLDER = "[图片]"
+
+
+@dataclass
+class RichTextBlock:
+    """One block inside a RichText(=14) `content` array.
+
+    - type=text  → `text` (non-empty)
+    - type=image → `url` (http/https), `width` and `height` (px, > 0),
+                   `size` and `name` optional
+
+    Server-side validation lives in octo-lib; this dataclass only carries
+    the fields. Do NOT introduce `entities`/`offset`/`length` here — the
+    RichText contract is deliberately positional, not offset-based.
+    """
+    type: str
+    text: str | None = None
+    url: str | None = None
+    width: int | None = None
+    height: int | None = None
+    size: int | None = None
+    name: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the wire dict. Omits None-valued fields."""
+        out: dict[str, Any] = {"type": self.type}
+        if self.text is not None:
+            out["text"] = self.text
+        if self.url is not None:
+            out["url"] = self.url
+        if self.width is not None:
+            out["width"] = self.width
+        if self.height is not None:
+            out["height"] = self.height
+        if self.size is not None:
+            out["size"] = self.size
+        if self.name is not None:
+            out["name"] = self.name
+        return out
 
 
 @dataclass
@@ -75,12 +127,21 @@ class MessagePayload:
     mention: MentionPayload | None = None
     reply: ReplyPayload | None = None
     event: dict[str, Any] | None = None
+    # RichText(=14) only — ordered block array. Populated when the wire
+    # `content` field is a list; text/other message types leave this None.
+    blocks: list[dict[str, Any]] | None = None
+    # RichText(=14) only — top-level `plain` string (server-authoritative
+    # rendered text). None on other message types or when absent.
+    plain: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MessagePayload:
         """Parse a MessagePayload from a raw dict (e.g. from JSON)."""
-        known_keys = {"type", "content", "url", "name", "mention", "reply", "event"}
+        known_keys = {
+            "type", "content", "url", "name",
+            "mention", "reply", "event", "plain",
+        }
         extra = {k: v for k, v in data.items() if k not in known_keys}
 
         mention = None
@@ -116,14 +177,31 @@ class MessagePayload:
         except ValueError:
             msg_type = MessageType.Text
 
+        # RichText(=14): wire `content` is a list of blocks, and `plain`
+        # is a top-level string. Legacy string-typed `content` on RichText
+        # (old server or forward preview) is normalized into a single text
+        # block downstream — here we just keep raw shapes intact.
+        raw_content = data.get("content")
+        blocks: list[dict[str, Any]] | None = None
+        content_str: str | None = None
+        if isinstance(raw_content, list):
+            blocks = [b for b in raw_content if isinstance(b, dict)]
+        elif isinstance(raw_content, str) or raw_content is None:
+            content_str = raw_content
+
+        plain_val = data.get("plain")
+        plain_str = plain_val if isinstance(plain_val, str) else None
+
         return cls(
             type=msg_type,
-            content=data.get("content"),
+            content=content_str,
             url=data.get("url"),
             name=data.get("name"),
             mention=mention,
             reply=reply,
             event=data.get("event"),
+            blocks=blocks,
+            plain=plain_str,
             extra=extra,
         )
 
