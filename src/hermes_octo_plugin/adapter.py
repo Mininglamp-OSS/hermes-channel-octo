@@ -1045,18 +1045,39 @@ class OctoAdapter(BasePlatformAdapter):
         size = len(self._uid_to_name)
         if size == 0:
             return ""
+        # Self-identity anchor. Without it the LLM has no way to tell which
+        # group member IS this bot — a long context plus a bare "你是谁?"
+        # then drifts to another visible bot name. Skipped when the bot
+        # hasn't finished registration yet (empty robot_id).
+        self_uid = self._robot_id
+        self_name = self._uid_to_name.get(self_uid, "") if self_uid else ""
+        identity_line = ""
+        if self_uid and self_name:
+            identity_line = (
+                f"You are {self_name} (uid={self_uid}). Messages in "
+                "[Group Chat History] / [New message] were written by "
+                "OTHER members, not by you.\n\n"
+            )
         if size <= 10:
             members = list(self._uid_to_name.items())  # (uid, name)
-            lines = "\n".join(f"  {name} ({uid})" for uid, name in members)
-            example_uid, example_name = members[0]
+            lines = "\n".join(
+                f"  {name} ({uid})" + ("  ← YOU" if uid == self_uid else "")
+                for uid, name in members
+            )
+            # Pick a non-self member for the mention example so we don't
+            # accidentally teach the LLM to @ itself.
+            example_uid, example_name = next(
+                ((uid, name) for uid, name in members if uid != self_uid),
+                members[0],
+            )
             return (
-                f"[Group Members]\n{lines}\n\n"
+                f"{identity_line}[Group Members]\n{lines}\n\n"
                 f"When mentioning a group member, use the format "
                 f"@[uid:displayName] (e.g. @[{example_uid}:{example_name}]). "
                 "I will convert it to the correct format before sending."
             )
         return (
-            f"[Group Info] This group has {size} members. Use the "
+            f"{identity_line}[Group Info] This group has {size} members. Use the "
             "octo_management tool (action=group-members) to look up member "
             "info when needed. When mentioning a group member, use the "
             "format @[uid:displayName]."
@@ -1628,8 +1649,19 @@ class OctoAdapter(BasePlatformAdapter):
         if payload.mention:
             llm_content = convert_content_for_llm(content, payload.mention, dict(self._member_map))
 
-        # Build body with quote prefix
-        body = (reply_text + "\n---\n" + llm_content) if reply_text else llm_content
+        # Wrap the current message with sender attribution so the LLM can tell
+        # "this is what X said TO me" from "this is text I should continue".
+        # Without it, another bot @-ing this bot with a large markdown payload
+        # tends to be echoed back verbatim (the LLM treats the body as an
+        # incomplete draft it should finish).
+        sender_display = sender_name or msg.from_uid or "unknown"
+        current_prefix = f"[Message from {sender_display} (uid={msg.from_uid})]: "
+
+        # Build body with quote prefix + current-message attribution
+        if reply_text:
+            body = f"{reply_text}\n---\n{current_prefix}{llm_content}"
+        else:
+            body = f"{current_prefix}{llm_content}"
 
         # ── Group history context (injected on @mention) ──
         history_context: str | None = None
