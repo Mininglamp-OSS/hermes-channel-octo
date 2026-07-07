@@ -80,6 +80,25 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_ALLOWED_USERS` | no | Comma-separated user IDs allowed to talk to the bot |
 | `OCTO_ALLOW_ALL_USERS` | no | Allow any user to trigger the bot (dev only) |
 | `OCTO_HOME_CHANNEL` | no | Default group/chat ID for cron / notification delivery |
+| `OCTO_SECRETS_FILE_ROOT` | no | Jail root for `octo_management` `write-secret` file writes; defaults to `$HERMES_HOME/workspace/octo/secrets` (or `~/.hermes/workspace/octo/secrets`) |
+
+## Agent tools
+
+The plugin registers `octo_management` for Octo group/thread/GROUP.md administration and cross-channel reads. It also supports owner-only `write-secret`, which resolves a bot-owner managed secret alias through Octo (`POST /v1/bot/secrets/resolve`) and writes the plaintext directly to a local file without returning it to the model.
+
+`write-secret` parameters:
+
+- `alias`: stored secret display name or `secret_id`; do **not** pass raw secret values.
+- `file_path`: destination path relative to the secrets jail root.
+- `template`: optional content template containing `{{secret}}` where the resolved value should be inserted.
+- `mode`: `overwrite` (default) or `append`.
+
+Security properties:
+
+- Requires explicit bot-owner `requester_uid`.
+- Rejects paths outside the jail root and symlink escapes before resolving plaintext.
+- Creates/writes secret files with owner-only `0600` permissions.
+- Tool results never include the plaintext value or rendered file content.
 
 ## Start / Verify
 

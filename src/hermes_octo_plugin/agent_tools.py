@@ -30,9 +30,12 @@ Permissions:
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 from datetime import UTC
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -87,6 +90,8 @@ ACTIONS = [
     "thread-md-read", "thread-md-update",
     # Voice correction context
     "voice-context-read", "voice-context-update", "voice-context-delete",
+    # Owner secret resolution / local file write
+    "write-secret",
 ]
 
 
@@ -211,6 +216,38 @@ TOOL_SCHEMA = {
                     "for owner-initiated admin calls."
                 ),
             },
+            "alias": {
+                "type": "string",
+                "description": (
+                    "For write-secret only. Alias or secret_id for one of the "
+                    "bot owner's stored secrets. Pass the alias, never a raw "
+                    "secret value; the tool resolves plaintext internally."
+                ),
+            },
+            "file_path": {
+                "type": "string",
+                "description": (
+                    "For write-secret only. Destination path relative to the "
+                    "configured secrets jail root (e.g. '.env'). Paths escaping "
+                    "the jail are rejected."
+                ),
+            },
+            "template": {
+                "type": "string",
+                "description": (
+                    "For write-secret only. Optional content template containing "
+                    "the '{{secret}}' placeholder where the resolved value should "
+                    "be inserted. If omitted or blank, writes the raw secret."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["overwrite", "append"],
+                "description": (
+                    "For write-secret only. 'overwrite' replaces the file; "
+                    "'append' appends to it. Defaults to overwrite."
+                ),
+            },
         },
         "required": ["action"],
     },
@@ -220,6 +257,182 @@ TOOL_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+SECRET_PLACEHOLDER = "{{secret}}"
+SECRET_FILE_MODE = 0o600
+
+
+def _default_secrets_root() -> Path:
+    """Default write-secret jail under the active Hermes profile."""
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return Path(hermes_home).expanduser() / "workspace" / "octo" / "secrets"
+
+
+def _secrets_root() -> Path:
+    configured = os.environ.get("OCTO_SECRETS_FILE_ROOT", "").strip()
+    return Path(configured).expanduser() if configured else _default_secrets_root()
+
+
+def _is_inside(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _canonicalize_existing_prefix(path: Path) -> Path:
+    """Resolve symlinks through the nearest existing ancestor."""
+    cur = path
+    missing: list[str] = []
+    while not cur.exists():
+        if cur.parent == cur:
+            break
+        missing.append(cur.name)
+        cur = cur.parent
+    base = cur.resolve(strict=True) if cur.exists() else cur.resolve(strict=False)
+    for part in reversed(missing):
+        base = base / part
+    return base
+
+
+def _confine_secret_path(file_path: str, root_input: Path | None = None) -> tuple[Path, Path] | str:
+    """Return (safe_abs, canonical_root) or an error string."""
+    if not file_path or "\x00" in file_path:
+        return "file_path is required for write-secret and must not contain NUL bytes"
+
+    root_raw = root_input or _secrets_root()
+    try:
+        root = _canonicalize_existing_prefix(root_raw)
+    except Exception as exc:  # pragma: no cover - rare platform/fs failure
+        return f"write-secret is not configured: could not resolve secrets root ({type(exc).__name__})"
+
+    if root.anchor == str(root):
+        return "Refusing to use filesystem root as the write-secret jail root"
+
+    requested = Path(file_path).expanduser()
+    candidate = requested if requested.is_absolute() else root / requested
+    candidate = candidate.resolve(strict=False)
+
+    if not _is_inside(root, candidate):
+        return (
+            f"Refusing to write the secret outside the allowed directory. "
+            f"{file_path!r} resolves outside the permitted root."
+        )
+
+    rel = candidate.relative_to(root)
+    current = root
+    for part in rel.parts:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            break
+        if os.path.islink(current):
+            try:
+                real = current.resolve(strict=True)
+            except OSError:
+                return (
+                    f"Refusing to write the secret: {file_path!r} passes through "
+                    "a symlink that cannot be verified to stay inside the allowed directory."
+                )
+            if not _is_inside(root, real):
+                return (
+                    f"Refusing to write the secret: {file_path!r} resolves through "
+                    "a symlink that escapes the allowed directory."
+                )
+    return candidate, root
+
+
+async def _handle_write_secret(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    alias: str,
+    file_path: str,
+    template: str | None = None,
+    mode: str = "overwrite",
+) -> str:
+    """Resolve a stored secret and write it locally without exposing plaintext."""
+    if not alias:
+        return _err("alias is required for write-secret")
+    if not file_path:
+        return _err("file_path is required for write-secret")
+    if mode not in ("overwrite", "append"):
+        return _err(f"invalid mode for write-secret: {mode!r}; use 'overwrite' or 'append'")
+    if template is not None and template.strip() and SECRET_PLACEHOLDER not in template:
+        return _err(
+            f"template was provided but does not contain the {SECRET_PLACEHOLDER} placeholder"
+        )
+
+    confined = _confine_secret_path(file_path)
+    if isinstance(confined, str):
+        return _err(confined)
+    abs_path, root = confined
+
+    try:
+        resolved = await api.resolve_secret(session, api_url, bot_token, alias)
+    except Exception as exc:
+        return _err(
+            f"Could not resolve secret {alias!r}. The key service is unavailable "
+            f"or the secret may need to be re-set. ({type(exc).__name__}: {exc})"
+        )
+
+    status = resolved.get("status")
+    if status == "not_found":
+        return _err(f"No stored secret matches {alias!r}. Ask the user to add this key first, then try again.")
+    if status == "rate_limited":
+        return _err(f"The key service is busy right now (rate limited). Wait a moment and retry write-secret for {alias!r}.")
+    if status == "ambiguous":
+        return _ok({
+            "written": False,
+            "ambiguous": True,
+            "message": f"Multiple stored secrets match {alias!r}. Ask the user which one, then retry write-secret with the chosen display_name or secret_id.",
+            "candidates": resolved.get("candidates", []),
+        })
+    if status != "resolved" or not isinstance(resolved.get("value"), str):
+        return _err("resolveSecret returned an unusable response")
+
+    value = resolved["value"]
+    content = (
+        template.replace(SECRET_PLACEHOLDER, value)
+        if template and SECRET_PLACEHOLDER in template
+        else value
+    )
+
+    try:
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        real_parent = abs_path.parent.resolve(strict=True)
+        if not _is_inside(root, real_parent):
+            return _err("Refusing to write the secret: the destination directory escaped the allowed root after creation.")
+        open_target = real_parent / abs_path.name
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "append" else os.O_TRUNC)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(open_target, flags, SECRET_FILE_MODE)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return _err("Refusing to write the secret: the destination file is a symlink.")
+            raise
+        with os.fdopen(fd, "a" if mode == "append" else "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fchmod(f.fileno(), SECRET_FILE_MODE)
+    except Exception as exc:
+        rel = os.path.relpath(abs_path, root)
+        return _err(f"Resolved the secret but failed to write it to {rel!r}: {type(exc).__name__}: {exc}")
+
+    result: dict[str, Any] = {
+        "written": True,
+        "path": os.path.relpath(abs_path, root),
+        "mode": mode,
+    }
+    if isinstance(resolved.get("display_name"), str):
+        result["display_name"] = resolved["display_name"]
+    return _ok(result)
+
 
 
 def _audit(
@@ -302,6 +515,7 @@ OWNER_ONLY_ACTIONS = frozenset({
     "group-md-update", "create-thread", "delete-thread", "join-thread",
     "leave-thread", "thread-md-update",
     "voice-context-update", "voice-context-delete",
+    "write-secret",
 })
 
 
@@ -321,6 +535,9 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
         return _err("Octo adapter is not configured (missing api_url / bot_token)")
 
     requester_uid: str | None = args.get("requester_uid")
+
+    if action == "write-secret" and not requester_uid:
+        return _err("action 'write-secret' requires explicit requester_uid")
 
     if action in OWNER_ONLY_ACTIONS:
         err = _require_owner(adapter, requester_uid, action)
@@ -689,6 +906,18 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
             if action == "voice-context-delete":
                 await api.delete_voice_context(session, api_url, bot_token)
                 return _ok({"deleted": True})
+
+            if action == "write-secret":
+                alias = (args.get("alias") or "").strip()
+                file_path = (args.get("file_path") or args.get("filePath") or "").strip()
+                template = args.get("template")
+                mode = args.get("mode") or "overwrite"
+                return await _handle_write_secret(
+                    session, api_url, bot_token,
+                    alias=alias, file_path=file_path,
+                    template=template if isinstance(template, str) else None,
+                    mode=mode,
+                )
 
         except Exception as e:
             logger.exception("octo_management action %s failed", action)
