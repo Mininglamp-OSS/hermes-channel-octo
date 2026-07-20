@@ -647,7 +647,21 @@ class OctoAdapter(BasePlatformAdapter):
 
     # ── Connection Lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Connect to Octo and start receiving messages.
+
+        Args:
+            is_reconnect: False on a cold first boot; True when the gateway's
+                reconnect watcher re-establishes the platform after an outage.
+                Part of the ``BasePlatformAdapter.connect`` contract as of
+                hermes-agent >=0.16, which forwards this kwarg from
+                ``gateway/run.py``. This adapter tracks reconnect state
+                internally via ``_reconnect_attempts`` and has no server-side
+                update queue to preserve, so the flag is accepted for
+                interface compatibility but intentionally unused. Accepting it
+                with a default keeps the adapter working on older hermes-agent
+                releases (0.14/0.15) that call ``connect()`` with no arguments.
+        """
         if not self._api_url or not self._bot_token:
             logger.error("[%s] OCTO_API_URL and OCTO_BOT_TOKEN must be set", self.name)
             return False

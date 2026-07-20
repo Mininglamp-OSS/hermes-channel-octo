@@ -225,3 +225,42 @@ class TestMdDirPathValidation:
         assert adapter._md_dir("../../etc/passwd") is None
         # Well-formed key still works.
         assert adapter._md_dir("group123") is not None
+
+
+class TestConnectContract:
+    """The gateway's reconnect watcher (hermes-agent >=0.16) calls
+    ``adapter.connect(is_reconnect=...)``. The adapter must accept that
+    keyword without raising ``TypeError``, while remaining callable with no
+    arguments so it keeps working on older hermes-agent releases (0.14/0.15)
+    that call ``connect()`` bare. See BasePlatformAdapter.connect contract.
+    """
+
+    def test_connect_signature_accepts_is_reconnect(self):
+        import inspect
+        from hermes_octo_plugin.adapter import OctoAdapter
+
+        sig = inspect.signature(OctoAdapter.connect)
+        assert "is_reconnect" in sig.parameters
+        param = sig.parameters["is_reconnect"]
+        # Keyword-only with a default keeps bare connect() working.
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is False
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{}, {"is_reconnect": False}, {"is_reconnect": True}],
+        ids=["bare", "cold-boot", "reconnect"],
+    )
+    def test_connect_callable_all_forms(self, kwargs):
+        """All three call shapes must run without TypeError. With empty
+        credentials the adapter short-circuits and returns False before any
+        network I/O, so this exercises the signature end-to-end offline.
+        """
+        import asyncio
+
+        adapter = make_bare_adapter()
+        adapter._api_url = ""  # force the early "missing credentials" return
+        adapter._bot_token = ""
+
+        result = asyncio.run(adapter.connect(**kwargs))
+        assert result is False
