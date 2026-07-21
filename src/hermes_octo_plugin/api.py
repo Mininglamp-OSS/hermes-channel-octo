@@ -174,6 +174,89 @@ async def get_json(
         return await resp.json(content_type=None)
 
 
+
+# ─── User secret resolution ───────────────────────────────────────────────────
+
+def _parse_secret_candidates(raw_candidates: Any) -> list[dict[str, str]]:
+    """Return LLM-safe secret candidates (labels only, never values)."""
+    if not isinstance(raw_candidates, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw_candidates:
+        if not isinstance(item, dict):
+            continue
+        display_name = item.get("display_name")
+        secret_id = item.get("secret_id")
+        if not isinstance(display_name, str) or not display_name:
+            continue
+        candidate = {"display_name": display_name}
+        if isinstance(secret_id, str) and secret_id:
+            candidate["secret_id"] = secret_id
+        out.append(candidate)
+    return out
+
+
+async def resolve_secret(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    alias: str,
+) -> dict[str, Any]:
+    """Resolve a user-managed secret alias to plaintext for internal use.
+
+    POST /v1/bot/secrets/resolve with {"query": alias}. The plaintext appears
+    only in the returned ``resolved`` variant and callers must not expose it to
+    model-visible output or logs. Non-success error bodies are deliberately not
+    echoed, because this endpoint handles secret material.
+    """
+    url = f"{api_url.rstrip('/')}/v1/bot/secrets/resolve"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bot_token}",
+    }
+    async with session.post(
+        url, json={"query": alias}, headers=headers, timeout=DEFAULT_TIMEOUT,
+    ) as resp:
+        if resp.status == 404:
+            return {"status": "not_found"}
+        if resp.status == 429:
+            return {"status": "rate_limited"}
+        if resp.status == 422:
+            raw = await resp.json(content_type=None)
+            error = raw.get("error", {}) if isinstance(raw, dict) else {}
+            details = error.get("details", {}) if isinstance(error, dict) else {}
+            candidates = details.get("candidates", []) if isinstance(details, dict) else []
+            return {"status": "ambiguous", "candidates": _parse_secret_candidates(candidates)}
+        if not resp.ok:
+            # Do not read or echo the body: this endpoint handles plaintext
+            # secrets, and error bodies may contain sensitive diagnostics.
+            raise RuntimeError(f"resolveSecret failed ({resp.status})")
+
+        raw = await resp.json(content_type=None)
+        if not isinstance(raw, dict):
+            raise RuntimeError("resolveSecret returned an unparseable response")
+
+        status = raw.get("status")
+        if status == "not_found":
+            return {"status": "not_found"}
+        if status == "ambiguous":
+            return {
+                "status": "ambiguous",
+                "candidates": _parse_secret_candidates(raw.get("candidates", [])),
+            }
+        if status == "resolved" or (status is None and "value" in raw):
+            value = raw.get("value")
+            if not isinstance(value, str) or not value:
+                raise RuntimeError("resolveSecret resolved a secret with no value")
+            result: dict[str, Any] = {"status": "resolved", "value": value}
+            if isinstance(raw.get("secret_id"), str):
+                result["secret_id"] = raw["secret_id"]
+            if isinstance(raw.get("display_name"), str):
+                result["display_name"] = raw["display_name"]
+            return result
+
+        raise RuntimeError("resolveSecret returned an unknown status")
+
 # ─── Bot Registration ────────────────────────────────────────────────────────
 
 
