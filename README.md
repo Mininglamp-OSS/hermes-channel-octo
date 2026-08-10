@@ -18,9 +18,10 @@ Hermes buffers text replies and sends one complete final message.
 
 ## Install
 
-The plugin supports two install paths. The current compatibility gate is
-verified against `hermes-agent==0.20.0`; the lower bound remains `0.14` for
-existing installations.
+The plugin is verified against `hermes-agent==0.20.0`; the lower bound remains
+`0.14` for existing installations. Native interactive `send_clarify` cards are
+enabled for Hermes `>=0.20.0`. Hermes `0.14`–`0.19` and unknown/unparseable
+versions retain Hermes' plain-text clarify fallback.
 
 All commands below assume `HERMES_HOME` points at the hermes install you
 want to wire the plugin into, and that you invoke the matching `hermes`
@@ -43,7 +44,7 @@ $PIP install 'git+https://github.com/Mininglamp-OSS/hermes-channel-octo.git'
 ```
 
 Pip resolves all runtime dependencies automatically (`websockets`,
-`aiohttp`, `cryptography`, `python-socks`).
+`aiohttp`, `cryptography`, `python-socks`, `packaging`).
 
 The plugin is registered via Python entry-points and **loads on the
 next gateway start** — no `hermes plugins enable` needed. Note that
@@ -59,7 +60,8 @@ $HERMES plugins enable octo
 
 # bundled-plugin protocol does NOT install pyproject deps — install manually:
 $PIP install 'websockets>=15.0,<16' 'aiohttp>=3.13,<4' \
-             'cryptography>=46.0,<49' 'python-socks>=2.8,<3'
+             'cryptography>=46.0,<49' 'python-socks>=2.8,<3' \
+             'packaging>=24,<27'
 ```
 
 `hermes plugins install` clones into `$HERMES_HOME/plugins/octo/` (the
@@ -112,6 +114,16 @@ action, binding, and Hermes session identity all match. The event cursor is
 persisted before acknowledgement. These paths are covered by local automated
 tests; production-server card/action/media interoperability still requires the
 separately authorized live acceptance checks.
+
+On Hermes `>=0.20.0`, bounded clarifies with choices use the same trusted
+current-conversation route and Type-17 session binding. Single-select prompts
+render one submit action per choice; multi-select prompts render
+`Input.ChoiceSet` plus Submit; both include an **Other** action that switches
+the existing clarify to Hermes text capture. Choice clicks call Hermes'
+clarify resolution primitive directly and never become a new model turn.
+Card/profile/render failures use the base text fallback. Ambiguous POST
+failures retry once with the same `client_msg_no` and never send a second
+prompt. This version gate is automatic and has no configuration switch.
 
 ## Start / Verify
 

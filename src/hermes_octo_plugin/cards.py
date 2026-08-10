@@ -1293,6 +1293,11 @@ def build_interactive_card(
                 choice_titles.append(choice_title)
                 choices.append({"title": choice_title, "value": choice_value})
             node["choices"] = choices
+            multi_select = raw_input.get("multi_select", False)
+            if not isinstance(multi_select, bool):
+                raise ValueError("choice input multi_select must be a boolean")
+            if multi_select:
+                node["isMultiSelect"] = True
         else:
             placeholder = raw_input.get("placeholder")
             if placeholder is not None:

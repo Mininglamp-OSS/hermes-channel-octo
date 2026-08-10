@@ -13,6 +13,7 @@ import re
 import socket
 import time
 import uuid
+from importlib.metadata import PackageNotFoundError, version as _package_version
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ import websockets
 import websockets.exceptions
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
+from packaging.version import InvalidVersion, Version
 from agent.redact import redact_sensitive_text as _redact_raw
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -92,6 +94,35 @@ def _delivery_result(result: SendMessageResult) -> SendResult:
         message_id=result.message_id,
         raw_response=raw_response,
     )
+
+_NATIVE_CLARIFY_MIN = Version("0.20")
+
+
+def _native_clarify_supported() -> bool:
+    """Enable native clarify for Hermes releases that provide its gateway API."""
+    try:
+        installed = Version(_package_version("hermes-agent"))
+    except (InvalidVersion, PackageNotFoundError, TypeError, ValueError):
+        return False
+    return installed >= _NATIVE_CLARIFY_MIN
+
+def _registered_clarify_entry(clarify_id: str) -> Any | None:
+    """Read the exact gateway-owned clarify entry."""
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        return clarify_gateway._entries.get(clarify_id)
+
+
+def _clarify_send_is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, (aiohttp.ClientError, TimeoutError)):
+        return True
+    return isinstance(exc, api.OctoApiError) and (
+        exc.status is None
+        or exc.status >= 500
+        or exc.status in {408, 409, 425, 429}
+    )
+
 
 
 def _infer_image_mime(url: str) -> str:
@@ -899,6 +930,7 @@ class OctoAdapter(BasePlatformAdapter):
         self._event_task: asyncio.Task[Any] | None = None
         self._card_sessions = CardSessionRegistry()
         self._card_profile_cache = cards.CardProfileCache()
+        self._native_clarify_enabled = _native_clarify_supported()
 
         # Cache activity tracker: channel_id → last-touched monotonic seconds.
         # _cleanup_caches() uses this to age out stale per-channel state so
@@ -1095,12 +1127,18 @@ class OctoAdapter(BasePlatformAdapter):
             return False
         return True
 
+    async def _wait_for_card_progress(self, session_key: str) -> None:
+        """Wait only for this session's progress card to complete first send."""
+        from .card_progress import wait_for_initial_delivery
+
+        await wait_for_initial_delivery(adapter=self, session_key=session_key)
+
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
 
     async def _handle_card_action_event(self, action: CardAction) -> str:
         from .card_events import (
-            dispatch_card_action_event,
+            dispatch_card_session_action,
             handle_card_action,
             render_card_action_status,
         )
@@ -1135,7 +1173,7 @@ class OctoAdapter(BasePlatformAdapter):
         status = await handle_card_action(
             self._card_sessions,
             action,
-            lambda session, claimed: dispatch_card_action_event(
+            lambda session, claimed: dispatch_card_session_action(
                 self,
                 session,
                 claimed,
@@ -3858,6 +3896,235 @@ class OctoAdapter(BasePlatformAdapter):
         if channel_type == ChannelType.DM:
             return self._space_dm_targets.get(chat_id, _extract_base_uid(chat_id))
         return chat_id
+
+    async def _send_clarify_fallback(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[Any] | None,
+        *,
+        clarify_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None,
+    ) -> SendResult:
+        return await super().send_clarify(
+            chat_id,
+            question,
+            choices,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            metadata=metadata,
+        )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[Any] | None,
+        clarify_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Deliver Hermes 0.20 clarifies as session-bound Type-17 controls."""
+        async def fallback() -> SendResult:
+            return await self._send_clarify_fallback(
+                chat_id,
+                question,
+                choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+
+        if (
+            not self._native_clarify_enabled
+            or self._disconnecting
+            or self._http_session is None
+            or self._on_behalf_of
+        ):
+            return await fallback()
+
+        from .card_events import CardSession, ClarifySession
+        from .card_tools import _trusted_route
+
+        route = _trusted_route(self, require_session_key=True)
+        entry = _registered_clarify_entry(clarify_id)
+        if (
+            route is None
+            or route.chat_id != chat_id
+            or route.session_key != session_key
+            or entry is None
+            or entry.session_key != session_key
+            or entry.question != question
+            or entry.choices != choices
+            or not choices
+            or not all(
+                isinstance(choice, str)
+                and choice
+                and choice == choice.strip()
+                for choice in choices
+            )
+        ):
+            return await fallback()
+
+        if len(choices) > 4 or len(set(choices)) != len(choices):
+            return await fallback()
+        multi_select = bool(entry.multi_select)
+
+        try:
+            manifest = self._card_profile_cache.get()
+            if manifest is None:
+                manifest = await api.get_card_profile(
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                )
+                self._card_profile_cache.put(manifest)
+            if (
+                not manifest.available
+                or not manifest.enabled
+                or manifest.profiles is None
+                or CARD_PROFILE_V2 not in manifest.profiles
+            ):
+                return await fallback()
+            capabilities = cards.derive_card_capabilities(manifest)
+            binding_id = str(uuid.uuid4())
+            action_choices = tuple(
+                (f"clarify_choice_{index}", choice)
+                for index, choice in enumerate(choices)
+            )
+            other_action_id = "clarify_other"
+            input_id: str | None = None
+            confirm_action_id: str | None = None
+            if multi_select:
+                input_id = "clarify_choices"
+                confirm_action_id = "clarify_confirm"
+                inputs: list[dict[str, object]] = [{
+                    "kind": "choice",
+                    "id": input_id,
+                    "label": "可多选",
+                    "multi_select": True,
+                    "choices": [
+                        {"title": choice, "value": choice_id}
+                        for choice_id, choice in action_choices
+                    ],
+                }]
+                buttons: list[dict[str, object]] = [
+                    {"id": confirm_action_id, "label": "提交"},
+                    {"id": other_action_id, "label": "其他"},
+                ]
+            else:
+                inputs = []
+                buttons = [
+                    {"id": choice_id, "label": choice}
+                    for choice_id, choice in action_choices
+                ]
+                buttons.append({"id": other_action_id, "label": "其他"})
+            rendered = cards.build_interactive_card(
+                title="需要确认",
+                text=question,
+                inputs=inputs,
+                buttons=buttons,
+                binding_id=binding_id,
+                capabilities=capabilities,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return await fallback()
+
+        client_msg_no = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes-octo:clarify:{clarify_id}",
+            )
+        )
+        await self._wait_for_card_progress(session_key)
+        try:
+            result = await api.send_card_message(
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=route.channel_id,
+                channel_type=route.channel_type,
+                card=rendered.card,
+                plain=rendered.plain,
+                client_msg_no=client_msg_no,
+                profile=CARD_PROFILE_V2,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as first_error:
+            if not _clarify_send_is_retryable(first_error):
+                return await fallback()
+            try:
+                result = await api.send_card_message(
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=route.channel_id,
+                    channel_type=route.channel_type,
+                    card=rendered.card,
+                    plain=rendered.plain,
+                    client_msg_no=client_msg_no,
+                    profile=CARD_PROFILE_V2,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as retry_error:
+                return SendResult(
+                    success=False,
+                    error="Octo clarify card delivery failed",
+                    retryable=_clarify_send_is_retryable(retry_error),
+                )
+
+        if result.message_id is None:
+            return SendResult(
+                success=False,
+                error="Octo clarify card delivery missing message_id",
+            )
+        if _registered_clarify_entry(clarify_id) is not entry:
+            return SendResult(
+                success=False,
+                message_id=result.message_id,
+                error="Hermes clarify is no longer pending",
+            )
+        try:
+            self._register_card_session(
+                CardSession(
+                    message_id=result.message_id,
+                    binding_id=binding_id,
+                    session_key=session_key,
+                    chat_id=route.chat_id,
+                    channel_id=route.channel_id,
+                    channel_type=route.channel_type,
+                    requester_uid=route.requester_uid,
+                    card=rendered.card,
+                    plain=rendered.plain,
+                    action_labels=rendered.action_labels,
+                    input_ids=rendered.input_ids,
+                    max_input_text_bytes=capabilities.max_input_text_bytes,
+                    max_inputs_bytes=capabilities.max_inputs_bytes,
+                    clarify=ClarifySession(
+                        clarify_id=clarify_id,
+                        multi_select=bool(multi_select),
+                        question=question,
+                        choices=tuple(choices),
+                        action_choices=action_choices,
+                        input_id=input_id,
+                        confirm_action_id=confirm_action_id,
+                        other_action_id=other_action_id,
+                    ),
+                )
+            )
+        except Exception:
+            return SendResult(
+                success=False,
+                message_id=result.message_id,
+                error="Octo clarify card binding failed",
+            )
+        return _delivery_result(result)
+
 
     async def send(
         self,

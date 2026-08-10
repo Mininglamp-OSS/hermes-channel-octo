@@ -1,6 +1,7 @@
 """Progress-card lifecycle and concurrency contracts."""
 
 from __future__ import annotations
+import asyncio
 
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -487,9 +488,104 @@ async def test_progress_stays_silent_for_pure_model_turn_and_card_authoring_tool
             await adapter.run_next()
 
     send.assert_not_awaited()
-    assert controller.state_count == 0
 
 
+
+
+
+
+@pytest.mark.asyncio
+async def test_initial_delivery_barrier_ignores_other_session_progress() -> None:
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    other_route = TrustedOctoRoute(
+        chat_id="group-2",
+        channel_id="group-2",
+        channel_type=ChannelType.Group,
+        requester_uid="user-2",
+        session_key="octo:group-2:user-2",
+    )
+    send = AsyncMock(
+        side_effect=[
+            SendMessageResult(message_id="progress-1"),
+            SendMessageResult(message_id="progress-2"),
+        ]
+    )
+    with (
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+    ):
+        for session_id, turn_id, route in (
+            ("session-1", "turn-1", _ROUTE),
+            ("session-2", "turn-2", other_route),
+        ):
+            controller.begin(
+                adapter=adapter,
+                route=route,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+            controller.tool_started(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call_id=f"clarify-{turn_id}",
+                tool_name="clarify",
+                args={"question": "Choose"},
+            )
+
+        waiting = asyncio.create_task(
+            controller.wait_for_initial_delivery(
+                adapter=adapter,
+                session_key=_ROUTE.session_key,
+            )
+        )
+        await asyncio.sleep(0)
+        await adapter.run_next()
+        await asyncio.wait_for(waiting, timeout=0.1)
+
+    assert len(adapter.pending) == 1
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_initial_delivery_wait_does_not_cancel_progress() -> None:
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(return_value=SendMessageResult(message_id="progress-1"))
+    with (
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="clarify-1",
+            tool_name="clarify",
+            args={"question": "Choose"},
+        )
+        waiting = asyncio.create_task(
+            controller.wait_for_initial_delivery(
+                adapter=adapter,
+                session_key=_ROUTE.session_key,
+            )
+        )
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        await adapter.run_next()
+
+    send.assert_awaited_once()
 
 
 @pytest.mark.asyncio

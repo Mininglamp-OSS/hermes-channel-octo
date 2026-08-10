@@ -74,6 +74,7 @@ def make_bare_adapter():
     a._event_task = None
     a._card_sessions = CardSessionRegistry()
     a._card_profile_cache = cards.CardProfileCache()
+    a._native_clarify_enabled = False
     a._unknown_message_type_counts = OrderedDict()
     a._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
     a._disconnecting = False

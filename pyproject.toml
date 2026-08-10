@@ -23,6 +23,7 @@ dependencies = [
   # Verified against hermes-agent 0.20.0, so accept the 0.20 line while
   # keeping 0.21+ behind an explicit compatibility validation.
   "hermes-agent>=0.14,<0.21",
+  "packaging>=24,<27",
   # Octo runtime deps. Floor = current pinned upstream version (known-good);
   # ceiling = next major (SemVer-respecting libraries).
   "websockets>=15.0,<16",

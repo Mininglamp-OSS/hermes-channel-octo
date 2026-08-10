@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import Future
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -72,6 +73,7 @@ class _ProgressTurn:
     template_ref: dict[str, str] | None = None
     capabilities: cards.CardCapabilities | None = None
 
+    initial_delivery: Future[None] = field(default_factory=Future)
 
 class CardProgressController:
     """Thread-safe turn state with serialized network drains on the gateway loop."""
@@ -84,6 +86,43 @@ class CardProgressController:
     def state_count(self) -> int:
         with self._lock:
             return len(self._states)
+
+
+    async def wait_for_initial_delivery(
+        self,
+        *,
+        adapter: object,
+        session_key: str,
+    ) -> None:
+        with self._lock:
+            candidates = [
+                state
+                for state in self._states.values()
+                if state.adapter is adapter
+                and state.route.session_key == session_key
+                and not state.final
+                and any(tool.tool_name != "__thinking__" for tool in state.tools.values())
+            ]
+            if len(candidates) != 1:
+                return
+            delivery = candidates[0].initial_delivery
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(delivery)),
+                timeout=35.0,
+            )
+        except TimeoutError:
+            logger.warning("[Octo] progress initial delivery barrier timed out")
+
+    @staticmethod
+    def _release_initial_delivery(state: _ProgressTurn) -> None:
+        if not state.initial_delivery.done():
+            state.initial_delivery.set_result(None)
+
+    def _drop_state_locked(self, key: _ProgressKey) -> None:
+        state = self._states.pop(key, None)
+        if state is not None:
+            self._release_initial_delivery(state)
 
     def begin(
         self,
@@ -356,7 +395,7 @@ class CardProgressController:
                 capabilities=state.capabilities,
             )
             if state.message_id is None and not state.send_started:
-                self._states.pop(old_key, None)
+                self._drop_state_locked(old_key)
                 return
             state.final = True
             state.final_phase = "stopped"
@@ -377,19 +416,19 @@ class CardProgressController:
             return
         with self._lock:
             for key in [key for key in self._states if key[0] == session_id]:
-                self._states.pop(key, None)
+                self._drop_state_locked(key)
 
     def cancel_adapter(self, adapter: object) -> None:
         with self._lock:
             for key in [
                 key for key, state in self._states.items() if state.adapter is adapter
             ]:
-                self._states.pop(key, None)
+                self._drop_state_locked(key)
 
     def cancel_all(self) -> None:
         with self._lock:
-            self._states.clear()
-
+            for key in list(self._states):
+                self._drop_state_locked(key)
     def _find_key_locked(
         self,
         session_id: str,
@@ -420,7 +459,7 @@ class CardProgressController:
         )
         if not has_real_tool:
             if state.final:
-                self._states.pop(key, None)
+                self._drop_state_locked(key)
             return
         state.scheduled = True
         try:
@@ -429,7 +468,7 @@ class CardProgressController:
             scheduled = False
         if not scheduled:
             state.scheduled = False
-            self._states.pop(key, None)
+            self._drop_state_locked(key)
 
     @staticmethod
     def _tool_snapshot(state: _ProgressTurn) -> list[dict[str, object]]:
@@ -456,7 +495,7 @@ class CardProgressController:
                     return
                 adapter = state.adapter
                 if adapter._disconnecting or adapter._http_session is None:
-                    self._states.pop(key, None)
+                    self._drop_state_locked(key)
                     return
                 revision = state.revision
                 message_id = state.message_id
@@ -494,7 +533,7 @@ class CardProgressController:
                     )
                     if not enabled:
                         with self._lock:
-                            self._states.pop(key, None)
+                            self._drop_state_locked(key)
                         return
                     with self._lock:
                         current = self._states.get(key)
@@ -515,7 +554,7 @@ class CardProgressController:
                         current.delivered_revision = revision
                         current.scheduled = False
                         if current.final:
-                            self._states.pop(key, None)
+                            self._drop_state_locked(key)
                     return
 
                 wire_data = (
@@ -536,7 +575,7 @@ class CardProgressController:
                         current.delivered_revision = revision
                         current.scheduled = False
                         if current.final:
-                            self._states.pop(key, None)
+                            self._drop_state_locked(key)
                     return
 
                 if message_id is None:
@@ -589,11 +628,12 @@ class CardProgressController:
                             return
                         current.send_started = False
                         current.message_id = result.message_id
+                        self._release_initial_delivery(current)
                         current.delivered_revision = revision
                         if current.revision == revision:
                             current.scheduled = False
                             if current.final:
-                                self._states.pop(key, None)
+                                self._drop_state_locked(key)
                             return
                     continue
 
@@ -655,7 +695,7 @@ class CardProgressController:
             except Exception:
                 logger.warning("[Octo] progress card update failed", exc_info=True)
                 with self._lock:
-                    self._states.pop(key, None)
+                    self._drop_state_locked(key)
                 return
 
             with self._lock:
@@ -667,11 +707,18 @@ class CardProgressController:
                 if current.revision == revision:
                     current.scheduled = False
                     if current.final:
-                        self._states.pop(key, None)
+                        self._drop_state_locked(key)
                     return
 
 
+
+
 _CONTROLLER = CardProgressController()
+async def wait_for_initial_delivery(*, adapter: object, session_key: str) -> None:
+    await _CONTROLLER.wait_for_initial_delivery(
+        adapter=adapter,
+        session_key=session_key,
+    )
 
 
 def _turn_identity(kwargs: dict[str, Any]) -> tuple[str, str]:

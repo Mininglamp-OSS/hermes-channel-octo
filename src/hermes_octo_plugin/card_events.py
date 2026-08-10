@@ -268,6 +268,21 @@ def parse_card_action(event: object) -> CardAction | None:
 
 
 @dataclass(frozen=True)
+class ClarifySession:
+    """Authoritative mapping from opaque card controls to one Hermes clarify."""
+
+    clarify_id: str
+    multi_select: bool
+    question: str
+    choices: tuple[str, ...]
+    action_choices: tuple[tuple[str, str], ...]
+    input_id: str | None
+    confirm_action_id: str | None
+    other_action_id: str
+
+
+
+@dataclass(frozen=True)
 class CardSession:
     message_id: str
     binding_id: str
@@ -282,6 +297,7 @@ class CardSession:
     input_ids: tuple[str, ...]
     max_input_text_bytes: int | None = None
     max_inputs_bytes: int | None = None
+    clarify: ClarifySession | None = None
 
 
 @dataclass
@@ -501,6 +517,81 @@ def _freeze_action_node(
             frozen[key] = value
     return frozen
 
+def _clarify_selected_choices(
+    clarify: ClarifySession,
+    action: CardAction,
+) -> list[str]:
+    if action.action_id == clarify.other_action_id:
+        return []
+    if not clarify.multi_select:
+        return [
+            choice
+            for action_id, choice in clarify.action_choices
+            if action_id == action.action_id
+        ]
+    if action.action_id != clarify.confirm_action_id or clarify.input_id is None:
+        return []
+    raw_selection = action.inputs.get(clarify.input_id, "")
+    selected_ids = raw_selection.split(",") if raw_selection else []
+    if (
+        not selected_ids
+        or any(not value or value.strip() != value for value in selected_ids)
+        or len(set(selected_ids)) != len(selected_ids)
+    ):
+        return []
+    selected = set(selected_ids)
+    known_ids = {choice_id for choice_id, _ in clarify.action_choices}
+    if not selected.issubset(known_ids):
+        return []
+    return [
+        choice
+        for choice_id, choice in clarify.action_choices
+        if choice_id in selected
+    ]
+
+
+def _render_clarify_action_status(
+    session: CardSession,
+    action: CardAction,
+    status: str,
+) -> CardRenderResult:
+    clarify = session.clarify
+    if clarify is None:
+        raise ValueError("clarify session is required")
+    status_line = {
+        "processing": "正在提交…",
+        "completed": "已提交",
+        "awaiting_text": "请直接发送文字回复",
+        "expired": "该确认已失效或已处理",
+        "failed": "提交失败，请重试",
+    }.get(status, "提交失败，请重试")
+    lines = ["需要确认", clarify.question]
+    selected = (
+        _clarify_selected_choices(clarify, action)
+        if status in {"processing", "completed"}
+        else []
+    )
+    if selected:
+        lines.extend(("已选择", "、".join(selected)))
+    lines.append(status_line)
+    body = [
+        {
+            "type": "TextBlock",
+            "text": text,
+            "wrap": True,
+            **(
+                {"weight": "Bolder", "size": "Medium"}
+                if index == 0
+                else {"spacing": "Medium" if text in {"已选择", status_line} else "Small"}
+            ),
+        }
+        for index, text in enumerate(lines)
+    ]
+    card = {key: value for key, value in session.card.items() if key != "actions"}
+    card["body"] = body
+    return CardRenderResult(card=card, plain="\n".join(lines))
+
+
 
 def render_card_action_status(
     session: CardSession,
@@ -508,6 +599,8 @@ def render_card_action_status(
     status: str,
 ) -> CardRenderResult:
     """Freeze submitted controls and append a disclosure-safe terminal status."""
+    if session.clarify is not None:
+        return _render_clarify_action_status(session, action, status)
     source_body = session.card.get("body")
     body: list[dict[str, Any]] = []
     if isinstance(source_body, list):
@@ -519,15 +612,16 @@ def render_card_action_status(
                 body.append(frozen)
     label = session.action_labels.get(action.action_id, action.action_id)
     operator = _neutralize_action_echo(action.operator_uid)
-    status_line = (
-        f"Processing {label} for {operator}"
-        if status == "processing"
-        else (
-            f"Completed {label} for {operator}"
-            if status == "completed"
-            else f"Failed {label} for {operator}"
-        )
-    )
+    if status == "processing":
+        status_line = f"Processing {label} for {operator}"
+    elif status == "completed":
+        status_line = f"Completed {label} for {operator}"
+    elif status == "awaiting_text":
+        status_line = f"Waiting for a typed response from {operator}"
+    elif status == "expired":
+        status_line = "This clarification expired or was already resolved"
+    else:
+        status_line = f"Failed {label} for {operator}"
     body.append(
         {
             "type": "TextBlock",
@@ -567,7 +661,7 @@ async def _update_action_status(
 async def handle_card_action(
     registry: CardSessionRegistry,
     action: CardAction,
-    dispatch: Callable[[CardSession, CardAction], Awaitable[bool]],
+    dispatch: Callable[[CardSession, CardAction], Awaitable[bool | str]],
     *,
     update_status: Callable[..., Awaitable[None]] | None = None,
 ) -> str:
@@ -614,7 +708,16 @@ async def handle_card_action(
             return "dead_letter"
         registry.release(action.message_id, action.event_id)
         raise
-    if not accepted:
+    if accepted is False:
+        registry.release(action.message_id, action.event_id)
+        return "ignored"
+    terminal_status = accepted if isinstance(accepted, str) else "completed"
+    if terminal_status not in {
+        "completed",
+        "awaiting_text",
+        "expired",
+        "failed",
+    }:
         registry.release(action.message_id, action.event_id)
         return "ignored"
     registry.complete(action.message_id, action.event_id)
@@ -622,10 +725,106 @@ async def handle_card_action(
         update_status,
         session,
         action,
-        "completed",
+        terminal_status,
         transient=False,
     )
-    return "completed"
+    return terminal_status
+
+
+def _clarify_is_current(
+    session: CardSession,
+    clarify: ClarifySession,
+) -> bool:
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        entry = clarify_gateway._entries.get(clarify.clarify_id)
+        return bool(
+            entry is not None
+            and entry.session_key == session.session_key
+            and entry.question == clarify.question
+            and tuple(entry.choices or ()) == clarify.choices
+            and bool(getattr(entry, "multi_select", False)) == clarify.multi_select
+        )
+
+
+
+async def dispatch_clarify_action(
+    session: CardSession,
+    action: CardAction,
+) -> bool | str | None:
+    """Resolve an owned clarify card without creating a new user turn."""
+    clarify = session.clarify
+    if clarify is None:
+        return None
+    if not _clarify_is_current(session, clarify):
+        return "expired"
+
+    from tools.clarify_gateway import (
+        mark_awaiting_text,
+        resolve_gateway_clarify,
+    )
+
+    if action.action_id == clarify.other_action_id:
+        return (
+            "awaiting_text"
+            if mark_awaiting_text(clarify.clarify_id)
+            else "expired"
+        )
+
+    if not clarify.multi_select:
+        for action_id, response in clarify.action_choices:
+            if action.action_id == action_id:
+                return (
+                    "completed"
+                    if resolve_gateway_clarify(clarify.clarify_id, response)
+                    else "expired"
+                )
+        return False
+
+    if (
+        action.action_id != clarify.confirm_action_id
+        or clarify.input_id is None
+    ):
+        return False
+    raw_selection = action.inputs.get(clarify.input_id, "")
+    selected_ids = raw_selection.split(",") if raw_selection else []
+    if not selected_ids:
+        return False
+    if any(not value or value.strip() != value for value in selected_ids):
+        return False
+    selected = set(selected_ids)
+    if len(selected) != len(selected_ids):
+        return False
+    known_ids = {choice_id for choice_id, _ in clarify.action_choices}
+    if not selected.issubset(known_ids):
+        return False
+    response = json.dumps(
+        [
+            choice
+            for choice_id, choice in clarify.action_choices
+            if choice_id in selected
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        "completed"
+        if resolve_gateway_clarify(clarify.clarify_id, response)
+        else "expired"
+    )
+
+
+async def dispatch_card_session_action(
+    adapter: Any,
+    session: CardSession,
+    action: CardAction,
+) -> bool | str:
+    """Route clarify controls to Hermes primitives; other cards stay model-bound."""
+    clarify_status = await dispatch_clarify_action(session, action)
+    if clarify_status is not None:
+        return clarify_status
+    return await dispatch_card_action_event(adapter, session, action)
 
 
 def format_card_action_text(action: CardAction) -> str:
@@ -780,7 +979,14 @@ class EventPoller:
                 status = await self._on_card_action(action) if action is not None else None
                 await self._cursor_store.save(event_id)
                 self._cursor = event_id
-                if status in {"completed", "dead_letter", "duplicate"}:
+                if status in {
+                    "completed",
+                    "awaiting_text",
+                    "expired",
+                    "failed",
+                    "dead_letter",
+                    "duplicate",
+                }:
                     await self._ack(event_id)
             self._consecutive_errors = 0
             if self._wait_seconds == 0:
