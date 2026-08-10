@@ -36,8 +36,11 @@ MENTION_PATTERN = re.compile(
     r"@([\w\u00C0-\u024F\u4e00-\u9fff\u3040-\u30FF\uAC00-\uD7AF.\-]+)"
 )
 
-# Matches @[uid:displayName] format (adapter↔LLM internal use).
-STRUCTURED_MENTION_PATTERN = re.compile(r"@\[([\w.\-]+):([^\]\n]+)\]")
+# Matches the UID component accepted by the structured mention envelope.
+STRUCTURED_MENTION_UID_PATTERN = re.compile(r"[\w.\-]+")
+STRUCTURED_MENTION_PATTERN = re.compile(
+    rf"@\[({STRUCTURED_MENTION_UID_PATTERN.pattern}):([^\]\n]+)\]"
+)
 
 
 def strip_leading_self_mention_for_command(
@@ -123,7 +126,7 @@ def _utf16_length(text: str) -> int:
 def convert_structured_mentions(
     text: str,
     mentions: list[StructuredMention],
-    valid_uids: set[str] | None = None,
+    valid_uids: set[str] | None,
 ) -> tuple[str, list[MentionEntity], list[str]]:
     """Replace each ``@[uid:name]`` in *text* with ``@name`` and emit the
     matching wire-format sidecar.

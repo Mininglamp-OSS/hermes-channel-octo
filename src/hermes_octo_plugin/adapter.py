@@ -34,6 +34,7 @@ from .clarify import (
     native_clarify_supported as _native_clarify_supported,
 )
 from .mention import (
+    STRUCTURED_MENTION_UID_PATTERN,
     convert_content_for_llm,
     convert_structured_mentions,
     extract_mention_uids,
@@ -587,25 +588,50 @@ async def _standalone_send(
                 parse_structured_mentions as _parse_sm,
             )
 
+            channel_type = (
+                _ChannelType.CommunityTopic
+                if "____" in str(chat_id)
+                else _ChannelType.Group
+            )
             send_content = message
             send_uids = None
             send_entities = None
             structured = _parse_sm(message)
             if structured:
-                send_content, send_entities, send_uids = _convert_sm(
-                    message, structured
+                parent_group_no = str(chat_id).split("____", 1)[0]
+                members = await api.get_group_members(
+                    session,
+                    api_url,
+                    bot_token,
+                    parent_group_no,
                 )
+                valid_uids = {
+                    member.uid
+                    for member in members
+                    if isinstance(member.uid, str)
+                    and STRUCTURED_MENTION_UID_PATTERN.fullmatch(member.uid)
+                    is not None
+                }
+                if not valid_uids:
+                    raise RuntimeError("group member roster is unavailable")
+                send_content, send_entities, send_uids = _convert_sm(
+                    message,
+                    structured,
+                    valid_uids,
+                )
+                filtered = len(structured) - len(send_uids)
+                if filtered:
+                    logger.warning(
+                        "[Octo] filtered %d unverified standalone mention(s)",
+                        filtered,
+                    )
             client_msg_no = str(uuid.uuid4())
             send_result = await _octo_send(
                 session,
                 api_url,
                 bot_token,
                 channel_id=chat_id,
-                channel_type=(
-                    _ChannelType.CommunityTopic
-                    if "____" in str(chat_id)
-                    else _ChannelType.Group
-                ),
+                channel_type=channel_type,
                 content=send_content,
                 mention_uids=send_uids,
                 mention_entities=send_entities,
@@ -2868,10 +2894,12 @@ class OctoAdapter(BasePlatformAdapter):
                     timeout=timeout,
                     allow_redirects=False,
                 ) as resp:
-                    if resp.status >= 400 and resp.status < 500:
-                        # Permanent failure (auth, 404, ...) — don't retry
+                    if 300 <= resp.status < 500:
+                        # Redirects are not success: following them without
+                        # per-hop origin validation would weaken SSRF/auth
+                        # boundaries, while accepting them yields empty files.
                         return f"[文件: {filename} - 下载失败 HTTP {resp.status}]"
-                    if not resp.ok:
+                    if not 200 <= resp.status < 300:
                         raise RuntimeError(f"HTTP {resp.status}")
 
                     # Decide inline vs download path
@@ -2997,7 +3025,7 @@ class OctoAdapter(BasePlatformAdapter):
                 timeout=timeout,
                 allow_redirects=False,
             ) as resp:
-                if not resp.ok:
+                if not 200 <= resp.status < 300:
                     logger.warning(
                         "[%s] inbound media download HTTP %d for %s",
                         self.name,
@@ -3803,16 +3831,26 @@ class OctoAdapter(BasePlatformAdapter):
             content = content.replace(bare, "")
         return content
 
-    def _mention_uid_allowlist(
+    async def _mention_uid_allowlist(
         self,
         chat_id: str,
         channel_type: ChannelType,
     ) -> set[str] | None:
-        """Return the parent-group roster used by every outbound text lane."""
+        """Resolve the authoritative parent-group member UID allowlist."""
         if channel_type not in _GROUP_CHANNEL_TYPES:
             return None
         parent_group_no = chat_id.split("____", 1)[0]
-        return set(self._group_member_rosters.get(parent_group_no, {}))
+        await self._refresh_group_member_cache(parent_group_no)
+        member_map = self._group_robot_map.get(parent_group_no) or {}
+        valid_uids = {
+            uid
+            for uid in member_map
+            if isinstance(uid, str)
+            and STRUCTURED_MENTION_UID_PATTERN.fullmatch(uid) is not None
+        }
+        if not valid_uids:
+            raise RuntimeError("group member roster is unavailable")
+        return valid_uids
 
     async def _send_normal(
         self,
@@ -3836,17 +3874,40 @@ class OctoAdapter(BasePlatformAdapter):
         # Thread membership is changed only through the explicit owner-only
         # management actions; sending must not perform a hidden join/leave.
         try:
-            last_send_result = None
-            for chunk in chunks:
-                # Convert LLM-emitted @[uid:name] markers into wire format:
-                # plain @name in content + mention.entities/uids sidecar.
-                # Without this, the Octo client renders the literal template
-                # text instead of an @ pill (see review #2026-05-19).
+            structured_chunks = [
+                parse_structured_mentions(chunk) for chunk in chunks
+            ]
+            full_structured = parse_structured_mentions(content)
+            full_mention_ids = [
+                (mention.uid, mention.name) for mention in full_structured
+            ]
+            chunk_mention_ids = [
+                (mention.uid, mention.name)
+                for structured in structured_chunks
+                for mention in structured
+            ]
+            if chunk_mention_ids != full_mention_ids:
+                raise RuntimeError(
+                    "structured mention was split by message chunking"
+                )
+            valid_uids: set[str] | None = None
+            if any(structured_chunks):
+                valid_uids = await self._mention_uid_allowlist(
+                    chat_id,
+                    channel_type,
+                )
+
+            prepared_chunks: list[
+                tuple[str, list[Any] | None, list[str] | None]
+            ] = []
+            for chunk, structured in zip(
+                chunks,
+                structured_chunks,
+                strict=True,
+            ):
                 send_content = chunk
                 send_uids: list[str] | None = None
-                send_entities: list | None = None
-                structured = parse_structured_mentions(chunk)
-                valid_uids = self._mention_uid_allowlist(chat_id, channel_type)
+                send_entities: list[Any] | None = None
                 if structured:
                     send_content, send_entities, send_uids = (
                         convert_structured_mentions(
@@ -3855,6 +3916,19 @@ class OctoAdapter(BasePlatformAdapter):
                             valid_uids,
                         )
                     )
+                    filtered = len(structured) - len(send_uids)
+                    if filtered:
+                        logger.warning(
+                            "[%s] filtered %d unverified mention(s)",
+                            self.name,
+                            filtered,
+                        )
+                prepared_chunks.append(
+                    (send_content, send_entities, send_uids)
+                )
+
+            last_send_result = None
+            for send_content, send_entities, send_uids in prepared_chunks:
                 chunk_client_msg_no = str(uuid.uuid4())
                 last_send_result = await api.send_message(
                     self._http_session,
@@ -3944,6 +4018,30 @@ class OctoAdapter(BasePlatformAdapter):
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
             width = media_metadata.get("width")
             height = media_metadata.get("height")
+            caption_text = caption
+            send_uids: list[str] | None = None
+            send_entities: list[Any] | None = None
+            if caption:
+                structured = parse_structured_mentions(caption)
+                if structured:
+                    valid_uids = await self._mention_uid_allowlist(
+                        chat_id,
+                        channel_type,
+                    )
+                    caption_text, send_entities, send_uids = (
+                        convert_structured_mentions(
+                            caption,
+                            structured,
+                            valid_uids,
+                        )
+                    )
+                    filtered = len(structured) - len(send_uids)
+                    if filtered:
+                        logger.warning(
+                            "[%s] filtered %d unverified caption mention(s)",
+                            self.name,
+                            filtered,
+                        )
             file_data, content_type, filename = await self._load_outbound_media(
                 image_url
             )
@@ -3970,21 +4068,6 @@ class OctoAdapter(BasePlatformAdapter):
             # unknown — RichText image blocks reject width/height ≤ 0
             # and would invalidate the whole payload.
             if caption and width and height:
-                # Convert @[uid:name] mentions the same way _send_normal
-                # does, so a caption "@[uid:name] look" ships as a real
-                # mention pill instead of literal template text.
-                caption_text = caption
-                send_uids: list[str] | None = None
-                send_entities: list | None = None
-                structured = parse_structured_mentions(caption)
-                if structured:
-                    caption_text, send_entities, send_uids = (
-                        convert_structured_mentions(
-                            caption,
-                            structured,
-                            self._mention_uid_allowlist(chat_id, channel_type),
-                        )
-                    )
                 blocks = [
                     RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=caption_text),
                     RichTextBlock(
@@ -4034,8 +4117,10 @@ class OctoAdapter(BasePlatformAdapter):
                     self._bot_token,
                     channel_id=outbound_channel_id,
                     channel_type=channel_type,
-                    content=caption,
+                    content=caption_text,
                     reply_msg_id=reply_to,
+                    mention_uids=send_uids,
+                    mention_entities=send_entities,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4064,8 +4149,11 @@ class OctoAdapter(BasePlatformAdapter):
                 file_path
             )
 
-            if file_name:
-                filename = file_name
+            selected_filename = file_name if file_name is not None else filename
+            safe_filename = api.safe_media_filename(selected_filename)
+            if safe_filename is None:
+                raise ValueError("media filename is invalid")
+            filename = safe_filename
 
             uploaded_url = await api.upload_and_get_url(
                 self._http_session,

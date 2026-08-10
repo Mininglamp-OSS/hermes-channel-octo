@@ -282,6 +282,12 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset({
     "xamzsecuritytoken",
     "xamzsignature",
     "xamzcredential",
+    "accesskey",
+    "cookie",
+    "secretkey",
+    "sessiontoken",
+    "setcookie",
+    "xapikey",
     "xgoogcredential",
     "xgoogsignature",
 })
@@ -298,9 +304,60 @@ _DIGEST_AUTHORIZATION_VALUE_RE = re.compile(
     r"(?i)\b(authorization\s*:\s*digest)\b[^\r\n]*"
 )
 _AUTHORIZATION_VALUE_RE = re.compile(
-    r"(?i)\b(authorization\s*:\s*)((?:bearer|basic)\s+)?((?!digest\b)[^\s,;]+)"
+    r"(?i)\b(authorization\s*:\s*)([^\r\n]*)"
 )
 _BEARER_VALUE_RE = re.compile(r"(?i)\b(bearer\s+)[^\s,;]+")
+_COOKIE_VALUE_RE = re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)[^\r\n]*")
+_EXPLICIT_CREDENTIAL_VALUE_RE = re.compile(
+    r"""(?ix)
+    (?P<prefix>
+        (?<![A-Za-z0-9_.-])
+        (?P<key_quote>["']?)
+        (?P<key>
+            access[-_.]?(?:key|token)
+            |
+            api[-_.]?key
+            |
+            authorization
+            |
+            client[-_.]?secret
+            |
+            cookie
+            |
+            credential
+            |
+            key
+            |
+            pass(?:word|wd)
+            |
+            secret(?:[-_.]?key)?
+            |
+            set[-_.]?cookie
+            |
+            session[-_.]?token
+            |
+            sig(?:nature)?
+            |
+            token
+            |
+            x[-_.]?api[-_.]?key
+            |
+            x[-_.]?amz[-_.]?(?:credential|security[-_.]?token|signature)
+            |
+            x[-_.]?goog[-_.]?(?:credential|signature)
+        )
+        (?P=key_quote)
+        \s*[:=]\s*
+    )
+    (?P<value>
+        "(?:\\.|[^"\r\n])*"
+        |
+        '(?:\\.|[^'\r\n])*'
+        |
+        [^\s,;&#]+
+    )
+    """
+)
 _STANDALONE_SECRET_PATTERNS = (
     re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -365,6 +422,51 @@ def _redact_query_value(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}=[redacted]"
 
 
+_AUTHORIZATION_SCHEMES = frozenset(
+    {
+        "apikey",
+        "aws4-hmac-sha256",
+        "basic",
+        "bearer",
+        "digest",
+        "negotiate",
+        "oauth",
+        "token",
+    }
+)
+
+
+def _redact_authorization_value(match: re.Match[str]) -> str:
+    parts = match.group(2).split(maxsplit=1)
+    if len(parts) == 2 and parts[0].lower() in _AUTHORIZATION_SCHEMES:
+        return f"{match.group(1)}{parts[0]} [redacted]"
+    return f"{match.group(1)}[redacted]"
+
+
+def _redact_explicit_credential(match: re.Match[str]) -> str:
+    normalized_key = _normalize_sensitive_query_key(match.group("key"))
+    if normalized_key not in _SENSITIVE_URL_QUERY_KEYS:
+        return match.group(0)
+    normalized_value = match.group("value").strip().lower()
+    if normalized_key == "authorization" and normalized_value in {
+        "basic",
+        "bearer",
+        "digest",
+    }:
+        return match.group(0)
+    raw_value = match.group("value")
+    if (
+        len(raw_value) >= 2
+        and raw_value[0] in {'"', "'"}
+        and raw_value[-1] == raw_value[0]
+    ):
+        return (
+            f"{match.group('prefix')}{raw_value[0]}"
+            f"[redacted]{raw_value[-1]}"
+        )
+    return f"{match.group('prefix')}[redacted]"
+
+
 def _redact_summary_text(value: str) -> str:
     redacted = _AUTHORIZATION_QUOTED_VALUE_RE.sub(
         lambda match: (
@@ -379,11 +481,19 @@ def _redact_summary_text(value: str) -> str:
         redacted,
     )
     redacted = _AUTHORIZATION_VALUE_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2) or ''}[redacted]",
+        _redact_authorization_value,
         redacted,
     )
     redacted = _BEARER_VALUE_RE.sub(
         lambda match: f"{match.group(1)}[redacted]",
+        redacted,
+    )
+    redacted = _COOKIE_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}[redacted]",
+        redacted,
+    )
+    redacted = _EXPLICIT_CREDENTIAL_VALUE_RE.sub(
+        _redact_explicit_credential,
         redacted,
     )
     for pattern in _STANDALONE_SECRET_PATTERNS:

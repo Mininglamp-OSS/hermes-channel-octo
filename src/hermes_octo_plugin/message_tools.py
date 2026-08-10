@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 import uuid
 from typing import Any
 
@@ -38,7 +37,6 @@ _MAX_MEDIA_BYTES = api.MAX_OUTBOUND_MEDIA_BYTES
 _MAX_BLOCKS = 50
 _MAX_TEXT_CHARS = 20_000
 _MAX_SOURCE_CHARS = 4_096
-_MAX_FILENAME_BYTES = 255
 
 _TEXT_BLOCK_SCHEMA = {
     "type": "object",
@@ -184,17 +182,7 @@ def _context() -> tuple[Any, TrustedOctoRoute] | str:
 
 
 def _safe_filename(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip()
-    if (
-        not candidate
-        or candidate != Path(candidate).name
-        or any(ord(char) < 32 or ord(char) == 127 for char in candidate)
-        or len(candidate.encode("utf-8")) > _MAX_FILENAME_BYTES
-    ):
-        return None
-    return candidate
+    return api.safe_media_filename(value)
 
 
 def _positive_integer(value: object, field: str) -> int | None:

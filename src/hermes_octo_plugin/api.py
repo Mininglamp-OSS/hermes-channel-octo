@@ -87,6 +87,25 @@ def _response_error(path: str, response: aiohttp.ClientResponse) -> OctoApiError
 
 # ─── MIME Type Helpers ───────────────────────────────────────────────────────
 MAX_OUTBOUND_MEDIA_BYTES = 100 * 1024 * 1024
+MAX_MEDIA_FILENAME_BYTES = 255
+
+
+def safe_media_filename(value: object) -> str | None:
+    """Return a safe basename for Octo media metadata, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or candidate in {".", ".."}
+        or "/" in candidate
+        or "\\" in candidate
+        or candidate != Path(candidate).name
+        or any(ord(char) < 32 or ord(char) == 127 for char in candidate)
+        or len(candidate.encode("utf-8")) > MAX_MEDIA_FILENAME_BYTES
+    ):
+        return None
+    return candidate
 
 _MIME_MAP: dict[str, str] = {
     ".jpg": "image/jpeg",
@@ -331,8 +350,9 @@ async def post_json(
         json=payload,
         headers=headers,
         timeout=timeout or DEFAULT_TIMEOUT,
+        allow_redirects=False,
     ) as resp:
-        if not resp.ok:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         text = await resp.text()
         if not text:
@@ -354,8 +374,13 @@ async def get_json(
     """
     url = f"{api_url.rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {bot_token}"}
-    async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-        if not resp.ok:
+    async with session.get(
+        url,
+        headers=headers,
+        timeout=DEFAULT_TIMEOUT,
+        allow_redirects=False,
+    ) as resp:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         text = await resp.text()
         if not text:

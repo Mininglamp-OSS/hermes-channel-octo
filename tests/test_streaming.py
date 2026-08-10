@@ -9,12 +9,17 @@ message when the turn completes.
 from __future__ import annotations
 from typing import Any, cast
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hermes_octo_plugin.adapter import MAX_MESSAGE_LENGTH, OctoAdapter
-from hermes_octo_plugin.types import ChannelType, MentionEntity, SendMessageResult
+from hermes_octo_plugin.types import (
+    ChannelType,
+    GroupMember,
+    MentionEntity,
+    SendMessageResult,
+)
 from tests.conftest import make_bare_adapter
 
 
@@ -94,6 +99,8 @@ async def test_complete_send_converts_mention_and_preserves_trailing_text() -> N
     adapter = _make_adapter()
     adapter._chat_kind["chatA"] = ChannelType.Group
     adapter._group_member_rosters["chatA"] = {"member-1": "成员"}
+    adapter._group_robot_map["chatA"] = {"member-1": False}
+    adapter._group_cache_timestamps["chatA"] = 2**63
     complete = "结果：@[member-1:成员]，尾部完整。"
 
     with patch(
@@ -113,6 +120,143 @@ async def test_complete_send_converts_mention_and_preserves_trailing_text() -> N
         ("member-1", 3, 3)
     ]
 
+
+
+@pytest.mark.asyncio
+async def test_unknown_group_roster_is_fetched_before_sending_mentions() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    complete = "结果：@[member-1:成员]，尾部完整。"
+    get_members = AsyncMock(
+        return_value=[GroupMember(uid="member-1", name="成员", robot=False)]
+    )
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", complete)
+
+    assert result.success is True
+    get_members.assert_awaited_once()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "结果：@成员，尾部完整。"
+    assert kwargs["mention_uids"] == ["member-1"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_group_roster_failure_does_not_send_unverified_mentions() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(side_effect=RuntimeError("offline")),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", "@[member-1:成员]")
+
+    assert result.success is False
+    assert "roster" in (result.error or "")
+    send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_later_chunk_roster_failure_sends_no_partial_message() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter.truncate_message = MagicMock(
+        return_value=["first chunk", "@[member-1:成员]"]
+    )
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(side_effect=RuntimeError("offline")),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(),
+        ) as send_message,
+    ):
+        result = await adapter.send(
+            "chatA",
+            "first chunk@[member-1:成员]",
+        )
+
+    assert result.success is False
+    assert "roster" in (result.error or "")
+    send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_split_structured_mention_sends_no_raw_fragments() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter.truncate_message = MagicMock(
+        return_value=["prefix @[member-1", ":成员] suffix"]
+    )
+    get_members = AsyncMock()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(),
+        ) as send_message,
+    ):
+        result = await adapter.send(
+            "chatA",
+            "prefix @[member-1:成员] suffix",
+        )
+
+    assert result.success is False
+    assert "mention" in (result.error or "")
+    get_members.assert_not_awaited()
+    send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roster_uid", ["", " ", "/", 123])
+async def test_unusable_group_roster_sends_no_unverified_mentions(
+    roster_uid: Any,
+) -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(
+                return_value=[
+                    GroupMember(uid=roster_uid, name="成员", robot=False)
+                ]
+            ),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", "@[member-1:成员]")
+
+    assert result.success is False
+    assert "roster" in (result.error or "")
+    send_message.assert_not_awaited()
 
 @pytest.mark.asyncio
 async def test_send_returns_the_real_server_message_id() -> None:

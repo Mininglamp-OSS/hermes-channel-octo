@@ -13,6 +13,7 @@ from hermes_octo_plugin.types import (
     RICH_TEXT_BLOCK_TEXT,
     RICH_TEXT_IMAGE_PLACEHOLDER,
     ChannelType,
+    GroupMember,
     MessagePayload,
     MessageType,
     RichTextBlock,
@@ -382,6 +383,11 @@ class TestSendImageWithCaption:
                    new_callable=AsyncMock, return_value=(b"", "image/webp", "y.webp")), \
              patch("hermes_octo_plugin.adapter.api.parse_image_dimensions",
                    return_value=None), \
+             patch(
+                 "hermes_octo_plugin.adapter.api.get_group_members",
+                 new_callable=AsyncMock,
+                 return_value=[GroupMember(uid="u1", name="Alice", robot=False)],
+             ), \
              patch("hermes_octo_plugin.adapter.api.upload_and_get_url",
                    new_callable=AsyncMock, return_value="https://cdn/y.webp"), \
              patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
@@ -399,7 +405,7 @@ class TestSendImageWithCaption:
             result = await a.send_image(
                 chat_id="G1",
                 image_url="https://source/y.webp",
-                caption="fallback caption",
+                caption="@[u1:Alice] fallback caption",
             )
 
         assert result.success is True
@@ -407,6 +413,60 @@ class TestSendImageWithCaption:
         mock_rich.assert_not_awaited()
         mock_media.assert_awaited_once()
         mock_text.assert_awaited_once()
+        kwargs = mock_text.await_args.kwargs
+        assert kwargs["content"] == "@Alice fallback caption"
+        assert kwargs["mention_uids"] == ["u1"]
+        assert [entity.uid for entity in kwargs["mention_entities"]] == ["u1"]
+
+    @pytest.mark.asyncio
+    async def test_caption_without_dims_roster_failure_sends_nothing(self):
+        a = _make_adapter_with_api()
+        a._http_session = MagicMock()
+        a._bot_token = "tok"
+        a._chat_kind = {"G1": ChannelType.Group}
+        download = AsyncMock(return_value=(b"", "image/webp", "y.webp"))
+        upload = AsyncMock(return_value="https://cdn/y.webp")
+        send_media = AsyncMock()
+        send_text = AsyncMock()
+
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_members",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.download_file",
+                new=download,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.parse_image_dimensions",
+                return_value=None,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.upload_and_get_url",
+                new=upload,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.send_media_message",
+                new=send_media,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.send_message",
+                new=send_text,
+            ),
+        ):
+            result = await a.send_image(
+                chat_id="G1",
+                image_url="https://source/y.webp",
+                caption="@[u1:Alice] fallback caption",
+            )
+
+        assert result.success is False
+        assert "roster" in (result.error or "")
+        download.assert_not_awaited()
+        upload.assert_not_awaited()
+        send_media.assert_not_awaited()
+        send_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_caption_uses_legacy_image_path(self):
@@ -634,6 +694,8 @@ class TestSendImageCaptionMentions:
         a._bot_token = "tok"
         a._chat_kind = {"G1": ChannelType.Group}
         a._group_member_rosters = {"G1": {"u1": "Alice"}}
+        a._group_robot_map = {"G1": {"u1": False}}
+        a._group_cache_timestamps["G1"] = 2**63
 
         # Structured mention tokens are converted to visible names, but only
         # current parent-group members may become actionable mention pills.
@@ -665,7 +727,7 @@ class TestSendImageCaptionMentions:
         assert "@Alice and @Mallory look" == blocks[0].text
 
     @pytest.mark.asyncio
-    async def test_caption_mentions_fail_closed_without_group_roster(self):
+    async def test_caption_mentions_refresh_missing_group_roster(self):
         a = _make_adapter_with_api()
         a._http_session = MagicMock()
         a._bot_token = "tok"
@@ -678,6 +740,11 @@ class TestSendImageCaptionMentions:
                    return_value=(200, 100)), \
              patch("hermes_octo_plugin.adapter.api.upload_and_get_url",
                    new_callable=AsyncMock, return_value="https://cdn/y.png"), \
+             patch(
+                 "hermes_octo_plugin.adapter.api.get_group_members",
+                 new_callable=AsyncMock,
+                 return_value=[GroupMember(uid="u1", name="Alice", robot=False)],
+             ), \
              patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
                    new_callable=AsyncMock) as mock_rich:
             result = await a.send_image(
@@ -689,8 +756,8 @@ class TestSendImageCaptionMentions:
         assert result.success is True
         kwargs = mock_rich.await_args.kwargs
         assert kwargs["blocks"][0].text == "@Alice look"
-        assert kwargs["mention_uids"] == []
-        assert kwargs["mention_entities"] == []
+        assert kwargs["mention_uids"] == ["u1"]
+        assert [entity.uid for entity in kwargs["mention_entities"]] == ["u1"]
 
     @pytest.mark.asyncio
     async def test_reply_to_forwarded_to_rich_text_path(self):

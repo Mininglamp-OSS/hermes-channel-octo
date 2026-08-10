@@ -132,7 +132,7 @@ def test_automatic_error_summary_redacts_only_explicit_credentials() -> None:
 
     assert summary.startswith("401 from https://api.example/v1/items?")
     assert "page=2" in summary
-    assert summary.count("[redacted]") >= 3
+    assert summary.count("[redacted]") >= 2
     assert "ghp_url_secret" not in summary
     assert "sk-live-secret" not in summary
     assert "ghp_direct_secret" not in summary
@@ -176,6 +176,47 @@ def test_automatic_error_summary_redacts_only_explicit_credentials() -> None:
             '{"Authorization": "Digest username=\\"bot\\", response=\\"quoted-digest\\""}',
             "quoted-digest",
         ),
+        (
+            "psql: password=SuperSecret123 host=db",
+            "SuperSecret123",
+        ),
+        (
+            "request failed api_key=sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "X-Api-Key: sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "token: sk-live-9f8e7d6c5b4a39281706",
+            "sk-live-9f8e7d6c5b4a39281706",
+        ),
+        (
+            "Cookie: session=abcdef123456; csrftoken=zzz",
+            "abcdef123456",
+        ),
+        (
+            '{"password": "quoted-password", "host": "db"}',
+            "quoted-password",
+        ),
+        (
+            "{'api_key': 'quoted-api-key', 'mode': 'debug'}",
+            "quoted-api-key",
+        ),
+        (
+            '{"Cookie": "session=quoted-cookie; csrftoken=csrf"}',
+            "quoted-cookie",
+        ),
+        (
+            "Authorization: Token custom-authorization-secret",
+            "custom-authorization-secret",
+        ),
+        (
+            "Authorization: OAuth oauth_consumer_key=consumer, "
+            "oauth_signature=oauth-secret",
+            "oauth-secret",
+        ),
     ],
 )
 def test_automatic_error_summary_redacts_all_recognized_credentials(
@@ -186,6 +227,12 @@ def test_automatic_error_summary_redacts_all_recognized_credentials(
 
     assert credential not in summary
     assert "[redacted]" in summary
+
+
+def test_automatic_error_summary_preserves_noncredential_assignments() -> None:
+    error = "worker failed: mode=debug retry_count=2"
+
+    assert cards.sanitize_error_text(error) == error
 
 
 def test_recursive_limit_helpers_count_rendered_card_structure() -> None:

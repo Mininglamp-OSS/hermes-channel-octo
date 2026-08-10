@@ -184,6 +184,33 @@ class TestApiFailureTruth:
         assert "secret-token-from-backend" not in str(exc_info.value)
 
     @pytest.mark.asyncio
+    async def test_authenticated_json_helpers_reject_redirects_without_following(
+        self,
+    ):
+        session = MagicMock()
+        session.post = MagicMock(return_value=_RedirectResponse())
+        session.get = MagicMock(return_value=_RedirectResponse())
+
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await post_json(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "/v1/bot/example",
+                {"value": 1},
+            )
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await api.get_json(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "/v1/bot/example",
+            )
+
+        assert session.post.call_args.kwargs["allow_redirects"] is False
+        assert session.get.call_args.kwargs["allow_redirects"] is False
+
+    @pytest.mark.asyncio
     async def test_presigned_upload_error_never_exposes_response_body_or_url(self):
         upload_url = "https://storage.example/upload?signature=secret"
         session = _FailedApiSession()
@@ -740,7 +767,7 @@ class TestSendReadReceipt:
     async def test_sends_correct_payload(self):
         mock_session = AsyncMock()
         mock_response = AsyncMock()
-        mock_response.ok = True
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value="null")
         mock_response.json = AsyncMock(return_value=None)
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
@@ -772,7 +799,7 @@ class TestStreamAPI:
 
         mock_session = AsyncMock()
         mock_response = AsyncMock()
-        mock_response.ok = True
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='{"stream_no": "s123"}')
         mock_response.json = AsyncMock(return_value={"stream_no": "s123"})
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
@@ -802,7 +829,7 @@ class TestGetChannelMessages:
 
         mock_session = AsyncMock()
         mock_response = AsyncMock()
-        mock_response.ok = True
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value=json.dumps({
             "messages": [
                 {"from_uid": "user1", "payload": encoded_payload, "timestamp": 1000},
@@ -913,7 +940,7 @@ class TestThreadApi:
     async def test_list_threads_accepts_bare_array_response(self):
         mock_session = AsyncMock()
         mock_response = AsyncMock()
-        mock_response.ok = True
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='[{"short_id":"t1","name":"测试 octo"}]')
         mock_response.json = AsyncMock(return_value=[{"short_id": "t1", "name": "测试 octo"}])
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
@@ -930,7 +957,7 @@ class TestThreadApi:
     async def test_list_thread_members_accepts_bare_array_response(self):
         mock_session = AsyncMock()
         mock_response = AsyncMock()
-        mock_response.ok = True
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='[{"uid":"u1","name":"董振兴"}]')
         mock_response.json = AsyncMock(return_value=[{"uid": "u1", "name": "董振兴"}])
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)

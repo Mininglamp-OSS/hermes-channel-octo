@@ -340,7 +340,9 @@ class TestConvertStructuredMentions:
         )
         text = "@[abc123:Alice] hello"
         content, entities, uids = convert_structured_mentions(
-            text, parse_structured_mentions(text),
+            text,
+            parse_structured_mentions(text),
+            None,
         )
         assert content == "@Alice hello"
         assert uids == ["abc123"]
@@ -357,7 +359,9 @@ class TestConvertStructuredMentions:
         )
         text = "prefix @[u1:刘建辉] middle @[u2:Alice] tail"
         content, entities, uids = convert_structured_mentions(
-            text, parse_structured_mentions(text),
+            text,
+            parse_structured_mentions(text),
+            None,
         )
         assert content == "prefix @刘建辉 middle @Alice tail"
         # First entity: starts at offset 7 ("prefix " is 7 chars)
@@ -374,7 +378,9 @@ class TestConvertStructuredMentions:
 
         text = "😀 @[u1:A😀] tail"
         content, entities, _ = convert_structured_mentions(
-            text, parse_structured_mentions(text),
+            text,
+            parse_structured_mentions(text),
+            None,
         )
 
         assert content == "😀 @A😀 tail"
@@ -387,7 +393,9 @@ class TestConvertStructuredMentions:
         )
         text = "@[u1:Bob] and @[u2:Bob]"
         content, entities, _ = convert_structured_mentions(
-            text, parse_structured_mentions(text),
+            text,
+            parse_structured_mentions(text),
+            None,
         )
         assert content == "@Bob and @Bob"
         assert entities[0].offset == 0
@@ -397,7 +405,11 @@ class TestConvertStructuredMentions:
 
     def test_empty_mentions_passes_through(self):
         from hermes_octo_plugin.mention import convert_structured_mentions
-        content, entities, uids = convert_structured_mentions("hello world", [])
+        content, entities, uids = convert_structured_mentions(
+            "hello world",
+            [],
+            None,
+        )
         assert content == "hello world"
         assert entities == []
         assert uids == []

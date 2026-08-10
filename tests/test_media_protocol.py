@@ -32,6 +32,29 @@ class _NotFoundResponse:
         return None
 
 
+class _UnexpectedBody:
+    def __init__(self):
+        self.called = False
+
+    def iter_chunked(self, _size):
+        self.called = True
+        raise AssertionError("redirect body must not be consumed")
+
+
+class _RedirectResponse:
+    ok = True
+    status = 302
+
+    def __init__(self):
+        self.content = _UnexpectedBody()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+
 def test_bearer_auth_is_limited_to_exact_configured_api_or_cdn_origins():
     adapter = make_bare_adapter()
     adapter._api_url = "https://api.octo.example/v1"
@@ -73,6 +96,26 @@ async def test_inbound_media_download_passes_only_origin_scoped_auth(
     assert await adapter._download_inbound_media_to_local(url, "image/png") is None
     assert adapter._http_session.get.call_args.kwargs["headers"] == expected_headers
 
+
+@pytest.mark.asyncio
+async def test_inbound_media_rejects_redirect_without_reading_body():
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._api_url = "https://api.octo.example/v1"
+    adapter._bot_token = "test-token"
+    adapter._http_session = MagicMock()
+    response = _RedirectResponse()
+    adapter._http_session.get.return_value = response
+
+    assert (
+        await adapter._download_inbound_media_to_local(
+            "https://api.octo.example/file/a.png",
+            "image/png",
+        )
+        is None
+    )
+
+    assert response.content.called is False
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -341,6 +384,26 @@ async def test_inbound_file_download_passes_only_origin_scoped_auth(
 
 
 @pytest.mark.asyncio
+async def test_inbound_file_rejects_redirect_without_reading_body():
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._api_url = "https://api.octo.example/v1"
+    adapter._bot_token = "test-token"
+    adapter._http_session = MagicMock()
+    response = _RedirectResponse()
+    adapter._http_session.get.return_value = response
+
+    result = await adapter._resolve_inbound_file(
+        "https://api.octo.example/download/report.pdf",
+        "report.pdf",
+        None,
+    )
+
+    assert result == "[文件: report.pdf - 下载失败 HTTP 302]"
+    assert response.content.called is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("msg_type", "kwargs", "expected_payload"),
     [
@@ -559,6 +622,92 @@ async def test_native_media_accepts_data_urls() -> None:
         "text/plain",
     )
     send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_name",
+    [
+        "../report.txt",
+        "nested/report.txt",
+        "report\nname.txt",
+        f"{'x' * 256}.txt",
+        r"..\report.txt",
+        r"nested\report.txt",
+        ".",
+        "..",
+    ],
+)
+async def test_native_document_rejects_unsafe_explicit_filename(
+    file_name: str,
+) -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    upload = AsyncMock(return_value="https://cdn.example/uploaded")
+    send = AsyncMock()
+
+    with (
+        patch.object(
+            adapter,
+            "_load_outbound_media",
+            AsyncMock(
+                return_value=(
+                    b"local media",
+                    "application/octet-stream",
+                    "report.txt",
+                )
+            ),
+        ),
+        patch.object(api, "upload_and_get_url", upload),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await adapter.send_document(
+            "group-1",
+            "/authorized/report.txt",
+            file_name=file_name,
+        )
+
+    assert result.success is False
+    assert result.error == "media filename is invalid"
+    upload.assert_not_awaited()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_document_rejects_unsafe_source_derived_filename() -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    upload = AsyncMock(return_value="https://cdn.example/uploaded")
+    send = AsyncMock()
+
+    with (
+        patch.object(
+            adapter,
+            "_load_outbound_media",
+            AsyncMock(
+                return_value=(
+                    b"remote media",
+                    "application/pdf",
+                    "../derived.pdf",
+                )
+            ),
+        ),
+        patch.object(api, "upload_and_get_url", upload),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await adapter.send_document(
+            "group-1",
+            "https://source.example/report.pdf",
+        )
+
+    assert result.success is False
+    assert result.error == "media filename is invalid"
+    upload.assert_not_awaited()
+    send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

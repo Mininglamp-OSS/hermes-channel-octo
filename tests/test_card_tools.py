@@ -362,6 +362,41 @@ async def test_card_tools_reject_model_controlled_route_or_identity(handler, arg
     assert result == {"ok": False, "error": "trusted session fields cannot be supplied"}
 
 
+@pytest.mark.asyncio
+async def test_gateway_background_worker_preserves_trusted_card_route() -> None:
+    from gateway.run import GatewayRunner
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    adapter = _Adapter()
+    runner = object.__new__(GatewayRunner)
+    tokens = set_session_vars(
+        platform="octo",
+        chat_id="group-1",
+        user_id="user-1",
+        session_key="octo:group-1:user-1",
+    )
+    try:
+        route = await runner._run_in_executor_with_context(
+            lambda: card_tools._trusted_route(
+                adapter,
+                require_session_key=True,
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+        shutdown_executor = getattr(runner, "_shutdown_executor", None)
+        if shutdown_executor is not None:
+            shutdown_executor()
+
+    assert route == card_tools.TrustedOctoRoute(
+        channel_id="group-1",
+        chat_id="group-1",
+        channel_type=ChannelType.Group,
+        requester_uid="user-1",
+        session_key="octo:group-1:user-1",
+    )
+
+
 def test_card_tool_schemas_expose_no_destination_or_identity_fields() -> None:
     for schema in (
         card_tools.DISPLAY_CARD_TOOL_SCHEMA,
