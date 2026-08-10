@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -147,6 +148,32 @@ async def test_reconnect_replaces_a_live_heartbeat_task_before_starting_another(
         adapter._heartbeat_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await adapter._heartbeat_task
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replaces_a_live_receive_loop_without_retiring_new_connection():
+    adapter = make_bare_adapter()
+    blocker = asyncio.Event()
+    adapter._connected = True
+    adapter._need_reconnect = True
+    adapter._ws = SimpleNamespace(recv=AsyncMock(side_effect=blocker.wait))
+    old_task = asyncio.create_task(adapter._receive_loop())
+    adapter._recv_task = old_task
+    await asyncio.sleep(0)
+
+    try:
+        with patch.object(adapter, "_spawn_reconnect_task") as reconnect:
+            await adapter._start_receive_task()
+            await asyncio.sleep(0)
+
+        assert old_task.cancelled() or old_task.done()
+        assert adapter._connected is True
+        assert adapter._recv_task is not old_task
+        assert not adapter._recv_task.done()
+        reconnect.assert_not_called()
+    finally:
+        adapter._recv_task.cancel()
+        await adapter._recv_task
 
 
 @pytest.mark.asyncio

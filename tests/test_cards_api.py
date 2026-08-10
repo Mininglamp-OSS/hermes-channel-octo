@@ -164,9 +164,9 @@ class TestCardApi:
         assert body["channel_type"] == ChannelType.Group
         assert body["on_behalf_of"] == "grantor-1"
         assert body["content_edit"] == (
-            '{"type": 17, "card": {"type": "AdaptiveCard", "version": "1.5", '
-            '"body": []}, "profile": "octo/v1", "card_version": "1.5", '
-            '"plain": "working", "card_seq": 3, "transient": true}'
+            '{"type":17,"card":{"type":"AdaptiveCard","version":"1.5",'
+            '"body":[]},"profile":"octo/v1","card_version":"1.5",'
+            '"plain":"working","card_seq":3,"transient":true}'
         )
 
     @pytest.mark.asyncio
@@ -312,6 +312,42 @@ class TestCardApi:
                 )
 
         assert post_json.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_edit_card_budget_matches_the_serialized_content_edit_bytes(self):
+        card = {
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": "中文" * 100}],
+        }
+        budget = cards.card_payload_bytes(
+            card,
+            None,
+            card_seq=1,
+            transient=True,
+        )
+        with (
+            patch.object(cards, "DEFAULT_MAX_CARD_PAYLOAD_BYTES", budget),
+            patch.object(
+                api,
+                "post_json",
+                AsyncMock(return_value=None),
+            ) as post_json,
+        ):
+            await api.edit_card_message(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                channel_id="group-1",
+                channel_type=ChannelType.Group,
+                message_id="card-1",
+                card=card,
+                card_seq=1,
+                transient=True,
+            )
+
+        content_edit = post_json.await_args.args[4]["content_edit"]
+        assert len(content_edit.encode("utf-8")) <= budget
 
     @pytest.mark.asyncio
     async def test_card_profile_keeps_404_distinct_from_explicitly_disabled(self):

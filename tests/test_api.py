@@ -201,6 +201,22 @@ class TestApiFailureTruth:
         assert "signature=secret" not in str(exc_info.value)
         assert session.put.call_args.kwargs["allow_redirects"] is False
 
+    @pytest.mark.asyncio
+    async def test_presigned_upload_rejects_redirect_without_following_it(self):
+        session = MagicMock()
+        session.put = MagicMock(return_value=_RedirectResponse())
+
+        with pytest.raises(RuntimeError, match="HTTP 302"):
+            await upload_file_to_presigned_url(
+                session,
+                upload_url="https://storage.example/upload",
+                download_url="https://cdn.example/file",
+                file_data=b"payload",
+                content_type="application/octet-stream",
+            )
+
+        assert session.put.call_args.kwargs["allow_redirects"] is False
+
     def test_read_local_media_rejects_symlink_before_open(self, tmp_path):
         target = tmp_path / "secret.txt"
         target.write_text("secret", encoding="utf-8")
@@ -228,6 +244,10 @@ class TestApiFailureTruth:
             "http://2130706433/private",
             "http://169.254.169.254/latest/meta-data/",
             "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata/latest/meta-data/",
+            "http://localhost/private",
+            "http://service.local/private",
+            "http://service.internal/private",
         ],
     )
     async def test_download_rejects_unsafe_initial_url_before_io(self, unsafe_url: str):
@@ -836,16 +856,48 @@ class TestGroupListApi:
         ]
 
     @pytest.mark.asyncio
-    async def test_fetch_bot_groups_skips_malformed_entries(self):
-        payload = {
-            "groups": [
-                {"group_no": "g1", "name": "Group 1"},
-                None,
-                {"name": "missing id"},
-                {"group_no": 7, "name": "wrong id type"},
-                {"group_no": "g2", "name": 9},
-            ]
-        }
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"items": []},
+            {
+                "groups": [
+                    {"group_no": "g1", "name": "Group 1"},
+                    None,
+                ]
+            },
+            {
+                "groups": [
+                    {"group_no": "g1", "name": "Group 1"},
+                    {"name": "missing id"},
+                ]
+            },
+            {
+                "groups": [
+                    {"group_no": "g1", "name": "Group 1"},
+                    {"group_no": 7, "name": "wrong id type"},
+                ]
+            },
+        ],
+        ids=[
+            "wrong-container",
+            "non-object-entry",
+            "missing-group-id",
+            "wrong-group-id-type",
+        ],
+    )
+    async def test_fetch_bot_groups_rejects_non_authoritative_snapshot(self, payload):
+        with patch.object(api, "get_json", AsyncMock(return_value=payload)):
+            with pytest.raises(RuntimeError, match="malformed group snapshot"):
+                await fetch_bot_groups(
+                    MagicMock(),
+                    "https://api.example.com",
+                    "token",
+                )
+
+    @pytest.mark.asyncio
+    async def test_fetch_bot_groups_normalizes_optional_name(self):
+        payload = {"groups": [{"group_no": "g2", "name": 9}]}
         with patch.object(api, "get_json", AsyncMock(return_value=payload)):
             groups = await fetch_bot_groups(
                 MagicMock(),
@@ -853,10 +905,7 @@ class TestGroupListApi:
                 "token",
             )
 
-        assert groups == [
-            GroupInfo(group_no="g1", name="Group 1"),
-            GroupInfo(group_no="g2", name=""),
-        ]
+        assert groups == [GroupInfo(group_no="g2", name="")]
 class TestThreadApi:
     """Thread endpoints have returned both wrapped dicts and bare arrays."""
 

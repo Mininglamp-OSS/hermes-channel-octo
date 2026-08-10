@@ -192,16 +192,38 @@ def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
     assert registry.claim_edit(**exact) is None
 
 
+def test_default_card_session_ttl_covers_the_default_clarify_window() -> None:
+    with patch(
+        "hermes_octo_plugin.card_sessions.time.monotonic",
+        side_effect=[0.0, 0.0, 3601.0],
+    ):
+        registry = card_events.CardSessionRegistry()
+        registry.register(_session())
+        claim = registry.claim("message-1", 1)
+
+    assert claim.status == "claimed"
+
+
 @pytest.mark.asyncio
 async def test_poller_does_not_ack_unowned_card_actions() -> None:
     cursor = _MemoryCursor(10)
-    callback = AsyncMock(side_effect=["missing", "ignored", "duplicate", "completed"])
+    callback = AsyncMock(
+        side_effect=["missing", "ignored", "duplicate", "completed", "unsupported"]
+    )
     ack = AsyncMock()
     with (
         patch.object(
             card_events.api,
             "fetch_bot_events",
-            AsyncMock(return_value=[_event(11), _event(12), _event(13), _event(14)]),
+            AsyncMock(
+                return_value=[
+                    _event(11),
+                    _event(12),
+                    _event(13),
+                    _event(14),
+                    _event(15),
+                ]
+            ),
         ),
         patch.object(card_events.api, "ack_bot_event", ack),
     ):
@@ -216,9 +238,9 @@ async def test_poller_does_not_ack_unowned_card_actions() -> None:
         await poller.initialize()
         await poller.poll_once()
 
-    assert cursor.saved == [11, 12, 13, 13, 14, 14]
-    assert cursor.pending_saved == [None, None, 13, None, 14, None]
-    assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14]
+    assert cursor.saved == [11, 12, 13, 13, 14, 14, 15, 15]
+    assert cursor.pending_saved == [None, None, 13, None, 14, None, 15, None]
+    assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14, 15]
 
 
 @pytest.mark.asyncio
@@ -696,6 +718,115 @@ async def test_dispatch_bridge_uses_public_handle_message_and_exact_session() ->
     mismatched = _session(session_key="another-session")
     assert await card_events.dispatch_card_action_event(adapter, mismatched, action) is False
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_bridge_preserves_a_non_default_session_profile() -> None:
+    source = SimpleNamespace(profile="work")
+    session = _session(session_key="agent:work:octo:group:group-1:user-1")
+    action = card_events.parse_card_action(_event())
+    assert action is not None
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(extra={}),
+        _message_handler=object(),
+        build_source=MagicMock(return_value=source),
+        handle_message=AsyncMock(),
+    )
+
+    def profiled_session_key(
+        _source,
+        group_sessions_per_user: bool = True,
+        thread_sessions_per_user: bool = False,
+        *,
+        profile: str | None = None,
+    ) -> str:
+        del group_sessions_per_user, thread_sessions_per_user
+        return (
+            "agent:work:octo:group:group-1:user-1"
+            if profile == "work"
+            else "agent:main:octo:group:group-1:user-1"
+        )
+
+    with patch.object(
+        card_events,
+        "build_session_key",
+        profiled_session_key,
+    ):
+        dispatched = await card_events.dispatch_card_action_event(
+            adapter,
+            session,
+            action,
+        )
+
+    assert dispatched is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("action_id", "label"),
+    [("reasoning_stop", "停止"), ("reasoning_retry", "重试")],
+)
+@pytest.mark.asyncio
+async def test_adapter_consumes_owned_registry_reasoning_control_without_user_turn(
+    action_id: str,
+    label: str,
+) -> None:
+    adapter = object.__new__(OctoAdapter)
+    adapter._card_sessions = card_events.CardSessionRegistry()
+    adapter.handle_message = AsyncMock()
+    reasoning_id = "session-1:turn-1:1"
+    adapter._card_sessions.register(
+        _session(
+            binding_id=reasoning_id,
+            action_labels={action_id: label},
+            input_ids=(),
+            kind="reasoning",
+        )
+    )
+    action = card_events.parse_card_action(
+        _event(
+            action_id=action_id,
+            inputs={},
+            data={"reasoningId": reasoning_id},
+        )
+    )
+    assert action is not None
+
+    assert await adapter._handle_card_action_event(action) == "unsupported"
+    assert await adapter._handle_card_action_event(action) == "duplicate"
+    adapter.handle_message.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_registry_reasoning_control_accepts_the_owned_dm_channel_alias() -> None:
+    adapter = object.__new__(OctoAdapter)
+    adapter._card_sessions = card_events.CardSessionRegistry()
+    adapter.handle_message = AsyncMock()
+    reasoning_id = "session-1:turn-1:1"
+    adapter._card_sessions.register(
+        _session(
+            binding_id=reasoning_id,
+            channel_id="user-1",
+            channel_type=ChannelType.DM,
+            action_channel_ids=("user-1", "bot-1"),
+            action_labels={"reasoning_stop": "停止"},
+            input_ids=(),
+            kind="reasoning",
+        )
+    )
+    action = card_events.parse_card_action(
+        _event(
+            channel_id="bot-1",
+            channel_type=1,
+            action_id="reasoning_stop",
+            inputs={},
+            data={"reasoningId": reasoning_id},
+        )
+    )
+    assert action is not None
+
+    assert await adapter._handle_card_action_event(action) == "unsupported"
+    adapter.handle_message.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio

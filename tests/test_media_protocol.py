@@ -515,8 +515,9 @@ async def test_native_remote_media_uses_the_server_upload_limit(method_name: str
     adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
-    async def guarded_download(session, *_args, **_kwargs):
+    async def guarded_download(session, *_args, **kwargs):
         assert isinstance(session.connector, _SSRFGuardConnector)
+        assert kwargs["policy"] is session.transport_policy
         return b"media", "application/octet-stream", "source.bin"
 
     download = AsyncMock(side_effect=guarded_download)

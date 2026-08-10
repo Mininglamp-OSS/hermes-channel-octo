@@ -16,20 +16,33 @@ from typing import Any
 from . import api, cards
 from .agent_tools import _resolve_adapter
 from .api import edit_template_card_message, send_template_card_message
+from .card_sessions import CardSession
 from .card_tools import (
     TrustedOctoRoute,
     _get_card_profile,
     _profile_enabled,
     _trusted_route,
 )
-from .types import CARD_PROFILE_V1
+from .types import CARD_PROFILE_V1, ChannelType
 
 logger = logging.getLogger(__name__)
 _MAX_PROGRESS_TOOL_ENTRIES = 32
+_MAX_PROGRESS_EDIT_EXHAUSTIONS = 2
 _CARD_AUTHORING_TOOLS = frozenset({
     "octo_send_display_card",
     "octo_send_interactive_card",
 })
+
+
+def _progress_edit_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, api.OctoApiError):
+        status = exc.status
+        return (
+            status is None
+            or status in {408, 425, 429}
+            or status >= 500
+        )
+    return not isinstance(exc, (TypeError, ValueError))
 
 
 
@@ -72,8 +85,55 @@ class _ProgressTurn:
     delivery_mode: str | None = None
     template_ref: dict[str, str] | None = None
     capabilities: cards.CardCapabilities | None = None
+    reasoning_submit_actions: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    preserve_registry_session_on_drop: bool = False
 
     initial_delivery: Future[None] = field(default_factory=Future)
+
+
+def _sync_reasoning_card_session(
+    state: _ProgressTurn,
+    *,
+    wire_state: str,
+    preserve_on_drop: bool,
+) -> None:
+    message_id = state.message_id
+    if not message_id:
+        return
+    action_labels = cards.reasoning_action_labels(
+        state.reasoning_submit_actions.get(wire_state, ())
+    )
+    if not action_labels:
+        state.adapter._card_sessions.discard(message_id)
+        state.preserve_registry_session_on_drop = False
+        return
+    reasoning_id = f"{state.session_id}:{state.turn_id}:{state.segment_no}"
+    state.adapter._register_card_session(
+        CardSession(
+            message_id=message_id,
+            binding_id=reasoning_id,
+            session_key=state.route.session_key,
+            chat_id=state.route.chat_id,
+            channel_id=state.route.channel_id,
+            channel_type=state.route.channel_type,
+            requester_uid=state.route.requester_uid,
+            action_channel_ids=(
+                tuple(
+                    dict.fromkeys(
+                        (state.route.channel_id, state.adapter._robot_id)
+                    )
+                )
+                if state.route.channel_type == ChannelType.DM
+                else (state.route.channel_id,)
+            ),
+            card={},
+            plain="处理进度",
+            action_labels=action_labels,
+            input_ids=(),
+            kind="reasoning",
+        )
+    )
+    state.preserve_registry_session_on_drop = preserve_on_drop
 
 class CardProgressController:
     """Thread-safe turn state with serialized network drains on the gateway loop."""
@@ -123,6 +183,12 @@ class CardProgressController:
     def _drop_state_locked(self, key: _ProgressKey) -> None:
         state = self._states.pop(key, None)
         if state is not None:
+            if (
+                state.delivery_mode == "registry"
+                and state.message_id
+                and not state.preserve_registry_session_on_drop
+            ):
+                state.adapter._card_sessions.discard(state.message_id)
             self._release_initial_delivery(state)
 
     def begin(
@@ -489,6 +555,7 @@ class CardProgressController:
         ]
 
     async def _drain(self, key: _ProgressKey) -> None:
+        edit_exhaustions = 0
         while True:
             with self._lock:
                 state = self._states.get(key)
@@ -545,6 +612,12 @@ class CardProgressController:
                             "registry" if selected is not None else "card"
                         )
                         current.capabilities = cards.derive_card_capabilities(manifest)
+                        current.reasoning_submit_actions = (
+                            cards.reasoning_process_submit_actions(
+                                manifest.templating,
+                                selected,
+                            )
+                        )
                     continue
 
                 if not tools:
@@ -630,6 +703,13 @@ class CardProgressController:
                         current.send_started = False
                         current.message_id = result.message_id
                         self._release_initial_delivery(current)
+                        if current.delivery_mode == "registry":
+                            assert wire_data is not None
+                            _sync_reasoning_card_session(
+                                current,
+                                wire_state=str(wire_data["state"]),
+                                preserve_on_drop=current.final,
+                            )
                         current.delivered_revision = revision
                         if current.revision == revision:
                             current.scheduled = False
@@ -659,15 +739,26 @@ class CardProgressController:
                             )
                             delivered = True
                             break
-                        except Exception:
+                        except Exception as exc:
+                            if not _progress_edit_retryable(exc):
+                                raise
                             if attempt < 2:
                                 await asyncio.sleep(0.1 * (2**attempt))
                     if not delivered:
+                        edit_exhaustions += 1
+                        if edit_exhaustions >= _MAX_PROGRESS_EDIT_EXHAUSTIONS:
+                            logger.warning(
+                                "[Octo] progress card edit retries exhausted; "
+                                "dropping progress state"
+                            )
+                            with self._lock:
+                                self._drop_state_locked(key)
+                            return
                         logger.warning(
                             "[Octo] progress card edit retries exhausted; "
                             "retrying the same sequence"
                         )
-                        await asyncio.sleep(0.4)
+                        await asyncio.sleep(0.4 * (2 ** (edit_exhaustions - 1)))
                         continue
                 else:
                     rendered = cards.build_agent_progress_card(
@@ -696,16 +787,28 @@ class CardProgressController:
                             )
                             delivered = True
                             break
-                        except Exception:
+                        except Exception as exc:
+                            if not _progress_edit_retryable(exc):
+                                raise
                             if attempt < 2:
                                 await asyncio.sleep(0.1 * (2**attempt))
                     if not delivered:
+                        edit_exhaustions += 1
+                        if edit_exhaustions >= _MAX_PROGRESS_EDIT_EXHAUSTIONS:
+                            logger.warning(
+                                "[Octo] progress card edit retries exhausted; "
+                                "dropping progress state"
+                            )
+                            with self._lock:
+                                self._drop_state_locked(key)
+                            return
                         logger.warning(
                             "[Octo] progress card edit retries exhausted; "
                             "retrying the same sequence"
                         )
-                        await asyncio.sleep(0.4)
+                        await asyncio.sleep(0.4 * (2 ** (edit_exhaustions - 1)))
                         continue
+                edit_exhaustions = 0
             except Exception:
                 logger.warning("[Octo] progress card update failed", exc_info=True)
                 with self._lock:
@@ -718,6 +821,13 @@ class CardProgressController:
                     return
                 current.card_seq = next_seq
                 current.delivered_revision = revision
+                if current.final and current.delivery_mode == "registry":
+                    assert wire_data is not None
+                    _sync_reasoning_card_session(
+                        current,
+                        wire_state=str(wire_data["state"]),
+                        preserve_on_drop=True,
+                    )
                 if current.revision == revision:
                     current.scheduled = False
                     if current.final:

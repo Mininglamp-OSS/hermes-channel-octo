@@ -887,11 +887,23 @@ async def edit_card_message(
     if transient is not None:
         frame["transient"] = transient
 
+    content_edit = json.dumps(
+        frame,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if (
+        len(content_edit.encode("utf-8"))
+        > card_renderer.DEFAULT_MAX_CARD_PAYLOAD_BYTES
+    ):
+        raise card_renderer.CardLimitError(
+            "card exceeds max_payload_bytes"
+        )
     body: dict[str, Any] = {
         "message_id": str(message_id),
         "channel_id": channel_id,
         "channel_type": channel_type,
-        "content_edit": json.dumps(frame),
+        "content_edit": content_edit,
     }
     if on_behalf_of:
         body["on_behalf_of"] = on_behalf_of
@@ -1380,6 +1392,10 @@ async def upload_file_to_presigned_url(
         timeout=upload_timeout,
         allow_redirects=False,
     ) as resp:
+        if 300 <= resp.status < 400:
+            raise RuntimeError(
+                f"Presigned PUT upload failed (HTTP {resp.status})"
+            )
         if not resp.ok:
             raise RuntimeError(f"Presigned PUT upload failed (HTTP {resp.status})")
     return download_url
@@ -1468,11 +1484,14 @@ def _validate_download_url(
         raise RuntimeError("unsafe download URL")
     if not enforce_host_safety:
         return url
+    trusted = policy is not None and policy.is_trusted(host)
     if (
-        literal is not None
-        and (literal.is_loopback or literal.is_private)
-        and (policy is None or not policy.is_trusted(host))
-    ):
+        is_private_or_metadata_host(host)
+        or (
+            literal is not None
+            and (literal.is_loopback or literal.is_private)
+        )
+    ) and not trusted:
         raise RuntimeError("unsafe download URL")
     return url
 
@@ -1667,14 +1686,14 @@ async def fetch_bot_groups(
     data = await get_json(session, api_url, bot_token, "/v1/bot/groups")
     raw_groups = data.get("groups") if isinstance(data, dict) else data
     if not isinstance(raw_groups, list):
-        return []
+        raise RuntimeError("malformed group snapshot")
     groups: list[GroupInfo] = []
     for raw_group in raw_groups:
         if not isinstance(raw_group, dict):
-            continue
+            raise RuntimeError("malformed group snapshot")
         group_no = raw_group.get("group_no")
         if not isinstance(group_no, str) or not group_no:
-            continue
+            raise RuntimeError("malformed group snapshot")
         raw_name = raw_group.get("name")
         groups.append(
             GroupInfo(

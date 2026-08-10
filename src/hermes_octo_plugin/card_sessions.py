@@ -11,7 +11,7 @@ from typing import Any
 from .types import ChannelType
 
 _MAX_CARD_SESSIONS = 1024
-_CARD_SESSION_TTL_SECONDS = 30 * 60
+_CARD_SESSION_TTL_SECONDS = 24 * 60 * 60
 
 
 def _bounded_message_id(value: object) -> bool:
@@ -51,6 +51,7 @@ class CardSession:
     max_input_text_bytes: int | None = None
     max_inputs_bytes: int | None = None
     clarify: ClarifySession | None = None
+    kind: str = "interactive"
 
 
 @dataclass
@@ -98,6 +99,15 @@ class CardSessionRegistry:
                 expires_at=time.monotonic() + self._ttl_seconds,
             )
 
+
+    def peek(self, message_id: str) -> CardSession | None:
+        with self._lock:
+            entry = self._entry_locked(message_id)
+            return entry.session if entry is not None else None
+
+    def discard(self, message_id: str) -> None:
+        with self._lock:
+            self._entries.pop(message_id, None)
     def claim_edit(
         self,
         *,

@@ -943,8 +943,19 @@ class OctoAdapter(BasePlatformAdapter):
         from .card_events import (
             dispatch_card_session_action,
             handle_card_action,
+            handle_reasoning_card_action,
             render_card_action_status,
         )
+
+        reasoning_status = handle_reasoning_card_action(self._card_sessions, action)
+        if reasoning_status is not None:
+            if reasoning_status == "unsupported":
+                logger.warning(
+                    "[%s] Registry reasoning control is not supported: %s",
+                    self.name,
+                    action.action_id,
+                )
+            return reasoning_status
 
         async def update_status(
             session: CardSession,
@@ -1221,7 +1232,7 @@ class OctoAdapter(BasePlatformAdapter):
 
         self._http_heartbeat_disabled = False
         await self._start_heartbeat_task()
-        self._recv_task = asyncio.create_task(self._receive_loop())
+        await self._start_receive_task()
         self._start_card_event_poller()
         # Only one cleanup loop per adapter lifetime; survives reconnects.
         if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
@@ -1235,6 +1246,23 @@ class OctoAdapter(BasePlatformAdapter):
             )
         self._mark_connected()
         return True
+
+    async def _start_receive_task(self) -> None:
+        """Cancel the previous receive loop before owning the new connection."""
+        previous = self._recv_task
+        current = asyncio.current_task()
+        if previous is current:
+            return
+        if previous and not previous.done():
+            self._recv_task = None
+            previous.cancel()
+            try:
+                await previous
+            except asyncio.CancelledError:
+                pass
+        self._connected = True
+        self._recv_task = asyncio.create_task(self._receive_loop())
+
 
     async def _start_heartbeat_task(self) -> None:
         """Own independent WS (60s) and HTTP presence (30s) loops."""
@@ -2181,12 +2209,14 @@ class OctoAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
         finally:
-            self._connected = False
-            if self._need_reconnect:
-                logger.debug(
-                    "[%s] Receive loop exited — scheduling reconnect", self.name
-                )
-                self._spawn_reconnect_task()
+            if self._recv_task is asyncio.current_task():
+                self._connected = False
+                if self._need_reconnect:
+                    logger.debug(
+                        "[%s] Receive loop exited — scheduling reconnect",
+                        self.name,
+                    )
+                    self._spawn_reconnect_task()
 
     async def _handle_frame(self, frame: bytes) -> None:
         pkt_type, result = decode_packet(frame)
@@ -3677,7 +3707,11 @@ class OctoAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """Delegate Hermes clarify delivery to the isolated integration."""
+        fallback_started = False
+
         async def fallback() -> SendResult:
+            nonlocal fallback_started
+            fallback_started = True
             return await self._send_clarify_fallback(
                 chat_id,
                 question,
@@ -3687,15 +3721,26 @@ class OctoAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
-        return await _deliver_clarify(
-            adapter=self,
-            chat_id=chat_id,
-            question=question,
-            choices=choices,
-            clarify_id=clarify_id,
-            session_key=session_key,
-            fallback=fallback,
-        )
+        try:
+            return await _deliver_clarify(
+                adapter=self,
+                chat_id=chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                fallback=fallback,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if fallback_started:
+                raise
+            logger.warning(
+                "[Octo] native clarify integration failed; using text fallback",
+                exc_info=True,
+            )
+            return await fallback()
 
 
     async def send(
@@ -3848,6 +3893,11 @@ class OctoAdapter(BasePlatformAdapter):
                     source,
                     max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
                     enforce_host_safety=True,
+                    policy=getattr(
+                        download_session,
+                        "transport_policy",
+                        None,
+                    ),
                 )
         file_data, filename = await asyncio.to_thread(
             api.read_authorized_local_media,

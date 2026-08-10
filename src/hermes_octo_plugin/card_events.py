@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import inspect
 import logging
 import math
 import os
@@ -15,7 +16,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from .card_sessions import (
     CardClaim,
@@ -350,6 +351,51 @@ def _action_matches_session(action: CardAction, session: CardSession) -> bool:
     ).encode("utf-8")
     return len(serialized) <= max_inputs
 
+
+def _reasoning_action_matches_session(
+    action: CardAction,
+    session: CardSession,
+) -> bool:
+    channel_matches = (
+        action.channel_id in (session.action_channel_ids or (session.channel_id,))
+        if action.channel_type == ChannelType.DM
+        else action.channel_id == session.channel_id
+    )
+    return (
+        session.kind == "reasoning"
+        and action.message_id == session.message_id
+        and channel_matches
+        and action.channel_type == session.channel_type
+        and action.operator_uid == session.requester_uid
+        and action.action_id in session.action_labels
+        and not action.inputs
+        and action.data.get("reasoningId") == session.binding_id
+    )
+
+
+def handle_reasoning_card_action(
+    registry: CardSessionRegistry,
+    action: CardAction,
+) -> str | None:
+    """Consume an owned Registry control without injecting a user turn."""
+    session = registry.peek(action.message_id)
+    if session is None or session.kind != "reasoning":
+        return None
+    claim = registry.claim(action.message_id, action.event_id)
+    if claim.session is None:
+        return claim.status
+    try:
+        matches = _reasoning_action_matches_session(action, claim.session)
+    except (TypeError, ValueError, UnicodeError):
+        matches = False
+    if claim.status != "claimed":
+        return "duplicate" if matches else "ignored"
+    if not matches:
+        registry.release(action.message_id, action.event_id)
+        return "ignored"
+    registry.complete(action.message_id, action.event_id)
+    return "unsupported"
+
 def _neutralize_action_echo(value: str) -> str:
     return re.sub(r"([\\`*_~\[\]<>])", r"\\\1", value)
 
@@ -674,11 +720,31 @@ async def dispatch_card_action_event(
         user_name=session.requester_uid,
     )
     extra = getattr(adapter.config, "extra", None) or {}
-    derived_session_key = build_session_key(
-        source,
-        group_sessions_per_user=extra.get("group_sessions_per_user", True),
-        thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+    group_sessions_per_user = bool(
+        extra.get("group_sessions_per_user", True)
     )
+    thread_sessions_per_user = bool(
+        extra.get("thread_sessions_per_user", False)
+    )
+    source_profile = getattr(source, "profile", None)
+    if (
+        isinstance(source_profile, str)
+        and source_profile
+        and "profile" in inspect.signature(build_session_key).parameters
+    ):
+        profiled_builder = cast(Callable[..., str], build_session_key)
+        derived_session_key = profiled_builder(
+            source,
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
+            profile=source_profile,
+        )
+    else:
+        derived_session_key = build_session_key(
+            source,
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
+        )
     if derived_session_key != session.session_key:
         return False
     event = MessageEvent(
@@ -825,6 +891,7 @@ class EventPoller:
                     "dead_letter",
                     "invalid",
                     "duplicate",
+                    "unsupported",
                 }
                 pending_ack_event_id = event_id if should_ack else None
                 await self._cursor_store.save(

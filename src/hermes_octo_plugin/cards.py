@@ -12,7 +12,7 @@ from itertools import islice
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 from .types import (
     CARD_PROFILE_V1,
@@ -270,7 +270,9 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset({
     "apikey",
     "auth",
     "authorization",
+    "clientsecret",
     "credential",
+    "key",
     "password",
     "passwd",
     "secret",
@@ -279,9 +281,32 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset({
     "token",
     "xamzsecuritytoken",
     "xamzsignature",
+    "xamzcredential",
     "xgoogcredential",
     "xgoogsignature",
 })
+_URL_QUERY_VALUE_RE = re.compile(r"([?&])([^=&#\s]+)=([^&#\s]*)")
+_AUTHORIZATION_QUOTED_VALUE_RE = re.compile(
+    r"""(?ix)
+    (?P<prefix>['"]?authorization['"]?\s*:\s*)
+    (?P<quote>['"])
+    (?P<value>(?:\\.|(?!(?P=quote)).)*)
+    (?P=quote)
+    """
+)
+_DIGEST_AUTHORIZATION_VALUE_RE = re.compile(
+    r"(?i)\b(authorization\s*:\s*digest)\b[^\r\n]*"
+)
+_AUTHORIZATION_VALUE_RE = re.compile(
+    r"(?i)\b(authorization\s*:\s*)((?:bearer|basic)\s+)?((?!digest\b)[^\s,;]+)"
+)
+_BEARER_VALUE_RE = re.compile(r"(?i)\b(bearer\s+)[^\s,;]+")
+_STANDALONE_SECRET_PATTERNS = (
+    re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b"),
+)
 _PROGRAM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./@:+-]+$")
 _SAFE_TOOL_LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _SUMMARY_MAX_CHARS = 64
@@ -312,6 +337,58 @@ def _origin_domain(raw_url: str) -> str | None:
         return None
     return f"{parsed.scheme.lower()}://{host}"
 
+
+
+def _summary_url_origin(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "[redacted]"
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return "[redacted]"
+    host = hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    authority = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme.lower()}://{authority}"
+
+
+def _normalize_sensitive_query_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", unquote_plus(key).lower())
+
+
+def _redact_query_value(match: re.Match[str]) -> str:
+    if _normalize_sensitive_query_key(match.group(2)) not in _SENSITIVE_URL_QUERY_KEYS:
+        return match.group(0)
+    return f"{match.group(1)}{match.group(2)}=[redacted]"
+
+
+def _redact_summary_text(value: str) -> str:
+    redacted = _AUTHORIZATION_QUOTED_VALUE_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"[redacted]{match.group('quote')}"
+        ),
+        value,
+    )
+    redacted = _URL_QUERY_VALUE_RE.sub(_redact_query_value, redacted)
+    redacted = _DIGEST_AUTHORIZATION_VALUE_RE.sub(
+        lambda match: f"{match.group(1)} [redacted]",
+        redacted,
+    )
+    redacted = _AUTHORIZATION_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2) or ''}[redacted]",
+        redacted,
+    )
+    redacted = _BEARER_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}[redacted]",
+        redacted,
+    )
+    for pattern in _STANDALONE_SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted
 
 def sanitize_visible_text(text: str, *, generic: bool = True) -> str | None:
     """Normalize bounded visible card text without inspecting its meaning."""
@@ -480,7 +557,7 @@ def summarize_tool_params(
     elif strategy == "shell":
         summary = _summarize_shell(params)
     elif strategy == "url":
-        summary = _first_string(params, ("url",))
+        summary = _summary_url_origin(_first_string(params, ("url",)))
     elif strategy == "name":
         summary = _first_string(
             params,
@@ -540,12 +617,12 @@ def localized_tool_label(
 
 
 def sanitize_error_text(error: object) -> str:
-    """Return a short visible error summary without content inspection."""
+    """Return a short visible error summary with explicit credentials redacted."""
     if not isinstance(error, str):
-        return ""
-    summary = re.sub(r"\s+", " ", error).strip()
+        return "Error"
+    summary = _redact_summary_text(error.strip() or "Error")
     if len(summary) > _ERROR_MAX_CHARS:
-        return f"{summary[:_ERROR_MAX_CHARS]}…"
+        return f"{summary[: _ERROR_MAX_CHARS - 3]}..."
     return summary
 
 
@@ -567,7 +644,7 @@ def sanitize_action_url(url: str) -> str:
     ):
         raise ValueError("card action URL must be a safe http URL")
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        normalized_key = re.sub(r"[^a-z0-9]+", "", key.lower())
+        normalized_key = _normalize_sensitive_query_key(key)
         visibly_redacted = value.strip().lower() in {
             "",
             "***",
@@ -1332,6 +1409,10 @@ _REASONING_REQUIRED_VIEWS = {
         frozenset(),
     ),
 }
+_REASONING_ACTION_LABELS = {
+    "reasoning_stop": "停止",
+    "reasoning_retry": "重试",
+}
 
 
 def select_reasoning_process_template(
@@ -1357,7 +1438,7 @@ def select_reasoning_process_template(
         for view_name, (
             wire_profiles,
             required_states,
-            _allowed_actions,
+            allowed_actions,
         ) in _REASONING_REQUIRED_VIEWS.items():
             views = [view for view in template.views if view.name == view_name]
             if len(views) != 1:
@@ -1367,7 +1448,7 @@ def select_reasoning_process_template(
             if (
                 view.wire_profile not in wire_profiles
                 or not required_states.issubset(view.states)
-                or view.submit_actions
+                or set(view.submit_actions) - allowed_actions
             ):
                 valid = False
                 break
@@ -1379,6 +1460,51 @@ def select_reasoning_process_template(
     if sum(template.version == selected.version for template in claimed) != 1:
         return None
     return {"id": selected.id, "version": selected.version}
+
+
+def reasoning_process_submit_actions(
+    templating: CardTemplatingCapability | None,
+    template_ref: Mapping[str, str] | None,
+) -> dict[str, tuple[str, ...]]:
+    """Return the selected Registry template's declared actions by state."""
+    if (
+        template_ref is None
+        or select_reasoning_process_template(templating) != dict(template_ref)
+        or templating is None
+    ):
+        return {}
+    selected = next(
+        (
+            template
+            for template in templating.templates
+            if template.id == template_ref.get("id")
+            and template.version == template_ref.get("version")
+        ),
+        None,
+    )
+    if selected is None:
+        return {}
+    actions_by_state: dict[str, tuple[str, ...]] = {}
+    for view_name, (_, required_states, allowed_actions) in (
+        _REASONING_REQUIRED_VIEWS.items()
+    ):
+        view = next(item for item in selected.views if item.name == view_name)
+        declared = tuple(
+            action
+            for action in view.submit_actions
+            if action in allowed_actions
+        )
+        for state in required_states:
+            actions_by_state[state] = declared
+    return actions_by_state
+
+
+def reasoning_action_labels(actions: Sequence[str]) -> dict[str, str]:
+    return {
+        action: _REASONING_ACTION_LABELS[action]
+        for action in actions
+        if action in _REASONING_ACTION_LABELS
+    }
 
 
 def format_progress_duration(duration_ms: object) -> str:

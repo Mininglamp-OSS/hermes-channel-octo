@@ -126,6 +126,32 @@ async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_clarify_host_integration_failure_uses_text_fallback() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    expected = SendResult(success=True, message_id="text-fallback")
+    fallback = AsyncMock(return_value=expected)
+
+    with (
+        patch.object(BasePlatformAdapter, "send_clarify", fallback),
+        patch(
+            "hermes_octo_plugin.adapter._deliver_clarify",
+            AsyncMock(side_effect=RuntimeError("host integration changed")),
+        ),
+    ):
+        result = await OctoAdapter.send_clarify(
+            adapter,
+            "group-1",
+            "Which option?",
+            ["A", "B"],
+            clarify_id="clarify-host-failure",
+            session_key=_ROUTE.session_key,
+        )
+
+    assert result is expected
+    fallback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_native_clarify_waits_for_scheduled_progress_card() -> None:
     adapter = _bare_clarify_adapter(native=True)
     adapter._gateway_loop = asyncio.get_running_loop()

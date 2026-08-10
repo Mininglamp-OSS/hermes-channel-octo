@@ -10,14 +10,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hermes_octo_plugin import card_progress, cards, types
+from hermes_octo_plugin.api import OctoApiError
+from hermes_octo_plugin.card_sessions import CardSessionRegistry
 from hermes_octo_plugin.card_tools import TrustedOctoRoute
 from hermes_octo_plugin.types import CardProfileManifest, ChannelType, SendMessageResult
-from hermes_octo_plugin.api import OctoApiError
 
 
 class _Adapter:
     _api_url = "https://api.example.invalid"
     _bot_token = "test-token"
+    _robot_id = "bot-1"
     _http_session = object()
     _disconnecting = False
     on_behalf_of: str | None = None
@@ -26,6 +28,7 @@ class _Adapter:
     def __init__(self) -> None:
         self.pending: list[Callable[[], Coroutine[Any, Any, None]]] = []
         self._card_profile_cache = cards.CardProfileCache()
+        self._card_sessions = CardSessionRegistry()
 
     def _schedule_card_progress(
         self,
@@ -33,6 +36,9 @@ class _Adapter:
     ) -> bool:
         self.pending.append(factory)
         return True
+
+    def _register_card_session(self, session) -> None:
+        self._card_sessions.register(session)
 
     async def run_next(self) -> None:
         await self.pending.pop(0)()
@@ -44,6 +50,13 @@ _ROUTE = TrustedOctoRoute(
     channel_type=ChannelType.Group,
     requester_uid="user-1",
     session_key="octo:group-1:user-1",
+)
+_DM_ROUTE = TrustedOctoRoute(
+    chat_id="user-1",
+    channel_id="user-1",
+    channel_type=ChannelType.DM,
+    requester_uid="user-1",
+    session_key="octo:dm:user-1",
 )
 _MANIFEST = CardProfileManifest(
     available=True,
@@ -80,7 +93,7 @@ def test_progress_renderer_uses_allowlisted_bounded_summaries_without_dlp() -> N
     assert "读取文件" in rendered.plain
     assert "扩展工具" in rendered.plain
     assert "AKIA1234567890ABCDEF" not in rendered.plain
-    assert "Authorization: Bearer hidden" in rendered.plain
+    assert "Authorization: Bearer [redacted]" in rendered.plain
     assert "reasoning" not in rendered.plain.lower()
     assert "🤖" not in rendered.plain
 
@@ -114,7 +127,7 @@ def test_current_hermes_tools_have_chinese_labels_and_bounded_parameter_summarie
             "browser_navigate",
             {"url": "https://user:password@docs.example.com/private?q=secret"},
             "打开网页",
-            "https://user:password@docs.example.com/private?q=secret",
+            "https://docs.example.com",
         ),
         (
             "tool_search",
@@ -224,7 +237,8 @@ async def test_progress_lifecycle_sends_then_edits_transient_and_final() -> None
     final = edit.await_args.kwargs
     assert "● 读取文件 · /tmp/a.py · 已完成" in sent["plain"]
     assert "○ 运行命令 · pytest · 失败" in sent["plain"]
-    assert "secret-token-AKIA1234567890ABCDEF" in sent["plain"]
+    assert "secret-token-AKIA1234567890ABCDEF" not in sent["plain"]
+    assert "secret-token-[redacted]" in sent["plain"]
     assert final["card_seq"] == 1
     assert final["transient"] is False
     assert final["plain"].startswith("处理进度 · 已完成")
@@ -888,13 +902,21 @@ async def test_registry_edit_retries_same_sequence_and_recovers_after_exhaustion
                     version="0.3.0",
                     views=(
                         types.CardTemplateViewCapability(
-                            name="active", wire_profile="octo/v2", states=("reasoning", "answering")
+                            name="active",
+                            wire_profile="octo/v2",
+                            states=("reasoning", "answering"),
+                            submit_actions=("reasoning_stop",),
                         ),
                         types.CardTemplateViewCapability(
-                            name="error", wire_profile="octo/v2", states=("error",)
+                            name="error",
+                            wire_profile="octo/v2",
+                            states=("error",),
+                            submit_actions=("reasoning_retry",),
                         ),
                         types.CardTemplateViewCapability(
-                            name="result", wire_profile="octo/v1", states=("completed", "stopped")
+                            name="result",
+                            wire_profile="octo/v1",
+                            states=("completed", "stopped"),
                         ),
                     ),
                 ),
@@ -912,13 +934,22 @@ async def test_registry_edit_retries_same_sequence_and_recovers_after_exhaustion
         patch.object(card_progress.asyncio, "sleep", AsyncMock()),
     ):
         controller.begin(
-            adapter=adapter, route=_ROUTE, session_id="session-1", turn_id="turn-1"
+            adapter=adapter,
+            route=_DM_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
         )
         controller.tool_started(
             session_id="session-1", turn_id="turn-1", tool_call_id="call-1",
             tool_name="read", args={"path": "/tmp/input.py"},
         )
         await adapter.run_next()
+        registered = adapter._card_sessions.peek("reasoning-1")
+        assert registered is not None
+        assert registered.kind == "reasoning"
+        assert registered.binding_id == "session-1:turn-1:0"
+        assert registered.action_labels == {"reasoning_stop": "停止"}
+        assert registered.action_channel_ids == ("user-1", "bot-1")
         controller.tool_finished(
             session_id="session-1", turn_id="turn-1", tool_call_id="call-1",
             tool_name="read", status="ok", result={"match_count": 1},
@@ -927,6 +958,7 @@ async def test_registry_edit_retries_same_sequence_and_recovers_after_exhaustion
         assert edit_template.await_count == 4
         controller.complete(session_id="session-1", turn_id="turn-1")
         await adapter.run_next()
+        assert adapter._card_sessions.peek("reasoning-1") is None
 
     assert [call.kwargs["card_seq"] for call in edit_template.await_args_list] == [1, 1, 1, 1, 2]
     assert edit_template.await_args_list[-1].kwargs["transient"] is False
@@ -998,6 +1030,87 @@ async def test_failed_turn_finalizes_as_stopped_and_closes_running_tools() -> No
     final = send.await_args.kwargs
     assert final["plain"].startswith("处理进度 · 处理失败")
     assert "读取文件 · /tmp/input.txt · 失败" in final["plain"]
+    assert controller.state_count == 0
+
+
+@pytest.mark.asyncio
+async def test_registry_error_progress_keeps_only_the_owned_retry_control() -> None:
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    adapter.progress_card_renderer = "registry"
+    manifest = CardProfileManifest(
+        available=True,
+        enabled=True,
+        templating=types.CardTemplatingCapability(
+            supported=True,
+            wire="template-ref/v1",
+            templates=(
+                types.CardTemplateCapability(
+                    id="ai.reasoning-process",
+                    version="0.3.0",
+                    views=(
+                        types.CardTemplateViewCapability(
+                            name="active",
+                            wire_profile="octo/v2",
+                            states=("reasoning", "answering"),
+                            submit_actions=("reasoning_stop",),
+                        ),
+                        types.CardTemplateViewCapability(
+                            name="error",
+                            wire_profile="octo/v2",
+                            states=("error",),
+                            submit_actions=("reasoning_retry",),
+                        ),
+                        types.CardTemplateViewCapability(
+                            name="result",
+                            wire_profile="octo/v1",
+                            states=("completed", "stopped"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    send_template = AsyncMock(
+        return_value=SendMessageResult(message_id="reasoning-error-1")
+    )
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=manifest),
+        ),
+        patch.object(
+            card_progress,
+            "send_template_card_message",
+            send_template,
+        ),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.txt"},
+        )
+        controller.complete(
+            session_id="session-1",
+            turn_id="turn-1",
+            failed=True,
+            terminal_phase="error",
+        )
+        await adapter.run_next()
+
+    registered = adapter._card_sessions.peek("reasoning-error-1")
+    assert registered is not None
+    assert registered.kind == "reasoning"
+    assert registered.action_labels == {"reasoning_retry": "重试"}
     assert controller.state_count == 0
 
 
@@ -1338,9 +1451,18 @@ async def test_progress_defaults_to_local_type17_when_registry_is_compatible() -
     assert "7 项结果" in final["plain"]
 
 
-@pytest.mark.parametrize("action", ["reasoning_stop", "reasoning_retry"])
-def test_registry_reasoning_template_rejects_unhandled_submit_actions(
+@pytest.mark.parametrize(
+    ("view_name", "action", "accepted"),
+    [
+        ("active", "reasoning_stop", True),
+        ("error", "reasoning_retry", True),
+        ("active", "unexpected_action", False),
+    ],
+)
+def test_registry_reasoning_template_allows_only_declared_submit_actions(
+    view_name: str,
     action: str,
+    accepted: bool,
 ) -> None:
     templating = types.CardTemplatingCapability(
         supported=True,
@@ -1354,13 +1476,13 @@ def test_registry_reasoning_template_rejects_unhandled_submit_actions(
                         name="active",
                         wire_profile="octo/v2",
                         states=("reasoning", "answering"),
-                        submit_actions=(action,) if action == "reasoning_stop" else (),
+                        submit_actions=(action,) if view_name == "active" else (),
                     ),
                     types.CardTemplateViewCapability(
                         name="error",
                         wire_profile="octo/v2",
                         states=("error",),
-                        submit_actions=(action,) if action == "reasoning_retry" else (),
+                        submit_actions=(action,) if view_name == "error" else (),
                     ),
                     types.CardTemplateViewCapability(
                         name="result",
@@ -1372,8 +1494,59 @@ def test_registry_reasoning_template_rejects_unhandled_submit_actions(
         ),
     )
 
-    assert cards.select_reasoning_process_template(templating) is None
+    selected = cards.select_reasoning_process_template(templating)
+    if accepted:
+        assert selected == {"id": "ai.reasoning-process", "version": "0.3.0"}
+    else:
+        assert selected is None
 
+
+
+def test_registry_reasoning_action_map_ignores_extra_template_views() -> None:
+    templating = types.CardTemplatingCapability(
+        supported=True,
+        wire="template-ref/v1",
+        templates=(
+            types.CardTemplateCapability(
+                id="ai.reasoning-process",
+                version="0.3.0",
+                views=(
+                    types.CardTemplateViewCapability(
+                        name="active",
+                        wire_profile="octo/v2",
+                        states=("reasoning", "answering"),
+                        submit_actions=("reasoning_stop",),
+                    ),
+                    types.CardTemplateViewCapability(
+                        name="error",
+                        wire_profile="octo/v2",
+                        states=("error",),
+                        submit_actions=("reasoning_retry",),
+                    ),
+                    types.CardTemplateViewCapability(
+                        name="result",
+                        wire_profile="octo/v1",
+                        states=("completed", "stopped"),
+                    ),
+                    types.CardTemplateViewCapability(
+                        name="surprise",
+                        wire_profile="octo/v2",
+                        states=("reasoning",),
+                        submit_actions=("reasoning_retry",),
+                    ),
+                ),
+            ),
+        ),
+    )
+    selected = cards.select_reasoning_process_template(templating)
+
+    assert cards.reasoning_process_submit_actions(templating, selected) == {
+        "reasoning": ("reasoning_stop",),
+        "answering": ("reasoning_stop",),
+        "error": ("reasoning_retry",),
+        "completed": (),
+        "stopped": (),
+    }
 
 
 def test_registry_reasoning_template_accepts_server_v1_views_without_controls():
@@ -1524,4 +1697,108 @@ async def test_local_progress_reschedules_same_sequence_after_retry_exhaustion()
         1,
         2,
     ]
+    assert controller.state_count == 0
+
+
+@pytest.mark.asyncio
+async def test_local_progress_drops_permanent_edit_failure_without_retrying():
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(
+        return_value=SendMessageResult(message_id="progress-1")
+    )
+    edit = AsyncMock(
+        side_effect=[
+            OctoApiError("/v1/bot/message/edit", status=404),
+            {},
+        ]
+    )
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+        patch.object(card_progress.api, "edit_card_message", edit),
+        patch.object(card_progress.asyncio, "sleep", AsyncMock()),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.py"},
+        )
+        await adapter.run_next()
+        controller.tool_finished(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            status="ok",
+        )
+        await adapter.run_next()
+
+    assert edit.await_count == 1
+    assert controller.state_count == 0
+
+
+@pytest.mark.asyncio
+async def test_local_progress_bounds_consecutive_transient_edit_failures():
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(
+        return_value=SendMessageResult(message_id="progress-1")
+    )
+    edit = AsyncMock(side_effect=RuntimeError("transient"))
+    exhausted_cycles = 0
+
+    async def bounded_sleep(delay: float) -> None:
+        nonlocal exhausted_cycles
+        if delay == 0.4:
+            exhausted_cycles += 1
+            if exhausted_cycles > 2:
+                raise AssertionError("unbounded progress edit retry")
+
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+        patch.object(card_progress.api, "edit_card_message", edit),
+        patch.object(card_progress.asyncio, "sleep", bounded_sleep),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.py"},
+        )
+        await adapter.run_next()
+        controller.tool_finished(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            status="ok",
+        )
+        await adapter.run_next()
+
+    assert edit.await_count == 6
     assert controller.state_count == 0

@@ -112,6 +112,7 @@ class TestPresignedUpload:
     async def test_presigned_put_replays_server_headers_and_returns_download_url(self):
         response = AsyncMock()
         response.ok = True
+        response.status = 200
         response.__aenter__ = AsyncMock(return_value=response)
         response.__aexit__ = AsyncMock(return_value=None)
         session = MagicMock()
@@ -137,6 +138,7 @@ class TestPresignedUpload:
     async def test_presigned_put_replays_arbitrary_server_signed_headers(self):
         response = AsyncMock()
         response.ok = True
+        response.status = 200
         response.__aenter__ = AsyncMock(return_value=response)
         response.__aexit__ = AsyncMock(return_value=None)
         session = MagicMock()

@@ -299,6 +299,11 @@ async def test_space_wide_reads_require_the_explicit_owner(
     with (
         patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(
+            agent_tools.api,
+            "fetch_bot_groups",
+            AsyncMock(return_value=[]),
+        ),
     ):
         result = json.loads(
             await _call_handler(

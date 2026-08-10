@@ -109,6 +109,85 @@ def test_action_url_preserves_non_sensitive_query_parameters() -> None:
     url = "https://example.com/search?q=octo&page=2"
     assert cards.sanitize_action_url(url) == url
 
+
+def test_automatic_tool_url_summary_exposes_only_the_origin() -> None:
+    summary = cards.summarize_tool_params(
+        "fetch",
+        {
+            "url": (
+                "https://cdn.example.com/private/report.pdf"
+                "?X-Amz-Signature=signed-secret#download"
+            )
+        },
+    )
+
+    assert summary == "https://cdn.example.com"
+
+
+def test_automatic_error_summary_redacts_only_explicit_credentials() -> None:
+    summary = cards.sanitize_error_text(
+        "401 from https://api.example/v1/items?token=ghp_url_secret&page=2 "
+        "Authorization: Bearer sk-live-secret GitHub ghp_direct_secret"
+    )
+
+    assert summary.startswith("401 from https://api.example/v1/items?")
+    assert "page=2" in summary
+    assert summary.count("[redacted]") >= 3
+    assert "ghp_url_secret" not in summary
+    assert "sk-live-secret" not in summary
+    assert "ghp_direct_secret" not in summary
+
+@pytest.mark.parametrize(
+    ("error", "credential"),
+    [
+        (
+            "GET https://api.example/items?passwd=pw-value&page=2",
+            "pw-value",
+        ),
+        (
+            "GET https://api.example/items?x-goog-credential=cloud-value&page=2",
+            "cloud-value",
+        ),
+        (
+            "GET https://api.example/items?client_secret=client-value&page=2",
+            "client-value",
+        ),
+        (
+            "GET https://api.example/items?x-amz-credential=amz-value&page=2",
+            "amz-value",
+        ),
+        (
+            "GET https://api.example/items?key=key-value&page=2",
+            "key-value",
+        ),
+        (
+            "Authorization: Basic Zm9vOmJhcg== request failed",
+            "Zm9vOmJhcg==",
+        ),
+        (
+            'Authorization: Digest username="bot", response="digest-value"',
+            "digest-value",
+        ),
+        (
+            "{'Authorization': 'Basic cXVvdGVkLWJhc2lj'}",
+            "cXVvdGVkLWJhc2lj",
+        ),
+        (
+            '{"Authorization": "Digest username=\\"bot\\", response=\\"quoted-digest\\""}',
+            "quoted-digest",
+        ),
+    ],
+)
+def test_automatic_error_summary_redacts_all_recognized_credentials(
+    error: str,
+    credential: str,
+) -> None:
+    summary = cards.sanitize_error_text(error)
+
+    assert credential not in summary
+    assert "[redacted]" in summary
+
+
 def test_recursive_limit_helpers_count_rendered_card_structure() -> None:
     card = {
         "type": "AdaptiveCard",
@@ -233,4 +312,7 @@ def test_tool_labels_and_errors_preserve_content_with_structural_bounds() -> Non
     assert cards.safe_tool_label("token") == "token"
     error = "request failed at https://private.example.com/path?id=secret"
     assert cards.sanitize_error_text(error) == error
-    assert cards.sanitize_error_text("Authorization: Bearer hidden") == "Authorization: Bearer hidden"
+    assert (
+        cards.sanitize_error_text("Authorization: Bearer hidden")
+        == "Authorization: Bearer [redacted]"
+    )
