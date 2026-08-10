@@ -319,8 +319,9 @@ def parse_card_action(event: object) -> CardAction | None:
 
 def _action_matches_session(action: CardAction, session: CardSession) -> bool:
     channel_matches = (
-        action.channel_type == ChannelType.DM
-        or action.channel_id == session.channel_id
+        action.channel_id in (session.action_channel_ids or (session.channel_id,))
+        if action.channel_type == ChannelType.DM
+        else action.channel_id == session.channel_id
     )
     if (
         action.message_id != session.message_id
@@ -398,6 +399,25 @@ def _render_clarify_action_status(
     clarify = session.clarify
     if clarify is None:
         raise ValueError("clarify session is required")
+    if status == "invalid":
+        status_line = "请选择至少一个选项后再提交"
+        card = dict(session.card)
+        source_body = session.card.get("body")
+        body = list(source_body) if isinstance(source_body, list) else []
+        body.append({
+            "type": "TextBlock",
+            "text": status_line,
+            "wrap": True,
+            "spacing": "Medium",
+            "color": "Attention",
+        })
+        card["body"] = body
+        return CardRenderResult(
+            card=card,
+            plain="\n".join(
+                part for part in (session.plain.strip(), status_line) if part
+            ),
+        )
     status_line = {
         "processing": "正在提交…",
         "completed": "已提交",
@@ -523,6 +543,22 @@ async def handle_card_action(
     if not matches:
         registry.release(action.message_id, action.event_id)
         return "ignored"
+    clarify = session.clarify
+    if (
+        clarify is not None
+        and clarify.multi_select
+        and action.action_id == clarify.confirm_action_id
+        and not clarify_integration.selected_choices(clarify, action)
+    ):
+        registry.release(action.message_id, action.event_id)
+        await _update_action_status(
+            update_status,
+            session,
+            action,
+            "invalid",
+            transient=False,
+        )
+        return "invalid"
     try:
         await _update_action_status(
             update_status,
@@ -704,11 +740,12 @@ class EventPoller:
             pending_ack_event_id = await self._cursor_store.load_pending_ack()
         except Exception:
             pending_ack_event_id = None
+        safe_pending_ack_event_id = _safe_event_id(pending_ack_event_id)
         self._pending_ack_event_id = (
-            pending_ack_event_id
+            safe_pending_ack_event_id
             if (
-                _safe_event_id(pending_ack_event_id) is not None
-                and pending_ack_event_id <= self._cursor
+                safe_pending_ack_event_id is not None
+                and safe_pending_ack_event_id <= self._cursor
             )
             else None
         )
@@ -786,6 +823,7 @@ class EventPoller:
                     "expired",
                     "failed",
                     "dead_letter",
+                    "invalid",
                     "duplicate",
                 }
                 pending_ack_event_id = event_id if should_ack else None

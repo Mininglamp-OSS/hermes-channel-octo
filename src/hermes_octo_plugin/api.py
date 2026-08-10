@@ -18,8 +18,9 @@ import stat
 import struct
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, cast
 from urllib.parse import quote, unquote, unquote_to_bytes, urlencode, urljoin, urlparse
 
 import aiohttp
@@ -190,7 +191,7 @@ def authorize_local_media_path(source: str) -> str | None:
     validator = getattr(BasePlatformAdapter, "validate_media_delivery_path", None)
     if not callable(validator):
         return None
-    authorized = validator(source)
+    authorized = cast(Callable[[str], object], validator)(source)
     return authorized if isinstance(authorized, str) and authorized else None
 
 
@@ -220,10 +221,12 @@ def read_local_media(
     if not isinstance(source, str) or not source or max_size <= 0:
         raise ValueError("local media source is unavailable")
     try:
-        candidate = Path(source).expanduser().resolve(strict=True)
-        before = candidate.stat()
+        candidate = Path(source).expanduser()
+        before = candidate.lstat()
     except OSError as exc:
         raise ValueError("local media source is unavailable") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("local media source is unavailable")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(candidate, flags)
@@ -1375,6 +1378,7 @@ async def upload_file_to_presigned_url(
         data=file_data,
         headers=put_headers,
         timeout=upload_timeout,
+        allow_redirects=False,
     ) as resp:
         if not resp.ok:
             raise RuntimeError(f"Presigned PUT upload failed (HTTP {resp.status})")
@@ -1658,15 +1662,32 @@ async def fetch_bot_groups(
     session: aiohttp.ClientSession,
     api_url: str,
     bot_token: str,
-) -> list[dict[str, str]]:
-    """
-    Fetch the list of groups the bot belongs to.
-
-    Returns:
-        List of dicts with 'group_no' and 'name' keys.
-    """
+) -> list[GroupInfo]:
+    """Fetch and normalize the groups visible to the bot."""
     data = await get_json(session, api_url, bot_token, "/v1/bot/groups")
-    return data if isinstance(data, list) else []
+    raw_groups = data.get("groups") if isinstance(data, dict) else data
+    if not isinstance(raw_groups, list):
+        return []
+    groups: list[GroupInfo] = []
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
+            continue
+        group_no = raw_group.get("group_no")
+        if not isinstance(group_no, str) or not group_no:
+            continue
+        raw_name = raw_group.get("name")
+        groups.append(
+            GroupInfo(
+                group_no=group_no,
+                name=raw_name if isinstance(raw_name, str) else "",
+                extra={
+                    key: value
+                    for key, value in raw_group.items()
+                    if key not in {"group_no", "name"}
+                },
+            )
+        )
+    return groups
 
 
 async def get_group_members(

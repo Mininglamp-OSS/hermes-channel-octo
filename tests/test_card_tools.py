@@ -24,6 +24,7 @@ class _Adapter:
     _api_url = "https://api.example.invalid"
     _bot_token = "test-token"
     on_behalf_of: str | None = None
+    _robot_id = "bot-1"
     def __init__(self) -> None:
         self.sessions = []
         self._card_profile_cache = cards.CardProfileCache()
@@ -253,6 +254,54 @@ async def test_interactive_tool_binds_submit_to_trusted_session() -> None:
     assert registered.session_key == "octo:group-1:user-1"
     assert registered.requester_uid == "user-1"
 
+
+
+@pytest.mark.asyncio
+async def test_interactive_tool_retires_card_when_session_binding_fails() -> None:
+    manifest = CardProfileManifest(
+        available=True,
+        enabled=True,
+        profiles=("octo/v2",),
+        card_version="1.5",
+        elements=("TextBlock",),
+        actions=("Action.Submit",),
+    )
+    adapter = _Adapter()
+    adapter._register_card_session = MagicMock(
+        side_effect=RuntimeError("registry unavailable")
+    )
+    edit_card = AsyncMock()
+    with (
+        patch.object(card_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
+        patch("gateway.session_context.get_session_env", side_effect=_session_value),
+        patch.object(card_tools.api, "get_card_profile", AsyncMock(return_value=manifest)),
+        patch.object(
+            card_tools.api,
+            "send_card_message",
+            AsyncMock(return_value=SendMessageResult(message_id="orphan-card")),
+        ),
+        patch.object(card_tools.api, "edit_card_message", edit_card),
+    ):
+        result = json.loads(
+            await card_tools.octo_send_interactive_card_handler(
+                {
+                    "title": "Approve",
+                    "buttons": [{"id": "approve", "label": "Approve"}],
+                }
+            )
+        )
+
+    assert result == {"ok": False, "error": "Octo card delivery failed"}
+    edit_card.assert_awaited_once()
+    kwargs = edit_card.await_args.kwargs
+    assert kwargs["message_id"] == "orphan-card"
+    assert kwargs["card_seq"] == 1
+    assert kwargs["transient"] is False
+    assert not any(
+        isinstance(node, dict) and node.get("type") == "Action.Submit"
+        for node in kwargs["card"].get("actions", ())
+    )
 
 @pytest.mark.asyncio
 async def test_interactive_tool_falls_back_when_v2_manifest_is_unavailable(

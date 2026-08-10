@@ -721,6 +721,26 @@ def test_session_end_preserves_stopped_error_and_incomplete_terminal_states() ->
     ] == ["stopped", "error", "error", "completed"]
 
 
+def test_progress_renderer_accepts_authoritative_error_terminal_phase() -> None:
+    rendered = cards.build_progress_card(
+        phase="error",
+        tools=({
+            "tool_name": "read",
+            "status": "failed",
+            "error": "read failed",
+        },),
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({"TextBlock", "ColumnSet", "Column", "Container", "ActionSet"}),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    assert rendered.plain.startswith("处理进度 · 处理失败")
+    assert rendered.card["body"][1]["isVisible"] is False
+
+
 @pytest.mark.asyncio
 async def test_missing_tool_call_ids_pair_with_last_running_same_name() -> None:
     controller = card_progress.CardProgressController()
@@ -883,7 +903,7 @@ async def test_registry_edit_retries_same_sequence_and_recovers_after_exhaustion
     )
     send_template = AsyncMock(return_value=SendMessageResult(message_id="reasoning-1"))
     edit_template = AsyncMock(
-        side_effect=[failure, failure, failure, {}]
+        side_effect=[failure, failure, failure, {}, {}]
     )
     with (
         patch.object(card_progress.api, "get_card_profile", AsyncMock(return_value=manifest)),
@@ -904,10 +924,11 @@ async def test_registry_edit_retries_same_sequence_and_recovers_after_exhaustion
             tool_name="read", status="ok", result={"match_count": 1},
         )
         await adapter.run_next()
+        assert edit_template.await_count == 4
         controller.complete(session_id="session-1", turn_id="turn-1")
         await adapter.run_next()
 
-    assert [call.kwargs["card_seq"] for call in edit_template.await_args_list] == [1, 1, 1, 2]
+    assert [call.kwargs["card_seq"] for call in edit_template.await_args_list] == [1, 1, 1, 1, 2]
     assert edit_template.await_args_list[-1].kwargs["transient"] is False
     assert controller.state_count == 0
 
@@ -1437,6 +1458,68 @@ async def test_local_progress_edit_retries_same_sequence_before_advancing():
         await adapter.run_next()
 
     assert [call.kwargs["card_seq"] for call in edit.await_args_list] == [
+        1,
+        1,
+        2,
+    ]
+    assert controller.state_count == 0
+
+
+@pytest.mark.asyncio
+async def test_local_progress_reschedules_same_sequence_after_retry_exhaustion():
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(
+        return_value=SendMessageResult(message_id="progress-1")
+    )
+    edit = AsyncMock(
+        side_effect=[
+            RuntimeError("transient"),
+            RuntimeError("transient"),
+            RuntimeError("transient"),
+            {},
+            {},
+        ]
+    )
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+        patch.object(card_progress.api, "edit_card_message", edit),
+        patch.object(card_progress.asyncio, "sleep", AsyncMock()),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.py"},
+        )
+        await adapter.run_next()
+        controller.tool_finished(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            status="ok",
+        )
+        await adapter.run_next()
+        assert edit.await_count == 4
+        controller.complete(session_id="session-1", turn_id="turn-1")
+        await adapter.run_next()
+
+    assert [call.kwargs["card_seq"] for call in edit.await_args_list] == [
+        1,
+        1,
         1,
         1,
         2,

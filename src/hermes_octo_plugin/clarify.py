@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -11,28 +12,47 @@ from typing import Any
 
 import aiohttp
 from gateway.platforms.base import SendResult
-from packaging.version import InvalidVersion, Version
 
 from . import api, cards
 from .card_sessions import CardSession, ClarifySession
-from .types import CARD_PROFILE_V2, SendMessageResult
+from .types import CARD_PROFILE_V2, ChannelType, SendMessageResult
+
+logger = logging.getLogger(__name__)
 
 
 
-_NATIVE_CLARIFY_MIN = Version("0.20")
-_NATIVE_CLARIFY_MAX_EXCLUSIVE = Version("0.21")
+_NATIVE_CLARIFY_MIN = "0.20"
+_NATIVE_CLARIFY_MAX_EXCLUSIVE = "0.21"
 
 
 def native_clarify_supported() -> bool:
     try:
+        from packaging.version import InvalidVersion, Version
+    except ModuleNotFoundError:
+        logger.warning(
+            "[Octo] native clarify disabled: packaging.version is unavailable"
+        )
+        return False
+    try:
         installed = Version(package_version("hermes-agent"))
-    except (PackageNotFoundError, InvalidVersion):
+    except PackageNotFoundError:
+        logger.debug(
+            "[Octo] native clarify disabled: hermes-agent distribution not found"
+        )
+        return False
+    except InvalidVersion as exc:
+        logger.warning(
+            "[Octo] native clarify disabled: invalid hermes-agent version",
+            exc_info=exc,
+        )
         return False
     return (
-        _NATIVE_CLARIFY_MIN
+        Version(_NATIVE_CLARIFY_MIN)
         <= installed
-        < _NATIVE_CLARIFY_MAX_EXCLUSIVE
+        < Version(_NATIVE_CLARIFY_MAX_EXCLUSIVE)
     )
+
+
 def registered_clarify_entry(clarify_id: str) -> Any | None:
     from tools import clarify_gateway
 
@@ -341,12 +361,9 @@ async def deliver(
     except Exception:
         return await fallback_with_deadline(entry)
 
-    client_msg_no = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"hermes-octo:clarify:{clarify_id}",
-        )
-    )
+    # Scope transport idempotency to this delivery attempt. The same Hermes
+    # clarify_id may be reused by a later, semantically distinct prompt.
+    client_msg_no = str(uuid.uuid4())
     if not still_pending(entry):
         return pending_failure()
     try:
@@ -421,6 +438,15 @@ async def deliver(
                 plain=rendered.plain,
                 action_labels=rendered.action_labels,
                 input_ids=rendered.input_ids,
+                action_channel_ids=(
+                    tuple(
+                        dict.fromkeys(
+                            (route.channel_id, adapter._robot_id)
+                        )
+                    )
+                    if route.channel_type == ChannelType.DM
+                    else (route.channel_id,)
+                ),
                 max_input_text_bytes=capabilities.max_input_text_bytes,
                 max_inputs_bytes=capabilities.max_inputs_bytes,
                 clarify=ClarifySession(
@@ -436,6 +462,30 @@ async def deliver(
             )
         )
     except Exception:
+        try:
+            unavailable = cards.build_display_card(
+                title="需要确认",
+                blocks=[{"type": "text", "text": "该确认卡不可用，请重试。"}],
+            )
+            await within_deadline(
+                api.edit_card_message(
+                    adapter._http_session,
+                    adapter._api_url,
+                    adapter._bot_token,
+                    channel_id=route.channel_id,
+                    channel_type=route.channel_type,
+                    message_id=result.message_id,
+                    card=unavailable.card,
+                    card_seq=1,
+                    plain=unavailable.plain,
+                    transient=False,
+                    profile=CARD_PROFILE_V2,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
         return SendResult(
             success=False,
             message_id=result.message_id,

@@ -12,7 +12,7 @@ from itertools import islice
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .types import (
     CARD_PROFILE_V1,
@@ -30,6 +30,8 @@ DEFAULT_MAX_CARD_PAYLOAD_BYTES = 512 << 10
 DEFAULT_MAX_VISIBLE_TEXT_BYTES = 64 << 10
 DEFAULT_MAX_ACTION_DATA_BYTES = 16 << 10
 DEFAULT_MAX_ACTION_DATA_VALUE_BYTES = 512
+DEFAULT_MAX_INPUT_TEXT_BYTES = 4096
+DEFAULT_MAX_INPUTS_BYTES = 16 << 10
 DEFAULT_MAX_DISPLAY_BLOCKS = 100
 
 
@@ -118,12 +120,12 @@ def card_delivery_enabled(
     return manifest.enabled if manifest.available else configured_enabled
 
 
-def _positive_limit(value: object) -> int | None:
+def _positive_limit(value: object, *, ceiling: int) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if not math.isfinite(value) or value <= 0:
         return None
-    return math.floor(value)
+    return min(math.floor(value), ceiling)
 
 
 def derive_card_capabilities(manifest: CardProfileManifest) -> CardCapabilities:
@@ -158,13 +160,26 @@ def derive_card_capabilities(manifest: CardProfileManifest) -> CardCapabilities:
         profiles=profiles,
         card_version=manifest.card_version if authoritative else None,
         authoritative=authoritative,
-        max_nodes=_positive_limit(manifest.limits.get("max_nodes")),
-        max_depth=_positive_limit(manifest.limits.get("max_depth")),
-        max_payload_bytes=_positive_limit(manifest.limits.get("max_payload_bytes")),
-        max_input_text_bytes=_positive_limit(
-            manifest.limits.get("max_input_text_bytes")
+        max_nodes=_positive_limit(
+            manifest.limits.get("max_nodes"),
+            ceiling=DEFAULT_MAX_CARD_NODES,
         ),
-        max_inputs_bytes=_positive_limit(manifest.limits.get("max_inputs_bytes")),
+        max_depth=_positive_limit(
+            manifest.limits.get("max_depth"),
+            ceiling=DEFAULT_MAX_CARD_DEPTH,
+        ),
+        max_payload_bytes=_positive_limit(
+            manifest.limits.get("max_payload_bytes"),
+            ceiling=DEFAULT_MAX_CARD_PAYLOAD_BYTES,
+        ),
+        max_input_text_bytes=_positive_limit(
+            manifest.limits.get("max_input_text_bytes"),
+            ceiling=DEFAULT_MAX_INPUT_TEXT_BYTES,
+        ),
+        max_inputs_bytes=_positive_limit(
+            manifest.limits.get("max_inputs_bytes"),
+            ceiling=DEFAULT_MAX_INPUTS_BYTES,
+        ),
     )
 
 
@@ -250,6 +265,23 @@ _TOOL_LABELS = {
     "write": "写入文件",
     "write_file": "写入文件",
 }
+_SENSITIVE_URL_QUERY_KEYS = frozenset({
+    "accesstoken",
+    "apikey",
+    "auth",
+    "authorization",
+    "credential",
+    "password",
+    "passwd",
+    "secret",
+    "sig",
+    "signature",
+    "token",
+    "xamzsecuritytoken",
+    "xamzsignature",
+    "xgoogcredential",
+    "xgoogsignature",
+})
 _PROGRAM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./@:+-]+$")
 _SAFE_TOOL_LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _SUMMARY_MAX_CHARS = 64
@@ -534,6 +566,17 @@ def sanitize_action_url(url: str) -> str:
         or parsed.password is not None
     ):
         raise ValueError("card action URL must be a safe http URL")
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = re.sub(r"[^a-z0-9]+", "", key.lower())
+        visibly_redacted = value.strip().lower() in {
+            "",
+            "***",
+            "<redacted>",
+            "[redacted]",
+            "redacted",
+        }
+        if normalized_key in _SENSITIVE_URL_QUERY_KEYS and not visibly_redacted:
+            raise ValueError("card action URL contains sensitive query credentials")
     return clean
 
 
@@ -2080,8 +2123,8 @@ def build_reasoning_process_card(
 
 
 _PROGRESS_PHASES = frozenset({
-    "thinking", "tool", "answering", "completed", "stopped", "failed", "expired",
-    "starting", "running",
+    "thinking", "tool", "answering", "completed", "stopped", "failed", "error",
+    "expired", "starting", "running",
 })
 _PROGRESS_STATUSES = frozenset({"running", "complete", "failed"})
 _PROGRESS_MAX_VISIBLE_STEPS = 12
@@ -2276,7 +2319,7 @@ def build_progress_card(
         and capabilities.actions is not None
         and "Action.ToggleVisibility" in capabilities.actions
     )
-    terminal = phase in {"completed", "stopped", "failed", "expired"}
+    terminal = phase in {"completed", "stopped", "failed", "error", "expired"}
     detail_visible = not (can_toggle and terminal)
     status_label, status_tone = _progress_state(phase)
     summary_parts = []

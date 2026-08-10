@@ -663,14 +663,12 @@ class CardProgressController:
                             if attempt < 2:
                                 await asyncio.sleep(0.1 * (2**attempt))
                     if not delivered:
-                        logger.warning("[Octo] progress card edit retries exhausted")
-                        with self._lock:
-                            current = self._states.get(key)
-                            if current is not None and current is state:
-                                current.card_seq = next_seq
-                                current.delivered_revision = revision
-                                current.scheduled = False
-                        return
+                        logger.warning(
+                            "[Octo] progress card edit retries exhausted; "
+                            "retrying the same sequence"
+                        )
+                        await asyncio.sleep(0.4)
+                        continue
                 else:
                     rendered = cards.build_agent_progress_card(
                         phase=phase,
@@ -703,13 +701,11 @@ class CardProgressController:
                                 await asyncio.sleep(0.1 * (2**attempt))
                     if not delivered:
                         logger.warning(
-                            "[Octo] progress card edit retries exhausted"
+                            "[Octo] progress card edit retries exhausted; "
+                            "retrying the same sequence"
                         )
-                        with self._lock:
-                            current = self._states.get(key)
-                            if current is not None and current is state:
-                                current.scheduled = False
-                        return
+                        await asyncio.sleep(0.4)
+                        continue
             except Exception:
                 logger.warning("[Octo] progress card update failed", exc_info=True)
                 with self._lock:

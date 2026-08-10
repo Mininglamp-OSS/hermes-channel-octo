@@ -83,6 +83,21 @@ def test_constructor_enables_native_clarify_from_hermes_020(
     assert actual is expected
 
 
+def test_missing_packaging_only_disables_native_clarify() -> None:
+    real_import = __import__
+
+    def import_without_packaging(name, *args, **kwargs):
+        if name == "packaging.version":
+            raise ModuleNotFoundError("packaging unavailable")
+        return real_import(name, *args, **kwargs)
+
+    with (
+        patch.object(clarify, "package_version", return_value="0.20.0"),
+        patch("builtins.__import__", side_effect=import_without_packaging),
+    ):
+        assert clarify.native_clarify_supported() is False
+
+
 @pytest.mark.asyncio
 async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
     adapter = _bare_clarify_adapter(native=False)
@@ -480,6 +495,56 @@ async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> Non
 
 
 @pytest.mark.asyncio
+async def test_binding_failure_retires_the_sent_clarify_card() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    clarify_id = "clarify-binding-failure"
+    entry = clarify_gateway.register(
+        clarify_id,
+        _ROUTE.session_key,
+        "Which option?",
+        ["A", "B"],
+    )
+    entry.multi_select = False
+    edit_card = AsyncMock()
+    try:
+        with (
+            patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
+            patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+            patch.object(
+                api,
+                "send_card_message",
+                AsyncMock(return_value=SendMessageResult(message_id="orphan-card")),
+            ),
+            patch.object(api, "edit_card_message", edit_card),
+            patch.object(
+                adapter,
+                "_register_card_session",
+                side_effect=RuntimeError("registry unavailable"),
+            ),
+        ):
+            result = await OctoAdapter.send_clarify(
+                adapter,
+                _ROUTE.chat_id,
+                "Which option?",
+                ["A", "B"],
+                clarify_id=clarify_id,
+                session_key=_ROUTE.session_key,
+            )
+    finally:
+        clarify_gateway.clear_session(_ROUTE.session_key)
+
+    assert result.success is False
+    assert result.message_id == "orphan-card"
+    edit_card.assert_awaited_once()
+    kwargs = edit_card.await_args.kwargs
+    assert kwargs["message_id"] == "orphan-card"
+    assert kwargs["card_seq"] == 1
+    assert kwargs["transient"] is False
+    assert _card_nodes(kwargs["card"], "Action.Submit") == []
+    assert "不可用" in kwargs["plain"]
+
+
+@pytest.mark.asyncio
 async def test_hermes_020_multi_select_clarify_uses_choiceset_contract() -> None:
     adapter = _bare_clarify_adapter(native=True)
     clarify_id = "clarify-native-multi"
@@ -612,7 +677,23 @@ def _clarify_session(
         channel_id=_ROUTE.channel_id,
         channel_type=_ROUTE.channel_type,
         requester_uid=_ROUTE.requester_uid,
-        card={"type": "AdaptiveCard", "version": "1.5", "body": []},
+        card={
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [],
+            **(
+                {
+                    "actions": [{
+                        "type": "Action.Submit",
+                        "id": "clarify_confirm",
+                        "title": "提交",
+                        "data": {"_octo_binding": "binding-1"},
+                    }]
+                }
+                if multi_select
+                else {}
+            ),
+        },
         plain="Clarify",
         action_labels={
             "clarify_choice_0": "A",
@@ -689,7 +770,7 @@ async def test_multi_clarify_action_resolves_canonical_json_in_choice_order() ->
 
 
 @pytest.mark.asyncio
-async def test_invalid_multi_submit_releases_card_for_a_later_valid_action() -> None:
+async def test_invalid_multi_submit_keeps_card_retryable_for_a_later_valid_action() -> None:
     registry = card_events.CardSessionRegistry()
     clarify_id = "clarify-invalid-multi"
     entry = clarify_gateway.register(
@@ -702,6 +783,15 @@ async def test_invalid_multi_submit_releases_card_for_a_later_valid_action() -> 
     registry.register(
         _clarify_session(clarify_id=clarify_id, multi_select=True)
     )
+    updates: list[tuple[str, bool, cards.CardRenderResult]] = []
+
+    async def update_status(session, action, status, *, transient):
+        updates.append((
+            status,
+            transient,
+            card_events.render_card_action_status(session, action, status),
+        ))
+
     try:
         invalid = await card_events.handle_card_action(
             registry,
@@ -713,6 +803,7 @@ async def test_invalid_multi_submit_releases_card_for_a_later_valid_action() -> 
                 session,
                 claimed,
             ),
+            update_status=update_status,
         )
         valid = await card_events.handle_card_action(
             registry,
@@ -730,7 +821,13 @@ async def test_invalid_multi_submit_releases_card_for_a_later_valid_action() -> 
     finally:
         clarify_gateway.clear_session(_ROUTE.session_key)
 
-    assert invalid == "ignored"
+    assert invalid == "invalid"
+    assert [(status, transient) for status, transient, _ in updates] == [
+        ("invalid", False)
+    ]
+    invalid_card = updates[0][2]
+    assert "请选择至少一个选项" in invalid_card.plain
+    assert _card_nodes(invalid_card.card, "Action.Submit")
     assert valid == "completed"
     assert response == '[\"B\"]'
 
@@ -796,6 +893,48 @@ async def test_reused_clarify_id_cannot_resolve_a_replacement_entry() -> None:
 
     assert status == "expired"
     assert response is None
+
+
+@pytest.mark.asyncio
+async def test_reused_clarify_id_gets_a_new_delivery_id_per_occurrence() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    clarify_id = "clarify-reused-delivery"
+    send_card = AsyncMock(
+        side_effect=[
+            SendMessageResult(message_id="card-1"),
+            SendMessageResult(message_id="card-2"),
+        ]
+    )
+    with (
+        patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
+        patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        patch.object(api, "send_card_message", send_card),
+    ):
+        for _ in range(2):
+            entry = clarify_gateway.register(
+                clarify_id,
+                _ROUTE.session_key,
+                "Which option?",
+                ["A", "B"],
+            )
+            entry.multi_select = False
+            try:
+                result = await OctoAdapter.send_clarify(
+                    adapter,
+                    _ROUTE.chat_id,
+                    "Which option?",
+                    ["A", "B"],
+                    clarify_id=clarify_id,
+                    session_key=_ROUTE.session_key,
+                )
+                assert result.success is True
+            finally:
+                clarify_gateway.clear_session(_ROUTE.session_key)
+
+    assert send_card.await_count == 2
+    first = send_card.await_args_list[0].kwargs["client_msg_no"]
+    second = send_card.await_args_list[1].kwargs["client_msg_no"]
+    assert first != second
 
 
 @pytest.mark.asyncio

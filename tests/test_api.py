@@ -34,7 +34,7 @@ from hermes_octo_plugin.api import (
     infer_content_type,
     parse_image_dimensions,
 )
-from hermes_octo_plugin.types import ChannelType, MentionEntity, MessageType
+from hermes_octo_plugin.types import ChannelType, GroupInfo, MentionEntity, MessageType
 
 
 class _FailedApiResponse:
@@ -186,9 +186,10 @@ class TestApiFailureTruth:
     @pytest.mark.asyncio
     async def test_presigned_upload_error_never_exposes_response_body_or_url(self):
         upload_url = "https://storage.example/upload?signature=secret"
+        session = _FailedApiSession()
         with pytest.raises(RuntimeError, match="HTTP 503") as exc_info:
             await upload_file_to_presigned_url(
-                _FailedApiSession(),
+                session,
                 upload_url=upload_url,
                 download_url="https://cdn.example/file",
                 file_data=b"payload",
@@ -198,6 +199,16 @@ class TestApiFailureTruth:
         assert "secret-token-from-backend" not in str(exc_info.value)
         assert upload_url not in str(exc_info.value)
         assert "signature=secret" not in str(exc_info.value)
+        assert session.put.call_args.kwargs["allow_redirects"] is False
+
+    def test_read_local_media_rejects_symlink_before_open(self, tmp_path):
+        target = tmp_path / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        link = tmp_path / "report.txt"
+        link.symlink_to(target)
+
+        with pytest.raises(ValueError, match="local media source is unavailable"):
+            api.read_local_media(str(link), max_size=1024)
 
     @pytest.mark.asyncio
     async def test_download_error_never_exposes_signed_source_url(self):
@@ -796,6 +807,56 @@ class TestGetChannelMessages:
         assert messages[0]["from_uid"] == "user1"
 
 
+
+
+class TestGroupListApi:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [{"group_no": "g1", "name": "Group 1", "kind": "private"}],
+            {"groups": [{"group_no": "g1", "name": "Group 1", "kind": "private"}]},
+        ],
+        ids=["bare-list", "wrapped-list"],
+    )
+    async def test_fetch_bot_groups_normalizes_supported_envelopes(self, payload):
+        with patch.object(api, "get_json", AsyncMock(return_value=payload)):
+            groups = await fetch_bot_groups(
+                MagicMock(),
+                "https://api.example.com",
+                "token",
+            )
+
+        assert groups == [
+            GroupInfo(
+                group_no="g1",
+                name="Group 1",
+                extra={"kind": "private"},
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fetch_bot_groups_skips_malformed_entries(self):
+        payload = {
+            "groups": [
+                {"group_no": "g1", "name": "Group 1"},
+                None,
+                {"name": "missing id"},
+                {"group_no": 7, "name": "wrong id type"},
+                {"group_no": "g2", "name": 9},
+            ]
+        }
+        with patch.object(api, "get_json", AsyncMock(return_value=payload)):
+            groups = await fetch_bot_groups(
+                MagicMock(),
+                "https://api.example.com",
+                "token",
+            )
+
+        assert groups == [
+            GroupInfo(group_no="g1", name="Group 1"),
+            GroupInfo(group_no="g2", name=""),
+        ]
 class TestThreadApi:
     """Thread endpoints have returned both wrapped dicts and bare arrays."""
 

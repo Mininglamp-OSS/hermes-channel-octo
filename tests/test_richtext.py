@@ -632,10 +632,46 @@ class TestSendImageCaptionMentions:
         a = _make_adapter_with_api()
         a._http_session = MagicMock()
         a._bot_token = "tok"
-        a._chat_kind = {"G1": "group"}
+        a._chat_kind = {"G1": ChannelType.Group}
+        a._group_member_rosters = {"G1": {"u1": "Alice"}}
 
-        # parse_structured_mentions in this codebase converts "@[uid:name]"
-        # into (converted_text, entities, uids); let it run for real.
+        # Structured mention tokens are converted to visible names, but only
+        # current parent-group members may become actionable mention pills.
+        with patch("hermes_octo_plugin.adapter.api.download_file",
+                   new_callable=AsyncMock, return_value=(b"", "image/jpeg", "y.png")), \
+             patch("hermes_octo_plugin.adapter.api.parse_image_dimensions",
+                   return_value=(200, 100)), \
+             patch("hermes_octo_plugin.adapter.api.upload_and_get_url",
+                   new_callable=AsyncMock, return_value="https://cdn/y.png"), \
+             patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
+                   new_callable=AsyncMock) as mock_rich:
+            result = await a.send_image(
+                chat_id="G1",
+                image_url="https://source/y.png",
+                caption="@[u1:Alice] and @[u2:Mallory] look",
+            )
+        assert result.success is True
+        mock_rich.assert_awaited_once()
+        kwargs = mock_rich.call_args.kwargs
+        # Only the roster member becomes a real mention pill.
+        assert kwargs.get("mention_uids") == ["u1"]
+        entities = kwargs.get("mention_entities")
+        assert entities and [entity.uid for entity in entities] == ["u1"]
+        # Both tokens become readable text, without granting the unknown UID a
+        # mention sidecar.
+        blocks = kwargs["blocks"]
+        assert "@[u1:Alice]" not in blocks[0].text
+        assert "@[u2:Mallory]" not in blocks[0].text
+        assert "@Alice and @Mallory look" == blocks[0].text
+
+    @pytest.mark.asyncio
+    async def test_caption_mentions_fail_closed_without_group_roster(self):
+        a = _make_adapter_with_api()
+        a._http_session = MagicMock()
+        a._bot_token = "tok"
+        a._chat_kind = {"G1": ChannelType.Group}
+        a._group_member_rosters = {}
+
         with patch("hermes_octo_plugin.adapter.api.download_file",
                    new_callable=AsyncMock, return_value=(b"", "image/jpeg", "y.png")), \
              patch("hermes_octo_plugin.adapter.api.parse_image_dimensions",
@@ -649,19 +685,12 @@ class TestSendImageCaptionMentions:
                 image_url="https://source/y.png",
                 caption="@[u1:Alice] look",
             )
+
         assert result.success is True
-        mock_rich.assert_awaited_once()
-        kwargs = mock_rich.call_args.kwargs
-        # mention_uids MUST include u1 so the send goes through as a
-        # real mention pill instead of literal text.
-        assert kwargs.get("mention_uids") == ["u1"]
-        entities = kwargs.get("mention_entities")
-        assert entities and entities[0].uid == "u1"
-        # The text block itself must contain the converted "@Alice"
-        # form, not the raw "@[u1:Alice]" template.
-        blocks = kwargs["blocks"]
-        assert "@[u1:Alice]" not in blocks[0].text
-        assert "Alice" in blocks[0].text
+        kwargs = mock_rich.await_args.kwargs
+        assert kwargs["blocks"][0].text == "@Alice look"
+        assert kwargs["mention_uids"] == []
+        assert kwargs["mention_entities"] == []
 
     @pytest.mark.asyncio
     async def test_reply_to_forwarded_to_rich_text_path(self):

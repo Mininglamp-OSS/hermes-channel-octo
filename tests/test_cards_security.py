@@ -89,6 +89,26 @@ def test_action_url_rejects_dangerous_or_ambiguous_targets(url: str) -> None:
         cards.sanitize_action_url(url)
 
 
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/callback?token=secret",
+        "https://example.com/object?X-Amz-Signature=secret",
+        "https://example.com/object?X-Amz-Security-Token=secret",
+        "https://example.com/callback?access_token=secret",
+        "https://example.com/callback?api%5Fkey=secret",
+    ],
+)
+def test_action_url_rejects_sensitive_query_credentials(url: str) -> None:
+    with pytest.raises(ValueError, match="sensitive query"):
+        cards.sanitize_action_url(url)
+
+
+def test_action_url_preserves_non_sensitive_query_parameters() -> None:
+    url = "https://example.com/search?q=octo&page=2"
+    assert cards.sanitize_action_url(url) == url
+
 def test_recursive_limit_helpers_count_rendered_card_structure() -> None:
     card = {
         "type": "AdaptiveCard",

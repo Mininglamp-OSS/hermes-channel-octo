@@ -47,6 +47,7 @@ class CardSession:
     plain: str
     action_labels: dict[str, str]
     input_ids: tuple[str, ...]
+    action_channel_ids: tuple[str, ...] = ()
     max_input_text_bytes: int | None = None
     max_inputs_bytes: int | None = None
     clarify: ClarifySession | None = None

@@ -468,15 +468,15 @@ async def test_registry_blocks_replay_binding_channel_operator_and_input_mismatc
 
 
 @pytest.mark.asyncio
-async def test_registry_accepts_dm_action_with_server_bot_channel_view() -> None:
+async def test_registry_accepts_only_bound_dm_channel_views() -> None:
     registry = card_events.CardSessionRegistry()
-    registry.register(
-        _session(
-            chat_id="user-1",
-            channel_id="user-1",
-            channel_type=ChannelType.DM,
-        )
+    session = _session(
+        chat_id="user-1",
+        channel_id="user-1",
+        channel_type=ChannelType.DM,
+        action_channel_ids=("user-1", "bot-1"),
     )
+    registry.register(session)
     action = card_events.parse_card_action(
         _event(channel_id="bot-1", channel_type=1)
     )
@@ -490,6 +490,18 @@ async def test_registry_accepts_dm_action_with_server_bot_channel_view() -> None
         )
         == "completed"
     )
+
+    registry.register(session)
+    forged = card_events.parse_card_action(
+        _event(event_id=19, channel_id="attacker", channel_type=1)
+    )
+    assert forged is not None
+    dispatch = AsyncMock(return_value=True)
+    assert (
+        await card_events.handle_card_action(registry, forged, dispatch)
+        == "ignored"
+    )
+    dispatch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

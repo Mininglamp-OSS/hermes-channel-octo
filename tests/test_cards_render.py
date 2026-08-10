@@ -114,6 +114,28 @@ def test_manifest_caps_fail_closed_when_deployed_lists_are_absent() -> None:
     assert explicit.max_inputs_bytes == 16384
 
 
+def test_manifest_limits_cannot_raise_local_renderer_safety_caps() -> None:
+    capabilities = cards.derive_card_capabilities(
+        CardProfileManifest(
+            available=True,
+            enabled=True,
+            limits={
+                "max_nodes": 10**9,
+                "max_depth": 10**9,
+                "max_payload_bytes": 10**9,
+                "max_input_text_bytes": 10**9,
+                "max_inputs_bytes": 10**9,
+            },
+        )
+    )
+
+    assert capabilities.max_nodes == cards.DEFAULT_MAX_CARD_NODES
+    assert capabilities.max_depth == cards.DEFAULT_MAX_CARD_DEPTH
+    assert capabilities.max_payload_bytes == cards.DEFAULT_MAX_CARD_PAYLOAD_BYTES
+    assert capabilities.max_input_text_bytes == cards.DEFAULT_MAX_INPUT_TEXT_BYTES
+    assert capabilities.max_inputs_bytes == cards.DEFAULT_MAX_INPUTS_BYTES
+
+
 def test_deployed_manifest_requires_exact_profile_and_card_version() -> None:
     missing = cards.derive_card_capabilities(
         CardProfileManifest(available=True, enabled=True)

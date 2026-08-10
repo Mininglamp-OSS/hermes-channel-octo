@@ -2221,14 +2221,17 @@ class OctoAdapter(BasePlatformAdapter):
         # Decrypt payload
         try:
             decrypted = aes_decrypt(recv.encrypted_payload, self._aes_key, self._aes_iv)
-            payload_dict = json.loads(decrypted.decode("utf-8"))
+            raw_payload: object = json.loads(decrypted.decode("utf-8"))
+            if not isinstance(raw_payload, dict):
+                raise ValueError("Octo payload must be a JSON object")
+            payload_dict: dict[str, Any] = raw_payload
         except Exception as e:
             logger.debug(
                 "[%s] Payload decrypt/parse error: %s", self.name, redact_log(str(e))
             )
             return
 
-        payload = MessagePayload.from_dict(payload_dict)
+        payload: MessagePayload = MessagePayload.from_dict(payload_dict)
 
         msg = BotMessage(
             message_id=recv.message_id,
@@ -3737,6 +3740,17 @@ class OctoAdapter(BasePlatformAdapter):
             content = content.replace(bare, "")
         return content
 
+    def _mention_uid_allowlist(
+        self,
+        chat_id: str,
+        channel_type: ChannelType,
+    ) -> set[str] | None:
+        """Return the parent-group roster used by every outbound text lane."""
+        if channel_type not in _GROUP_CHANNEL_TYPES:
+            return None
+        parent_group_no = chat_id.split("____", 1)[0]
+        return set(self._group_member_rosters.get(parent_group_no, {}))
+
     async def _send_normal(
         self,
         chat_id: str,
@@ -3769,12 +3783,7 @@ class OctoAdapter(BasePlatformAdapter):
                 send_uids: list[str] | None = None
                 send_entities: list | None = None
                 structured = parse_structured_mentions(chunk)
-                valid_uids = None
-                if channel_type in _GROUP_CHANNEL_TYPES:
-                    parent_group_no = chat_id.split("____", 1)[0]
-                    valid_uids = set(
-                        self._group_member_rosters.get(parent_group_no, {})
-                    )
+                valid_uids = self._mention_uid_allowlist(chat_id, channel_type)
                 if structured:
                     send_content, send_entities, send_uids = (
                         convert_structured_mentions(
@@ -3905,6 +3914,7 @@ class OctoAdapter(BasePlatformAdapter):
                         convert_structured_mentions(
                             caption,
                             structured,
+                            self._mention_uid_allowlist(chat_id, channel_type),
                         )
                     )
                 blocks = [

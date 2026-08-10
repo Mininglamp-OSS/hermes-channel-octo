@@ -49,6 +49,17 @@ async def test_human_broadcast_does_not_activate_the_bot():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b"[]", b"null", b'"text"'])
+async def test_non_object_payload_is_ignored(raw: bytes) -> None:
+    adapter = _inbound_adapter()
+
+    with patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw):
+        await adapter._handle_recv(_group_recv(raw))
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ignore_legacy_all", "expected_calls"),
     [(False, 1), (True, 0)],

@@ -46,11 +46,13 @@ _DISPLAY_TEXT_BLOCK_SCHEMA = {
     "required": ["type", "text"],
 }
 _DISPLAY_HEADING_BLOCK_SCHEMA = {
-    **_DISPLAY_TEXT_BLOCK_SCHEMA,
+    "type": "object",
+    "additionalProperties": False,
     "properties": {
-        **_DISPLAY_TEXT_BLOCK_SCHEMA["properties"],
         "type": {"type": "string", "const": "heading"},
+        "text": {"type": "string", "maxLength": 65536},
     },
+    "required": ["type", "text"],
 }
 _DISPLAY_SECTION_BLOCK_SCHEMA = {
     "type": "object",
@@ -405,10 +407,13 @@ async def octo_send_interactive_card_handler(
     route = _trusted_route(adapter, require_session_key=True)
     if route is None:
         return _error("trusted Octo session context is unavailable")
+    title = args.get("title")
+    if not isinstance(title, str):
+        return _error("invalid interactive card request")
     binding_id = str(uuid.uuid4())
     try:
         rendered = cards.build_interactive_card(
-            title=args.get("title"),
+            title=title,
             text=args.get("text"),
             inputs=args.get("inputs", ()),
             buttons=args.get("buttons", ()),
@@ -431,7 +436,7 @@ async def octo_send_interactive_card_handler(
             capabilities = cards.derive_card_capabilities(manifest)
             try:
                 rendered = cards.build_interactive_card(
-                    title=args.get("title"),
+                    title=title,
                     text=args.get("text"),
                     inputs=args.get("inputs", ()),
                     buttons=args.get("buttons", ()),
@@ -450,25 +455,63 @@ async def octo_send_interactive_card_handler(
                 plain=rendered.plain,
                 profile=CARD_PROFILE_V2,
             )
+            message_id = result.message_id
+            if message_id is None:
+                raise RuntimeError("Octo card delivery missing message_id")
             from .card_sessions import CardSession
 
-            adapter._register_card_session(
-                CardSession(
-                    message_id=result.message_id,
-                    binding_id=binding_id,
-                    session_key=route.session_key,
-                    chat_id=route.chat_id,
-                    channel_id=route.channel_id,
-                    channel_type=route.channel_type,
-                    requester_uid=route.requester_uid,
-                    card=rendered.card,
-                    plain=rendered.plain,
-                    action_labels=rendered.action_labels,
-                    input_ids=rendered.input_ids,
-                    max_input_text_bytes=capabilities.max_input_text_bytes,
-                    max_inputs_bytes=capabilities.max_inputs_bytes,
+            try:
+                adapter._register_card_session(
+                    CardSession(
+                        message_id=message_id,
+                        binding_id=binding_id,
+                        session_key=route.session_key,
+                        chat_id=route.chat_id,
+                        channel_id=route.channel_id,
+                        channel_type=route.channel_type,
+                        requester_uid=route.requester_uid,
+                        card=rendered.card,
+                        plain=rendered.plain,
+                        action_labels=rendered.action_labels,
+                        input_ids=rendered.input_ids,
+                        action_channel_ids=(
+                            tuple(
+                                dict.fromkeys(
+                                    (route.channel_id, adapter._robot_id)
+                                )
+                            )
+                            if route.channel_type == ChannelType.DM
+                            else (route.channel_id,)
+                        ),
+                        max_input_text_bytes=capabilities.max_input_text_bytes,
+                        max_inputs_bytes=capabilities.max_inputs_bytes,
+                    )
                 )
-            )
+            except Exception:
+                try:
+                    unavailable = cards.build_display_card(
+                        title="交互卡",
+                        blocks=[{"type": "text", "text": "该交互卡不可用，请重试。"}],
+                    )
+                    await api.edit_card_message(
+                        session,
+                        adapter._api_url,
+                        adapter._bot_token,
+                        channel_id=route.channel_id,
+                        channel_type=route.channel_type,
+                        message_id=message_id,
+                        card=unavailable.card,
+                        card_seq=1,
+                        plain=unavailable.plain,
+                        transient=False,
+                        profile=CARD_PROFILE_V2,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[Octo] failed to retire unbound interactive card",
+                        exc_info=True,
+                    )
+                raise
     except Exception:
         logger.exception("[Octo] interactive card delivery failed")
         return _error("Octo card delivery failed")
