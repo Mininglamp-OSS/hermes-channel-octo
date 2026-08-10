@@ -693,6 +693,41 @@ async def test_inbound_private_media_is_not_forwarded_after_local_download_rejec
 
 
 @pytest.mark.asyncio
+async def test_guarded_download_failure_never_forwards_remote_media_url():
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._robot_id = "bot-1"
+    adapter._aes_key = b"key"
+    adapter._aes_iv = b"iv"
+    adapter._resolve_sender_name = AsyncMock(return_value="Alice")
+    adapter._send_typing_safe = AsyncMock()
+    adapter.build_source = MagicMock(return_value=SimpleNamespace())
+    adapter.handle_message = AsyncMock()
+    adapter._download_inbound_media_to_local = AsyncMock(return_value=None)
+    raw = b'{"type": 2, "url": "https://attacker.example/image.png"}'
+    recv = SimpleNamespace(
+        message_id="message-1",
+        message_seq=1,
+        from_uid="user-1",
+        channel_id="bot-1",
+        channel_type=ChannelType.DM,
+        timestamp=1,
+        encrypted_payload=raw,
+    )
+
+    with patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw):
+        await adapter._handle_recv(recv)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.media_urls == []
+    assert event.media_types == []
+    adapter._download_inbound_media_to_local.assert_awaited_once_with(
+        "https://attacker.example/image.png",
+        "image/jpeg",
+    )
+
+
+@pytest.mark.asyncio
 async def test_native_media_failure_redacts_signed_source_from_result_and_logs(caplog):
     adapter = make_bare_adapter()
     adapter.platform = SimpleNamespace(value="octo")

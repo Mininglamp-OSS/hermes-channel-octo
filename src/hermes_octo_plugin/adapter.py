@@ -2553,18 +2553,16 @@ class OctoAdapter(BasePlatformAdapter):
         media_urls: list[str] = []
         media_types: list[str] = []
 
-        # Image/GIF/Voice/Video are downloaded to /tmp/octo-media first and
-        # the local path is handed to hermes-core. Public URLs may be passed
-        # through when the bounded download fails so Hermes can retry them,
-        # but rejected private/metadata targets must never escape this gate.
+        # Image/GIF/Voice/Video are downloaded through the guarded HTTP
+        # transport before being handed to hermes-core. A failed guarded
+        # download must not fall back to the original URL: hostname-only
+        # validation cannot preserve the resolver's DNS/IP decision, and
+        # forwarding the URL would let a rejected private target escape.
         async def _local_or_remote(rel_url: str | None, mime: str) -> str | None:
             url = self._build_media_url(rel_url)
             if not url:
                 return None
-            local = await self._download_inbound_media_to_local(url, mime)
-            if local:
-                return local
-            return url if self._inbound_media_url_allowed(url) else None
+            return await self._download_inbound_media_to_local(url, mime)
 
         if payload.type == OctoMessageType.Image:
             hermes_msg_type = MessageType.PHOTO
@@ -2935,14 +2933,11 @@ class OctoAdapter(BasePlatformAdapter):
     async def _download_inbound_media_to_local(
         self, url: str, mime: str | None
     ) -> str | None:
-        """Stream a remote media URL to a local temp file. Returns the path
-        on success, ``None`` on any failure (caller keeps the remote URL).
+        """Stream a remote media URL to a local temp file.
 
-        Hermes' vision/audio pipelines can stall on slow CDNs or hosts that
-        don't honour Range requests; downloading once locally is the same
-        trick the upstream reference uses. Capped at MEDIA_DOWNLOAD_MAX_BYTES; oversize
-        files quietly fall back to the remote URL so big videos still work
-        (LLM just won't get a local file path).
+        Returns the local path on success and ``None`` on any failure. Callers
+        must drop the media attachment rather than forwarding the original URL
+        to a second, potentially unguarded downloader.
         """
         if not self._http_session or not url:
             return None
@@ -3002,7 +2997,7 @@ class OctoAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
                             logger.info(
-                                "[%s] inbound media too large (>%s) — using remote URL",
+                                "[%s] inbound media too large (>%s) — dropping attachment",
                                 self.name,
                                 _format_size(MEDIA_DOWNLOAD_MAX_BYTES),
                             )

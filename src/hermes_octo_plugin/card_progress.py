@@ -948,6 +948,19 @@ def _assistant_is_answering(message: object) -> bool:
     return bool(content) and not tool_calls
 
 
+def _tool_hook_is_octo(kwargs: Mapping[str, Any]) -> bool:
+    if "platform" in kwargs:
+        platform = kwargs.get("platform")
+    else:
+        try:
+            from gateway.session_context import get_session_env
+
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        except Exception:
+            return False
+    return str(platform or "").strip().lower() == "octo"
+
+
 def on_pre_llm_call(**kwargs: Any) -> None:
     if str(kwargs.get("platform") or "").strip().lower() != "octo":
         return
@@ -1007,6 +1020,8 @@ def on_post_api_request(**kwargs: Any) -> None:
 
 
 def on_pre_tool_call(**kwargs: Any) -> None:
+    if not _tool_hook_is_octo(kwargs):
+        return
     session_id, turn_id = _turn_identity(kwargs)
     _CONTROLLER.tool_started(
         session_id=session_id,
@@ -1018,6 +1033,8 @@ def on_pre_tool_call(**kwargs: Any) -> None:
 
 
 def on_post_tool_call(**kwargs: Any) -> None:
+    if not _tool_hook_is_octo(kwargs):
+        return
     session_id, turn_id = _turn_identity(kwargs)
     _CONTROLLER.tool_finished(
         session_id=session_id,

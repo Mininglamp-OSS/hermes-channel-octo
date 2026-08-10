@@ -1005,6 +1005,7 @@ async def test_failed_turn_finalizes_as_stopped_and_closes_running_tools() -> No
         ),
         patch.object(card_progress.api, "send_card_message", send),
         patch.object(card_progress.api, "edit_card_message", edit),
+
     ):
         controller.begin(
             adapter=adapter,
@@ -1031,6 +1032,60 @@ async def test_failed_turn_finalizes_as_stopped_and_closes_running_tools() -> No
     assert final["plain"].startswith("处理进度 · 处理失败")
     assert "读取文件 · /tmp/input.txt · 失败" in final["plain"]
     assert controller.state_count == 0
+
+@pytest.mark.parametrize("platform", ["discord", "", None])
+def test_tool_hooks_ignore_non_octo_events(platform: object) -> None:
+    controller = MagicMock()
+    with patch.object(card_progress, "_CONTROLLER", controller):
+        card_progress.on_pre_tool_call(
+            platform=platform,
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.py"},
+        )
+        card_progress.on_post_tool_call(
+            platform=platform,
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            status="ok",
+            result={"content": "done"},
+        )
+
+    controller.tool_started.assert_not_called()
+    controller.tool_finished.assert_not_called()
+
+
+def test_tool_hooks_use_task_local_octo_platform_when_hook_omits_platform() -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    controller = MagicMock()
+    tokens = set_session_vars(platform="octo")
+    try:
+        with patch.object(card_progress, "_CONTROLLER", controller):
+            card_progress.on_pre_tool_call(
+                session_id="session-1",
+                turn_id="turn-1",
+                tool_call_id="call-1",
+                tool_name="read",
+                args={"path": "/tmp/input.py"},
+            )
+            card_progress.on_post_tool_call(
+                session_id="session-1",
+                turn_id="turn-1",
+                tool_call_id="call-1",
+                tool_name="read",
+                status="ok",
+                result={"content": "done"},
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    controller.tool_started.assert_called_once()
+    controller.tool_finished.assert_called_once()
 
 
 @pytest.mark.asyncio

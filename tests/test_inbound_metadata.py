@@ -206,6 +206,9 @@ async def test_relaxed_mention_gate_fails_closed_after_member_refresh_failure():
 @pytest.mark.asyncio
 async def test_gif_is_delivered_as_visual_media():
     adapter = _inbound_adapter()
+    adapter._download_inbound_media_to_local = AsyncMock(
+        return_value="/tmp/octo-media/animated.gif"
+    )
     raw = (
         b'{"type": 3, "url": "https://media.example/animated.gif", '
         b'"mention": {"uids": ["bot-1"]}}'
@@ -216,5 +219,9 @@ async def test_gif_is_delivered_as_visual_media():
 
     event = adapter.handle_message.await_args.args[0]
     assert event.message_type == HermesMessageType.PHOTO
-    assert event.media_urls == ["https://media.example/animated.gif"]
+    assert event.media_urls == ["/tmp/octo-media/animated.gif"]
     assert event.media_types == ["image/gif"]
+    adapter._download_inbound_media_to_local.assert_awaited_once_with(
+        "https://media.example/animated.gif",
+        "image/gif",
+    )
