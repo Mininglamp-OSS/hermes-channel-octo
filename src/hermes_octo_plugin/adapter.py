@@ -630,6 +630,26 @@ async def _standalone_send(
         return {"error": "Octo API send failed (see logs)"}
 
 
+def _octo_platform() -> Platform:
+    """Resolve Octo for both plugin-managed and direct adapter construction.
+
+    Hermes normally registers the platform before constructing the adapter.
+    A clean environment may load the entry-point module without enabling its
+    registration callback, while direct construction remains useful for
+    validation and embedding. Mirror Hermes' own ``Platform._missing_`` cache
+    for this single known plugin name rather than accepting arbitrary values.
+    """
+    try:
+        return Platform("octo")
+    except ValueError:
+        pseudo = object.__new__(Platform)
+        pseudo._value_ = "octo"
+        pseudo._name_ = "OCTO"
+        member = Platform._value2member_map_.setdefault("octo", pseudo)
+        Platform._member_map_.setdefault("OCTO", member)
+        return member
+
+
 class LRUCache:
     def __init__(self, max_size: int = 1000) -> None:
         self._cache: OrderedDict[str, str] = OrderedDict()
@@ -671,8 +691,7 @@ class OctoAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING: bool = False
 
     def __init__(self, config: PlatformConfig) -> None:
-        # Platform("octo") works via _missing_() dynamic enum creation
-        super().__init__(config, Platform("octo"))
+        super().__init__(config, _octo_platform())
 
         extra = config.extra or {}
         self._api_url: str = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
