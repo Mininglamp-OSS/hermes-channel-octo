@@ -235,11 +235,14 @@ class TestApiFailureTruth:
     @pytest.mark.asyncio
     async def test_download_allows_exact_guarded_private_origin(self):
         session = MagicMock()
-        session.connector._ssrf_resolver._trusted_hosts = {"10.0.0.8"}
         session.get = MagicMock(return_value=_SuccessfulDownloadResponse())
+        from hermes_octo_plugin.transport import TransportPolicy
 
+        policy = TransportPolicy({"10.0.0.8"})
         data, content_type, filename = await download_file(
-            session, "http://10.0.0.8/report.bin"
+            session,
+            "http://10.0.0.8/report.bin",
+            policy=policy,
         )
 
         assert data == b""
@@ -501,6 +504,33 @@ class TestHeartbeatApi:
             "/v1/bot/heartbeat",
             {},
         )
+
+
+class TestLocalMediaAuthorization:
+    def test_file_url_is_normalized_before_hermes_authorization(self, tmp_path):
+        source = tmp_path / "report.txt"
+        source.write_text("report", encoding="utf-8")
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.validate_media_delivery_path",
+            return_value=str(source),
+            create=True,
+        ) as validate:
+            authorized = api.authorize_local_media_path(source.as_uri())
+
+        validate.assert_called_once_with(str(source))
+        assert authorized == str(source)
+
+    def test_remote_file_url_is_rejected_before_hermes_authorization(self):
+        with patch(
+            "gateway.platforms.base.BasePlatformAdapter.validate_media_delivery_path",
+            create=True,
+        ) as validate:
+            authorized = api.authorize_local_media_path(
+                "file://remote.example/private/report.txt"
+            )
+
+        assert authorized is None
+        validate.assert_not_called()
 
 
 class TestInferContentType:

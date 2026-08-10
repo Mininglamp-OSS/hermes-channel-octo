@@ -15,7 +15,7 @@ When you (the agent) need to deliver a message on the `octo` platform, **always 
 
 Reasons:
 - Octo channel IDs are 32-char hex strings (e.g. `a44a7f3c2c214a63be8a86c9a6c1dd4a`) and thread IDs use the `{group_no}____{short_id}` composite form. The core `send_message` dispatcher does not parse these formats — calls silently fall back to the bot's home channel and return `success: true` with a synthetic `octo-buf-*` message ID, so the message never reaches the intended recipient.
-- `octo_management(action="send-message")` parses targets via the plugin's own `parse_target()`, performs permission checks, auto-joins threads (`channel_type=5`) before sending, supports `reply_to_message_id` / `mention_uids` / `mention_all`, and returns the real server-assigned message ID.
+- `octo_management(action="send-message")` parses targets via the plugin's own `parse_target()`, performs permission checks, supports `reply_to_message_id` / `mention_uids` / `mention_all`, and returns the real server-assigned message ID. Sending never changes Thread membership; use the explicit `join-thread` / `leave-thread` actions when needed.
 
 ### Quick Reference
 
@@ -31,6 +31,17 @@ octo_management(
 ```
 
 The `send_message` tool is fine for platforms whose target ref is a numeric group id or phone number. For **octo**, use `octo_management`.
+
+### Current-Conversation Rich Output
+
+For rich output to the current Octo conversation, use the matching registered tool:
+
+- `octo_send_rich_text`
+- `octo_send_image`, `octo_send_file`, `octo_send_voice`, or `octo_send_video`
+- `octo_send_display_card` or `octo_send_interactive_card`
+- `octo_edit_card` for a card created in the current session
+
+These tools bind the destination and requester from the current Octo route. Follow their schemas; do not pass raw Adaptive Card JSON or override the destination.
 
 ## Step 1: Register
 

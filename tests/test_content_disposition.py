@@ -217,13 +217,46 @@ class TestPresignedUpload:
 
 
     @pytest.mark.asyncio
+    async def test_private_presigned_origin_is_rejected_without_transport_policy(self):
+        presign = {
+            "uploadUrl": "http://127.0.0.1/upload",
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        put_file = AsyncMock()
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                put_file,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    MagicMock(),
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                )
+
+        put_file.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
     async def test_presign_private_storage_origin_is_narrowly_trusted_with_opt_in(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
         session = MagicMock()
-        session.connector._ssrf_resolver._trusted_hosts = {"api.internal"}
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"api.internal"})
         presign = {
             "uploadUrl": "http://minio.internal/upload?signature=secret",
             "downloadUrl": "http://cdn.internal/report.txt",
@@ -231,10 +264,11 @@ class TestPresignedUpload:
         }
 
         async def assert_trusted(active_session, **_kwargs):
-            assert active_session.connector._ssrf_resolver._trusted_hosts == {
+            assert active_session is session
+            assert policy.trusted_hosts() == frozenset({
                 "api.internal",
                 "minio.internal",
-            }
+            })
             return presign["downloadUrl"]
 
         with (
@@ -254,6 +288,7 @@ class TestPresignedUpload:
                 "report.txt",
                 b"data",
                 "text/plain",
+                policy=policy,
             )
 
         assert result == presign["downloadUrl"]
@@ -265,7 +300,9 @@ class TestPresignedUpload:
     ) -> None:
         monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
         session = MagicMock()
-        session.connector._ssrf_resolver._trusted_hosts = {"api.internal"}
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"api.internal"})
         presign = {
             "uploadUrl": "http://169.254.169.254/latest/meta-data/",
             "downloadUrl": "http://cdn.internal/report.txt",
@@ -283,6 +320,7 @@ class TestPresignedUpload:
                     "report.txt",
                     b"data",
                     "text/plain",
+                    policy=policy,
                 )
 
-        assert session.connector._ssrf_resolver._trusted_hosts == {"api.internal"}
+        assert policy.trusted_hosts() == frozenset({"api.internal"})

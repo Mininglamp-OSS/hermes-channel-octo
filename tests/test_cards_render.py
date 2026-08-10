@@ -148,11 +148,13 @@ def test_display_card_fails_closed_without_textblock_capability() -> None:
         )
 
 
-def test_display_card_rejects_empty_visible_fallback() -> None:
-    with pytest.raises(ValueError, match="visible text"):
-        cards.build_display_card(
-            blocks=[{"type": "text", "text": "token=AKIA1234567890ABCDEF"}]
-        )
+def test_display_card_preserves_visible_content_after_structural_validation() -> None:
+    rendered = cards.build_display_card(
+        blocks=[{"type": "text", "text": "token=AKIA1234567890ABCDEF"}]
+    )
+
+    assert rendered.plain == "token=AKIA1234567890ABCDEF"
+    assert rendered.card["body"][0]["text"] == "token=AKIA1234567890ABCDEF"
 
 
 
@@ -212,7 +214,7 @@ def test_display_card_renders_controlled_rich_blocks_and_same_source_plain() -> 
     )
     assert rendered.plain == (
         "Release\nSummary\nReady\nOwner: Platform\nState: Approved\n"
-        "Release diagram: https://example.com\n"
+        "Release diagram: https://cdn.example.com\n"
         "Open runbook: https://docs.example.com/private?token=redacted"
     )
 
@@ -290,7 +292,7 @@ def test_interactive_card_binds_controlled_inputs_and_submit_data() -> None:
             "title": "Approve",
             "data": {
                 "decision": "approve",
-                "token": "[redacted]",
+                "token": "must-not-leak",
                 "_octo_binding": "binding-123",
             },
             "style": "positive",
@@ -300,7 +302,7 @@ def test_interactive_card_binds_controlled_inputs_and_submit_data() -> None:
     assert rendered.input_ids == ("comment",)
     assert rendered.binding_id == "binding-123"
     assert types.resolve_card_profile(rendered.card) == "octo/v2"
-    assert "must-not-leak" not in str(rendered.card)
+    assert "must-not-leak" in str(rendered.card)
     assert rendered.plain == (
         "Approval\nReview this request\n[Comment]\nActions: Approve"
     )

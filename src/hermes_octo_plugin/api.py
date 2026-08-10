@@ -23,6 +23,7 @@ from typing import Any, Mapping
 from urllib.parse import quote, unquote, unquote_to_bytes, urlencode, urljoin, urlparse
 
 import aiohttp
+from .transport import TransportPolicy, is_private_or_metadata_host
 
 from .types import (
     CARD_VERSION,
@@ -171,6 +172,38 @@ def decode_media_data_uri(
         raise ValueError(f"media exceeds the {max_size}-byte limit")
     extension = _DATA_URI_EXTENSION_MAP.get(content_type, ".bin")
     return data, content_type, f"file{extension}"
+
+
+def authorize_local_media_path(source: str) -> str | None:
+    """Return the local path authorized by the installed Hermes runtime."""
+    if not isinstance(source, str) or not source:
+        return None
+    if source.startswith("file://"):
+        parsed = urlparse(source)
+        if parsed.netloc not in {"", "localhost"}:
+            return None
+        source = unquote(parsed.path)
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+    except ImportError:
+        return None
+    validator = getattr(BasePlatformAdapter, "validate_media_delivery_path", None)
+    if not callable(validator):
+        return None
+    authorized = validator(source)
+    return authorized if isinstance(authorized, str) and authorized else None
+
+
+def read_authorized_local_media(
+    source: str,
+    *,
+    max_size: int,
+) -> tuple[bytes, str]:
+    """Authorize one local source with Hermes before opening it."""
+    authorized = authorize_local_media_path(source)
+    if authorized is None:
+        raise PermissionError("local media source is not authorized")
+    return read_local_media(authorized, max_size=max_size)
 
 
 def read_local_media(
@@ -1263,42 +1296,38 @@ async def get_upload_presign(
     return result
 
 def _trust_presigned_upload_origin(
-    session: aiohttp.ClientSession,
+    policy: TransportPolicy | None,
     upload_url: str,
 ) -> None:
     """Trust one authenticated server-issued private upload host after opt-in."""
-    try:
-        parsed = urlparse(upload_url)
-        host = (parsed.hostname or "").lower().rstrip(".")
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("unsafe presigned upload URL") from exc
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not host
-        or parsed.username is not None
-        or parsed.password is not None
-        or host in _DOWNLOAD_METADATA_HOSTS
-    ):
-        raise RuntimeError("unsafe presigned upload URL")
-    literal = _canonical_download_ip(host)
-    if literal is not None and (
-        literal.is_link_local
-        or literal.is_multicast
-        or literal.is_reserved
-        or literal.is_unspecified
-    ):
-        raise RuntimeError("unsafe presigned upload URL")
-    if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if policy is None:
+        try:
+            parsed = urlparse(upload_url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("unsafe presigned upload URL") from exc
+        literal = _canonical_download_ip(host)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or is_private_or_metadata_host(host)
+            or (
+                literal is not None
+                and (
+                    literal.is_loopback
+                    or literal.is_private
+                    or literal.is_link_local
+                    or literal.is_multicast
+                    or literal.is_reserved
+                    or literal.is_unspecified
+                )
+            )
+        ):
+            raise RuntimeError("unsafe presigned upload URL")
         return
-    connector = getattr(session, "connector", None)
-    resolver = getattr(connector, "_ssrf_resolver", None)
-    trusted_hosts = getattr(resolver, "_trusted_hosts", None)
-    if isinstance(trusted_hosts, set):
-        trusted_hosts.add(host)
+    policy.trust_validated_private_host(upload_url)
 
 
 
@@ -1359,6 +1388,7 @@ async def upload_and_get_url(
     filename: str,
     file_data: bytes,
     content_type: str,
+    policy: TransportPolicy | None = None,
 ) -> str:
     """Presign and upload a file through the server-selected storage backend."""
     presign = await get_upload_presign(
@@ -1369,7 +1399,7 @@ async def upload_and_get_url(
         file_size=len(file_data),
         content_type=content_type,
     )
-    _trust_presigned_upload_origin(session, presign["uploadUrl"])
+    _trust_presigned_upload_origin(policy, presign["uploadUrl"])
     return await upload_file_to_presigned_url(
         session,
         upload_url=presign["uploadUrl"],
@@ -1408,7 +1438,7 @@ def _canonical_download_ip(
 def _validate_download_url(
     url: str,
     *,
-    trusted_private_hosts: frozenset[str] = frozenset(),
+    policy: TransportPolicy | None = None,
     enforce_host_safety: bool = True,
 ) -> str:
     """Validate one download hop before any network I/O."""
@@ -1437,19 +1467,11 @@ def _validate_download_url(
     if (
         literal is not None
         and (literal.is_loopback or literal.is_private)
-        and host not in trusted_private_hosts
+        and (policy is None or not policy.is_trusted(host))
     ):
         raise RuntimeError("unsafe download URL")
     return url
 
-
-def _download_trusted_private_hosts(session: aiohttp.ClientSession) -> frozenset[str]:
-    connector = getattr(session, "connector", None)
-    resolver = getattr(connector, "_ssrf_resolver", None)
-    hosts = getattr(resolver, "_trusted_hosts", None)
-    if not isinstance(hosts, set):
-        return frozenset()
-    return frozenset(str(host).lower().rstrip(".") for host in hosts)
 
 
 async def download_file(
@@ -1459,6 +1481,7 @@ async def download_file(
     timeout_seconds: int = 300,
     *,
     enforce_host_safety: bool = True,
+    policy: TransportPolicy | None = None,
 ) -> tuple[bytes, str, str]:
     """
     Download a file from a URL.
@@ -1477,11 +1500,11 @@ async def download_file(
     """
     dl_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     current_url = url
-    trusted_private_hosts = _download_trusted_private_hosts(session)
+    trusted_policy = policy
     for redirect_count in range(_MAX_DOWNLOAD_REDIRECTS + 1):
         _validate_download_url(
             current_url,
-            trusted_private_hosts=trusted_private_hosts,
+            policy=trusted_policy,
             enforce_host_safety=enforce_host_safety,
         )
         async with session.get(
@@ -1496,7 +1519,7 @@ async def download_file(
                 current_url = urljoin(current_url, location)
                 _validate_download_url(
                     current_url,
-                    trusted_private_hosts=trusted_private_hosts,
+                    policy=trusted_policy,
                     enforce_host_safety=enforce_host_safety,
                 )
                 continue

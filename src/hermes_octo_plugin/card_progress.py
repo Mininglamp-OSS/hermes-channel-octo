@@ -93,6 +93,7 @@ class CardProgressController:
         *,
         adapter: object,
         session_key: str,
+        timeout: float = 5.0,
     ) -> None:
         with self._lock:
             candidates = [
@@ -109,7 +110,7 @@ class CardProgressController:
         try:
             await asyncio.wait_for(
                 asyncio.shield(asyncio.wrap_future(delivery)),
-                timeout=35.0,
+                timeout=timeout,
             )
         except TimeoutError:
             logger.warning("[Octo] progress initial delivery barrier timed out")
@@ -714,12 +715,17 @@ class CardProgressController:
 
 
 _CONTROLLER = CardProgressController()
-async def wait_for_initial_delivery(*, adapter: object, session_key: str) -> None:
+async def wait_for_initial_delivery(
+    *,
+    adapter: object,
+    session_key: str,
+    timeout: float = 5.0,
+) -> None:
     await _CONTROLLER.wait_for_initial_delivery(
         adapter=adapter,
         session_key=session_key,
+        timeout=timeout,
     )
-
 
 def _turn_identity(kwargs: dict[str, Any]) -> tuple[str, str]:
     session_id = str(kwargs.get("session_id") or "")

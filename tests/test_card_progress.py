@@ -54,7 +54,7 @@ _MANIFEST = CardProfileManifest(
 )
 
 
-def test_progress_renderer_uses_only_safe_bounded_summaries() -> None:
+def test_progress_renderer_uses_allowlisted_bounded_summaries_without_dlp() -> None:
     rendered = cards.build_progress_card(
         phase="running",
         tools=[
@@ -80,12 +80,12 @@ def test_progress_renderer_uses_only_safe_bounded_summaries() -> None:
     assert "读取文件" in rendered.plain
     assert "扩展工具" in rendered.plain
     assert "AKIA1234567890ABCDEF" not in rendered.plain
-    assert "hidden" not in rendered.plain
+    assert "Authorization: Bearer hidden" in rendered.plain
     assert "reasoning" not in rendered.plain.lower()
     assert "🤖" not in rendered.plain
 
 
-def test_current_hermes_tools_have_chinese_labels_and_safe_parameter_summaries() -> None:
+def test_current_hermes_tools_have_chinese_labels_and_bounded_parameter_summaries() -> None:
     cases = [
         (
             "read_file",
@@ -114,7 +114,7 @@ def test_current_hermes_tools_have_chinese_labels_and_safe_parameter_summaries()
             "browser_navigate",
             {"url": "https://user:password@docs.example.com/private?q=secret"},
             "打开网页",
-            "https://example.com",
+            "https://user:password@docs.example.com/private?q=secret",
         ),
         (
             "tool_search",
@@ -224,7 +224,7 @@ async def test_progress_lifecycle_sends_then_edits_transient_and_final() -> None
     final = edit.await_args.kwargs
     assert "● 读取文件 · /tmp/a.py · 已完成" in sent["plain"]
     assert "○ 运行命令 · pytest · 失败" in sent["plain"]
-    assert "AKIA1234567890ABCDEF" not in sent["plain"]
+    assert "secret-token-AKIA1234567890ABCDEF" in sent["plain"]
     assert final["card_seq"] == 1
     assert final["transient"] is False
     assert final["plain"].startswith("处理进度 · 已完成")
@@ -1120,10 +1120,10 @@ def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
     assert "Reasoning" not in str(rendered.card)
 
 
-def test_reasoning_summary_never_uses_raw_cot_or_tool_output() -> None:
+def test_reasoning_summary_preserves_public_thought_but_not_raw_tool_output() -> None:
     assert (
         cards.sanitize_reasoning_thought("Authorization: Bearer abcdefghijklmnop")
-        == "正在分析…"
+        == "Authorization: Bearer abcdefghijklmnop"
     )
     assert (
         cards.summarize_tool_result(

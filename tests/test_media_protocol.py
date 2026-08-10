@@ -11,10 +11,10 @@ import aiohttp
 import pytest
 
 from hermes_octo_plugin import api
-from hermes_octo_plugin.adapter import (
-    OctoAdapter,
-    _SSRFGuardConnector,
-    _SSRFGuardResolver,
+from hermes_octo_plugin.adapter import OctoAdapter
+from hermes_octo_plugin.transport import (
+    SSRFGuardConnector as _SSRFGuardConnector,
+    SSRFGuardResolver as _SSRFGuardResolver,
 )
 from hermes_octo_plugin.types import ChannelType, MessagePayload, MessageType
 from tests.conftest import make_bare_adapter
@@ -159,10 +159,10 @@ async def test_http_session_trusts_configured_private_hosts_only_with_opt_in(
     session = MagicMock()
     with (
         patch(
-            "hermes_octo_plugin.adapter._SSRFGuardConnector",
+            "hermes_octo_plugin.transport.SSRFGuardConnector",
             return_value=connector,
         ) as connector_cls,
-        patch("hermes_octo_plugin.adapter.aiohttp.ClientSession", return_value=session),
+        patch("hermes_octo_plugin.transport.aiohttp.ClientSession", return_value=session),
     ):
         assert adapter._new_http_session() is session
 
@@ -466,6 +466,7 @@ async def test_native_media_accepts_local_paths(
     send = AsyncMock()
 
     with (
+        patch.object(api, "authorize_local_media_path", return_value=str(source)),
         patch.object(api, "upload_and_get_url", upload),
         patch.object(api, "send_media_message", send),
     ):
@@ -536,6 +537,47 @@ async def test_native_remote_media_uses_the_server_upload_limit(method_name: str
     assert download.await_args.kwargs["max_size"] == api.MAX_OUTBOUND_MEDIA_BYTES
     assert download.await_args.kwargs["enforce_host_safety"] is False
 
+
+
+@pytest.mark.asyncio
+async def test_native_local_media_uses_hermes_authorized_path_before_read(tmp_path):
+    adapter = make_bare_adapter()
+    requested = tmp_path / "requested.bin"
+    authorized = tmp_path / "authorized.bin"
+    requested.write_bytes(b"requested")
+    authorized.write_bytes(b"authorized")
+
+    with patch.object(
+        api,
+        "authorize_local_media_path",
+        return_value=str(authorized),
+    ) as validate:
+        data, content_type, filename = await adapter._load_outbound_media(str(requested))
+
+    validate.assert_called_once_with(str(requested))
+    assert data == b"authorized"
+    assert content_type == "application/octet-stream"
+    assert filename == "authorized.bin"
+
+
+@pytest.mark.asyncio
+async def test_native_local_media_rejects_hermes_denied_path_before_read(tmp_path):
+    adapter = make_bare_adapter()
+    requested = tmp_path / "denied.bin"
+    requested.write_bytes(b"must not be read")
+
+    with (
+        patch.object(api, "authorize_local_media_path", return_value=None),
+        patch.object(
+            api,
+            "read_local_media",
+            side_effect=AssertionError("denied path was read"),
+        ) as read_local,
+    ):
+        with pytest.raises(PermissionError, match="not authorized"):
+            await adapter._load_outbound_media(str(requested))
+
+    read_local.assert_not_called()
 @pytest.mark.asyncio
 async def test_native_image_download_failure_does_not_fall_back_to_remote_url():
     adapter = make_bare_adapter()

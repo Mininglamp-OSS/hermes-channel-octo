@@ -8,77 +8,63 @@ import pytest
 from hermes_octo_plugin import cards
 
 
-def test_card_text_reduces_embedded_urls_before_reaching_visible_sinks() -> None:
-    rendered = cards.build_display_card(
-        blocks=[
-            {
-                "type": "text",
-                "text": (
-                    "Callback https://hooks.slack.com/services/T00/B00/secret"
-                    "?token=also-secret"
-                ),
-            }
-        ]
+def test_card_text_preserves_embedded_urls_and_content() -> None:
+    text = (
+        "Callback https://hooks.slack.com/services/T00/B00/secret"
+        "?token=also-secret"
     )
-    assert rendered.card["body"][0]["text"] == "Callback https://slack.com"
-    assert rendered.plain == "Callback https://slack.com"
-
-
-
-@pytest.mark.parametrize(
-    ("text", "forbidden"),
-    [
-        ("dsn user:p4ss@db.private.example.com/prod", ("p4ss", "private")),
-        ("hook //hooks.private.example.com/services/K9x7", ("K9x7", "private")),
-        ("hook hooks.private.example.com/services/K9x7", ("K9x7", "private")),
-        ("click [here](javascript:alert(1))", ("javascript:",)),
-    ],
-)
-def test_visible_text_reduces_schemeless_and_markdown_targets(
-    text: str,
-    forbidden: tuple[str, ...],
-) -> None:
     rendered = cards.build_display_card(
         blocks=[{"type": "text", "text": text}]
     )
+    assert rendered.card["body"][0]["text"] == text
+    assert rendered.plain == text
 
-    serialized = str(rendered.card)
-    for value in forbidden:
-        assert value not in serialized
-        assert value not in rendered.plain
 
 
 @pytest.mark.parametrize(
-    "token",
+    "text",
     [
+        "dsn user:p4ss@db.private.example.com/prod",
+        "hook //hooks.private.example.com/services/K9x7",
+        "hook hooks.private.example.com/services/K9x7",
+        "click [here](javascript:alert(1))",
         "xapp-1-A1234567890-B1234567890-C1234567890",
         "npm_123456789012345678901234567890123456",
         "shpat_" + "12345678901234567890123456789012",
         "dop_v1_1234567890123456789012345678901234567890",
     ],
 )
-def test_explicit_token_prefixes_are_hidden_even_in_non_generic_sinks(token: str) -> None:
-    assert cards.sanitize_visible_text(token, generic=False) is None
+def test_visible_text_preserves_content_without_dlp_guessing(text: str) -> None:
+    rendered = cards.build_display_card(
+        blocks=[{"type": "text", "text": text}]
+    )
+    assert rendered.card["body"][0]["text"] == text
+    assert rendered.plain == text
 
 
-def test_action_data_rejects_unsafe_keys_and_internal_namespace() -> None:
-    for key in (
-        "ghp_123456789012345678901234567890123456",
-        "https://user:pass@example.com/private",
-        "_octo_session",
-    ):
-        with pytest.raises(ValueError, match="action data key"):
-            cards.build_interactive_card(
-                title="Approval",
-                buttons=[
-                    {
-                        "id": "approve",
-                        "label": "Approve",
-                        "data": {key: "value"},
-                    }
-                ],
-                binding_id="binding-123",
-            )
+def test_action_data_preserves_content_but_rejects_internal_namespace() -> None:
+    rendered = cards.build_interactive_card(
+        title="Approval",
+        buttons=[{
+            "id": "approve",
+            "label": "Approve",
+            "data": {
+                "token": "ghp_123456789012345678901234567890123456",
+                "callback": "https://example.com/private?secret=value",
+            },
+        }],
+        binding_id="binding-123",
+    )
+    submit = rendered.card["actions"][0]
+    assert submit["data"]["token"].startswith("ghp_")
+    assert submit["data"]["callback"].endswith("secret=value")
+
+    with pytest.raises(ValueError, match="action data key"):
+        cards.build_interactive_card(
+            title="Approval",
+            buttons=[{"id": "approve", "label": "Approve", "data": {"_octo_session": "x"}}],
+            binding_id="binding-123",
+        )
 
 
 def test_action_url_preserves_the_safe_http_destination() -> None:
@@ -190,21 +176,19 @@ def test_payload_bytes_match_go_json_escaping_and_edit_fields() -> None:
     assert edit_size > send_size
 
 
-def test_visible_card_text_drops_secret_shaped_blocks_from_card_and_plain() -> None:
+def test_visible_card_text_preserves_secret_shaped_blocks() -> None:
+    text = "token=AKIA1234567890ABCDEF"
     rendered = cards.build_display_card(
         blocks=[
-            {"type": "text", "text": "token=AKIA1234567890ABCDEF"},
+            {"type": "text", "text": text},
             {"type": "text", "text": "safe status"},
         ]
     )
-
-    serialized = str(rendered.card)
-    assert "AKIA1234567890ABCDEF" not in serialized
-    assert "AKIA1234567890ABCDEF" not in rendered.plain
-    assert rendered.plain == "safe status"
+    assert rendered.card["body"][0]["text"] == text
+    assert rendered.plain == f"{text}\nsafe status"
 
 
-def test_tool_summaries_are_allowlisted_bounded_and_secret_safe() -> None:
+def test_tool_summaries_are_allowlisted_bounded_and_content_preserving() -> None:
     assert (
         cards.summarize_tool_params(
             "read",
@@ -220,17 +204,13 @@ def test_tool_summaries_are_allowlisted_bounded_and_secret_safe() -> None:
         == "python"
     )
     assert cards.summarize_tool_params("mcp__unknown", {"query": "visible"}) == ""
-    assert cards.summarize_tool_params("web_search", {"query": "token=hidden"}) == ""
+    assert cards.summarize_tool_params("web_search", {"query": "token=hidden"}) == "token=hidden"
 
 
-def test_tool_labels_and_errors_do_not_echo_secrets() -> None:
+def test_tool_labels_and_errors_preserve_content_with_structural_bounds() -> None:
     assert cards.safe_tool_label("read") == "read"
     assert cards.safe_tool_label("mcp__database_query") == "MCP tool"
-    assert cards.safe_tool_label("token=AKIA1234567890ABCDEF") == "tool"
-    assert (
-        cards.sanitize_error_text(
-            "request failed at https://private.example.com/path?id=secret"
-        )
-        == "request failed at https://example.com"
-    )
-    assert cards.sanitize_error_text("Authorization: Bearer hidden") == ""
+    assert cards.safe_tool_label("token") == "token"
+    error = "request failed at https://private.example.com/path?id=secret"
+    assert cards.sanitize_error_text(error) == error
+    assert cards.sanitize_error_text("Authorization: Bearer hidden") == "Authorization: Bearer hidden"

@@ -474,8 +474,8 @@ def test_action_status_renderer_freezes_inputs_and_removes_actions() -> None:
     assert "actions" not in rendered.card
     assert all(not node["type"].startswith("Input.") for node in rendered.card["body"])
     visible = "\n".join(node.get("text", "") for node in rendered.card["body"])
-    assert "token=x" not in visible
-    assert "https://evil.example/path" not in visible
+    assert "token=x" in visible
+    assert "https://evil.example/path" in visible
     assert "Completed" in rendered.plain
 
 

@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ipaddress
 import json
 import logging
 import os
 import random
 import re
-import socket
 import time
 import uuid
-from importlib.metadata import PackageNotFoundError, version as _package_version
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -22,9 +19,6 @@ from urllib.parse import urlparse
 import aiohttp
 import websockets
 import websockets.exceptions
-from aiohttp.abc import AbstractResolver, ResolveResult
-from aiohttp.resolver import DefaultResolver
-from packaging.version import InvalidVersion, Version
 from agent.redact import redact_sensitive_text as _redact_raw
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -35,12 +29,23 @@ from gateway.platforms.base import (
 )
 
 from . import api, cards
+from .clarify import (
+    deliver as _deliver_clarify,
+    native_clarify_supported as _native_clarify_supported,
+)
 from .mention import (
     convert_content_for_llm,
     convert_structured_mentions,
     extract_mention_uids,
     parse_structured_mentions,
     strip_leading_self_mention_for_command,
+)
+from .transport import (
+    SSRFGuardConnector as _SSRFGuardConnector,
+    SSRFGuardResolver as _SSRFGuardResolver,
+    _METADATA_HOSTS,
+    is_private_or_metadata_host as _is_private_or_metadata_host,
+    new_guarded_http_session as _new_guarded_http_session,
 )
 from .protocol import (
     PROTO_VERSION,
@@ -70,7 +75,8 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .card_events import CardAction, CardSession
+    from .card_events import CardAction
+    from .card_sessions import CardSession
 from .types import (
     MessageType as OctoMessageType,
 )
@@ -95,33 +101,6 @@ def _delivery_result(result: SendMessageResult) -> SendResult:
         raw_response=raw_response,
     )
 
-_NATIVE_CLARIFY_MIN = Version("0.20")
-
-
-def _native_clarify_supported() -> bool:
-    """Enable native clarify for Hermes releases that provide its gateway API."""
-    try:
-        installed = Version(_package_version("hermes-agent"))
-    except (InvalidVersion, PackageNotFoundError, TypeError, ValueError):
-        return False
-    return installed >= _NATIVE_CLARIFY_MIN
-
-def _registered_clarify_entry(clarify_id: str) -> Any | None:
-    """Read the exact gateway-owned clarify entry."""
-    from tools import clarify_gateway
-
-    with clarify_gateway._lock:
-        return clarify_gateway._entries.get(clarify_id)
-
-
-def _clarify_send_is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, (aiohttp.ClientError, TimeoutError)):
-        return True
-    return isinstance(exc, api.OctoApiError) and (
-        exc.status is None
-        or exc.status >= 500
-        or exc.status in {408, 409, 425, 429}
-    )
 
 
 
@@ -384,191 +363,6 @@ def _validate_octo_path_segment(seg: str, kind: str) -> str:
     return seg
 
 
-# Hostnames that resolve to cloud / container metadata services (token theft
-# vectors when an attacker controls OCTO_API_URL / OCTO_CDN_URL).
-_METADATA_HOSTS = frozenset({
-    "169.254.169.254",  # AWS / GCP / Azure IMDS
-    "fd00:ec2::254",  # AWS IMDSv6
-    "metadata.google.internal",  # GCP
-    "metadata.goog",  # GCP
-    "metadata",  # GCP short form
-    "100.100.100.200",  # Aliyun
-})
-
-
-def _is_private_or_metadata_host(hostname: str) -> bool:
-    """Return True if the host should be blocked as an SSRF target.
-
-    Catches loopback, RFC1918, link-local, multicast, and well-known cloud
-    metadata endpoints. Literal IPs are inspected here; hostname DNS answers
-    are enforced at connection time by :class:`_SSRFGuardResolver`.
-    """
-    if not hostname:
-        return True
-    lowered = hostname.lower()
-    if lowered in _METADATA_HOSTS:
-        return True
-    if (
-        lowered.endswith((".local", ".internal", ".localhost"))
-        or lowered == "localhost"
-    ):
-        return True
-    try:
-        ip = ipaddress.ip_address(lowered.strip("[]"))
-    except ValueError:
-        return False  # Not a literal IP — let DNS layer / network stack decide
-    return (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
-
-
-def _is_unconditionally_unsafe_address(address: str) -> bool:
-    """Block metadata and non-routable DNS answers even for trusted origins."""
-    normalized = address.lower().strip("[]").rstrip(".")
-    if normalized in _METADATA_HOSTS:
-        return True
-    try:
-        ip = ipaddress.ip_address(normalized)
-    except ValueError:
-        return True
-    return ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
-
-
-class _SSRFGuardResolver(AbstractResolver):
-    """Reject unsafe DNS answers on the same resolution used by aiohttp.
-
-    URL string checks alone do not stop a public-looking hostname from
-    resolving to loopback, RFC1918, link-local, or metadata addresses. Wrapping
-    aiohttp's resolver makes the decision on the exact address records handed
-    to the connector, avoiding a separate preflight DNS lookup and its TOCTOU
-    window. Explicitly configured API/CDN hosts are trusted origins only
-    when ``OCTO_ALLOW_PRIVATE_HOSTS`` is enabled, so private self-hosted
-    deployments remain possible without weakening the default; metadata
-    hostnames are never trusted.
-    """
-
-    def __init__(self, *, trusted_hosts: set[str] | None = None) -> None:
-        super().__init__()
-        self._trusted_hosts = {
-            host.lower().rstrip(".") for host in (trusted_hosts or set()) if host
-        }
-        self._delegate = DefaultResolver()
-
-    async def resolve(
-        self,
-        host: str,
-        port: int = 0,
-        family: socket.AddressFamily = socket.AF_INET,
-    ) -> list[ResolveResult]:
-        normalized = host.lower().rstrip(".")
-        if normalized in _METADATA_HOSTS:
-            raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
-        trusted = normalized in self._trusted_hosts
-        if not trusted and _is_private_or_metadata_host(normalized):
-            raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
-
-        records = await self._delegate.resolve(host, port, family)
-        if not records:
-            raise OSError(f"hostname returned no addresses: {normalized}")
-        for record in records:
-            address = str(record.get("host") or "")
-            if _is_unconditionally_unsafe_address(address) or (
-                not trusted and _is_private_or_metadata_host(address)
-            ):
-                raise OSError(f"unsafe address blocked by SSRF guard for {normalized}")
-        return records
-
-    async def close(self) -> None:
-        await self._delegate.close()
-
-
-def _canonical_literal_ip(host: str) -> str | None:
-    """Return a canonical IP for ordinary and legacy numeric literals.
-
-    aiohttp intentionally bypasses custom resolvers for values accepted by
-    ``is_ip_address``.  libc also accepts historical IPv4 spellings such as
-    ``2130706433``, ``127.1`` and ``0177.0.0.1``.  Canonicalising those before
-    aiohttp's fast path keeps the SSRF policy on the actual destination.
-    ``socket.inet_aton`` performs numeric parsing only; it does not resolve DNS.
-    """
-    normalized = host.lower().strip("[]").rstrip(".")
-    try:
-        return str(ipaddress.ip_address(normalized))
-    except ValueError:
-        try:
-            return str(ipaddress.ip_address(socket.inet_aton(normalized)))
-        except OSError:
-            return None
-
-
-class _SSRFGuardConnector(aiohttp.TCPConnector):
-    """TCP connector that guards resolver bypasses and owns its resolver."""
-
-    def __init__(self, *, resolver: _SSRFGuardResolver) -> None:
-        self._ssrf_resolver = resolver
-        self._ssrf_resolver_closed = False
-        self._ssrf_resolver_close_lock = asyncio.Lock()
-        super().__init__(resolver=resolver)
-
-    async def _resolve_host(
-        self,
-        host: str,
-        port: int,
-        traces: Any = None,
-    ) -> list[ResolveResult]:
-        normalized = host.lower().strip("[]").rstrip(".")
-        trusted = normalized in self._ssrf_resolver._trusted_hosts
-        literal = _canonical_literal_ip(normalized)
-
-        if normalized in _METADATA_HOSTS:
-            raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
-        if literal is not None and (
-            _is_unconditionally_unsafe_address(literal)
-            or (not trusted and _is_private_or_metadata_host(literal))
-        ):
-            raise OSError(f"unsafe address blocked by SSRF guard: {normalized}")
-        if literal is None and not trusted and _is_private_or_metadata_host(normalized):
-            raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
-
-        return await super()._resolve_host(host, port, traces)
-
-    async def close(self, *, abort_ssl: bool = False) -> None:
-        try:
-            await super().close(abort_ssl=abort_ssl)
-        finally:
-            async with self._ssrf_resolver_close_lock:
-                if not self._ssrf_resolver_closed:
-                    await self._ssrf_resolver.close()
-                    self._ssrf_resolver_closed = True
-
-
-def _new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
-    """Create one SSRF-guarded session for live and ephemeral API clients."""
-    trusted_hosts: set[str] = set()
-    allow_private_hosts = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    if allow_private_hosts:
-        for configured_url in configured_urls:
-            if not configured_url:
-                continue
-            try:
-                host = (urlparse(configured_url).hostname or "").lower().rstrip(".")
-            except (TypeError, ValueError):
-                host = ""
-            if host and host not in _METADATA_HOSTS:
-                trusted_hosts.add(host)
-
-    resolver = _SSRFGuardResolver(trusted_hosts=trusted_hosts)
-    connector = _SSRFGuardConnector(resolver=resolver)
-    return aiohttp.ClientSession(connector=connector)
 
 
 def _validate_octo_endpoint(
@@ -924,7 +718,7 @@ class OctoAdapter(BasePlatformAdapter):
         self._lifecycle_lock = asyncio.Lock()
         self._gateway_loop: asyncio.AbstractEventLoop | None = None
         self._progress_tasks: set[asyncio.Task[Any]] = set()
-        from .card_events import CardSessionRegistry
+        from .card_sessions import CardSessionRegistry
 
         self._event_poller: Any | None = None
         self._event_task: asyncio.Task[Any] | None = None
@@ -1127,11 +921,20 @@ class OctoAdapter(BasePlatformAdapter):
             return False
         return True
 
-    async def _wait_for_card_progress(self, session_key: str) -> None:
+    async def _wait_for_card_progress(
+        self,
+        session_key: str,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
         """Wait only for this session's progress card to complete first send."""
         from .card_progress import wait_for_initial_delivery
 
-        await wait_for_initial_delivery(adapter=self, session_key=session_key)
+        await wait_for_initial_delivery(
+            adapter=self,
+            session_key=session_key,
+            timeout=timeout,
+        )
 
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
@@ -3925,7 +3728,7 @@ class OctoAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
-        """Deliver Hermes 0.20 clarifies as session-bound Type-17 controls."""
+        """Delegate Hermes clarify delivery to the isolated integration."""
         async def fallback() -> SendResult:
             return await self._send_clarify_fallback(
                 chat_id,
@@ -3936,194 +3739,15 @@ class OctoAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
-        if (
-            not self._native_clarify_enabled
-            or self._disconnecting
-            or self._http_session is None
-            or self._on_behalf_of
-        ):
-            return await fallback()
-
-        from .card_events import CardSession, ClarifySession
-        from .card_tools import _trusted_route
-
-        route = _trusted_route(self, require_session_key=True)
-        entry = _registered_clarify_entry(clarify_id)
-        if (
-            route is None
-            or route.chat_id != chat_id
-            or route.session_key != session_key
-            or entry is None
-            or entry.session_key != session_key
-            or entry.question != question
-            or entry.choices != choices
-            or not choices
-            or not all(
-                isinstance(choice, str)
-                and choice
-                and choice == choice.strip()
-                for choice in choices
-            )
-        ):
-            return await fallback()
-
-        if len(choices) > 4 or len(set(choices)) != len(choices):
-            return await fallback()
-        multi_select = bool(entry.multi_select)
-
-        try:
-            manifest = self._card_profile_cache.get()
-            if manifest is None:
-                manifest = await api.get_card_profile(
-                    self._http_session,
-                    self._api_url,
-                    self._bot_token,
-                )
-                self._card_profile_cache.put(manifest)
-            if (
-                not manifest.available
-                or not manifest.enabled
-                or manifest.profiles is None
-                or CARD_PROFILE_V2 not in manifest.profiles
-            ):
-                return await fallback()
-            capabilities = cards.derive_card_capabilities(manifest)
-            binding_id = str(uuid.uuid4())
-            action_choices = tuple(
-                (f"clarify_choice_{index}", choice)
-                for index, choice in enumerate(choices)
-            )
-            other_action_id = "clarify_other"
-            input_id: str | None = None
-            confirm_action_id: str | None = None
-            if multi_select:
-                input_id = "clarify_choices"
-                confirm_action_id = "clarify_confirm"
-                inputs: list[dict[str, object]] = [{
-                    "kind": "choice",
-                    "id": input_id,
-                    "label": "可多选",
-                    "multi_select": True,
-                    "choices": [
-                        {"title": choice, "value": choice_id}
-                        for choice_id, choice in action_choices
-                    ],
-                }]
-                buttons: list[dict[str, object]] = [
-                    {"id": confirm_action_id, "label": "提交"},
-                    {"id": other_action_id, "label": "其他"},
-                ]
-            else:
-                inputs = []
-                buttons = [
-                    {"id": choice_id, "label": choice}
-                    for choice_id, choice in action_choices
-                ]
-                buttons.append({"id": other_action_id, "label": "其他"})
-            rendered = cards.build_interactive_card(
-                title="需要确认",
-                text=question,
-                inputs=inputs,
-                buttons=buttons,
-                binding_id=binding_id,
-                capabilities=capabilities,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return await fallback()
-
-        client_msg_no = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"hermes-octo:clarify:{clarify_id}",
-            )
+        return await _deliver_clarify(
+            adapter=self,
+            chat_id=chat_id,
+            question=question,
+            choices=choices,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            fallback=fallback,
         )
-        await self._wait_for_card_progress(session_key)
-        try:
-            result = await api.send_card_message(
-                self._http_session,
-                self._api_url,
-                self._bot_token,
-                channel_id=route.channel_id,
-                channel_type=route.channel_type,
-                card=rendered.card,
-                plain=rendered.plain,
-                client_msg_no=client_msg_no,
-                profile=CARD_PROFILE_V2,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as first_error:
-            if not _clarify_send_is_retryable(first_error):
-                return await fallback()
-            try:
-                result = await api.send_card_message(
-                    self._http_session,
-                    self._api_url,
-                    self._bot_token,
-                    channel_id=route.channel_id,
-                    channel_type=route.channel_type,
-                    card=rendered.card,
-                    plain=rendered.plain,
-                    client_msg_no=client_msg_no,
-                    profile=CARD_PROFILE_V2,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as retry_error:
-                return SendResult(
-                    success=False,
-                    error="Octo clarify card delivery failed",
-                    retryable=_clarify_send_is_retryable(retry_error),
-                )
-
-        if result.message_id is None:
-            return SendResult(
-                success=False,
-                error="Octo clarify card delivery missing message_id",
-            )
-        if _registered_clarify_entry(clarify_id) is not entry:
-            return SendResult(
-                success=False,
-                message_id=result.message_id,
-                error="Hermes clarify is no longer pending",
-            )
-        try:
-            self._register_card_session(
-                CardSession(
-                    message_id=result.message_id,
-                    binding_id=binding_id,
-                    session_key=session_key,
-                    chat_id=route.chat_id,
-                    channel_id=route.channel_id,
-                    channel_type=route.channel_type,
-                    requester_uid=route.requester_uid,
-                    card=rendered.card,
-                    plain=rendered.plain,
-                    action_labels=rendered.action_labels,
-                    input_ids=rendered.input_ids,
-                    max_input_text_bytes=capabilities.max_input_text_bytes,
-                    max_inputs_bytes=capabilities.max_inputs_bytes,
-                    clarify=ClarifySession(
-                        clarify_id=clarify_id,
-                        multi_select=bool(multi_select),
-                        question=question,
-                        choices=tuple(choices),
-                        action_choices=action_choices,
-                        input_id=input_id,
-                        confirm_action_id=confirm_action_id,
-                        other_action_id=other_action_id,
-                    ),
-                )
-            )
-        except Exception:
-            return SendResult(
-                success=False,
-                message_id=result.message_id,
-                error="Octo clarify card binding failed",
-            )
-        return _delivery_result(result)
 
 
     async def send(
@@ -4142,8 +3766,19 @@ class OctoAdapter(BasePlatformAdapter):
             )
 
         channel_type = self._resolve_channel_type(chat_id, metadata)
+        # Hermes attaches the triggering inbound message as ``reply_to`` to
+        # every final response and marks that delivery with ``notify=True``.
+        # Octo renders the resulting reply envelope as a quote; card-action
+        # turns have no quoted text, leaving an empty block above the answer.
+        # Match OpenClaw's automatic reply path by omitting that implicit
+        # anchor. Explicit adapter/tool replies do not carry this marker.
+        effective_reply_to = (
+            None if metadata and metadata.get("notify") is True else reply_to
+        )
 
-        return await self._send_normal(chat_id, content, channel_type, reply_to)
+        return await self._send_normal(
+            chat_id, content, channel_type, effective_reply_to
+        )
 
     @staticmethod
     def _strip_hermes_cursor(content: str) -> str:
@@ -4258,7 +3893,7 @@ class OctoAdapter(BasePlatformAdapter):
                     enforce_host_safety=False,
                 )
         file_data, filename = await asyncio.to_thread(
-            api.read_local_media,
+            api.read_authorized_local_media,
             source,
             max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
         )
@@ -4299,6 +3934,7 @@ class OctoAdapter(BasePlatformAdapter):
                 filename,
                 file_data,
                 content_type,
+                policy=getattr(self._http_session, "transport_policy", None),
             )
 
             # With a caption AND known dimensions, ship as a single
@@ -4412,6 +4048,7 @@ class OctoAdapter(BasePlatformAdapter):
                 filename,
                 file_data,
                 content_type,
+                policy=getattr(self._http_session, "transport_policy", None),
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
@@ -4473,6 +4110,7 @@ class OctoAdapter(BasePlatformAdapter):
                 filename,
                 file_data,
                 content_type,
+                policy=getattr(self._http_session, "transport_policy", None),
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
@@ -4536,6 +4174,7 @@ class OctoAdapter(BasePlatformAdapter):
                 filename,
                 file_data,
                 content_type,
+                policy=getattr(self._http_session, "transport_policy", None),
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
@@ -4620,95 +4259,48 @@ def register(ctx) -> None:
             "registered so it appears in hermes setup gateway / hermes config."
         )
 
-    # Register the LLM-callable management tool first so it lives in the
-    # registry by the time the gateway builds its toolset list.
-    #
-    # Why a Tool (not a Skill + generic HTTP tool):
-    #   1. Target parsing must happen plugin-side. Octo's 32-char hex
-    #      channel_ids and {group_no}____{short_id} thread format are not
-    #      recognized by the core send_message tool — using it would silently
-    #      drop messages onto the bot's home channel with a fake message_id.
-    #   2. The handler cross-checks claimed requester_uid against Hermes'
-    #      trusted Octo session identity before applying membership / OWNER_ONLY
-    #      gates. Prompt-only enforcement is unacceptable against injection.
-    #   3. The handler depends on live adapter runtime state (_owner_uid,
-    #      _api_url, _bot_token, _known_group_ids, check_read_permission()),
-    #      not configuration — a generic HTTP tool cannot see it.
-    #   4. Event-loop / aiohttp-session compatibility with the gateway is a
-    #      plugin black box (see agent_tools.py module docstring).
+    tool_specs: list[tuple[dict[str, Any], Callable[..., Any], str | None]] = []
     if _bot_configured:
         try:
-            from .agent_tools import (
-                TOOL_SCHEMA,
-                octo_management_handler,
-            )
-
-            ctx.register_tool(
-                name="octo_management",
-                toolset="octo",
-                schema=TOOL_SCHEMA,
-                handler=octo_management_handler,
-                check_fn=check_octo_requirements,
-                requires_env=list(_REQUIRED_ENV),
-                is_async=True,
-                description=TOOL_SCHEMA.get("description", ""),
-                emoji="💬",
-            )
-        except Exception as e:  # pragma: no cover — be defensive at import time
-            logger.warning("[Octo] register_tool(octo_management) failed: %s", e)
-
-    if _bot_configured:
-        try:
+            from .agent_tools import TOOL_SCHEMA, octo_management_handler
             from .card_tools import (
                 DISPLAY_CARD_TOOL_SCHEMA,
                 INTERACTIVE_CARD_TOOL_SCHEMA,
                 octo_send_display_card_handler,
                 octo_send_interactive_card_handler,
             )
-        except Exception as e:  # pragma: no cover - defensive plugin loading
-            logger.warning("[Octo] card tool import failed: %s", e)
-        else:
-            card_tool_specs = (
-                (DISPLAY_CARD_TOOL_SCHEMA, octo_send_display_card_handler),
-                (INTERACTIVE_CARD_TOOL_SCHEMA, octo_send_interactive_card_handler),
-            )
-            for schema, handler in card_tool_specs:
-                name = schema["name"]
-                try:
-                    ctx.register_tool(
-                        name=name,
-                        toolset="octo",
-                        schema=schema,
-                        handler=handler,
-                        check_fn=check_octo_requirements,
-                        requires_env=list(_REQUIRED_ENV),
-                        is_async=True,
-                        description=schema.get("description", ""),
-                    )
-                except Exception as e:  # pragma: no cover - isolate registrations
-                    logger.warning("[Octo] register_tool(%s) failed: %s", name, e)
-
-    if _bot_configured:
-        try:
             from .message_tools import MESSAGE_TOOL_HANDLERS, MESSAGE_TOOL_SCHEMAS
+
+            tool_specs.extend([
+                (TOOL_SCHEMA, octo_management_handler, "💬"),
+                (DISPLAY_CARD_TOOL_SCHEMA, octo_send_display_card_handler, None),
+                (INTERACTIVE_CARD_TOOL_SCHEMA, octo_send_interactive_card_handler, None),
+            ])
+            tool_specs.extend(
+                (schema, MESSAGE_TOOL_HANDLERS[schema["name"]], None)
+                for schema in MESSAGE_TOOL_SCHEMAS
+            )
         except Exception as e:  # pragma: no cover - defensive plugin loading
-            logger.warning("[Octo] message tool import failed: %s", e)
-        else:
-            for schema in MESSAGE_TOOL_SCHEMAS:
-                name = schema["name"]
-                try:
-                    ctx.register_tool(
-                        name=name,
-                        toolset="octo",
-                        schema=schema,
-                        handler=MESSAGE_TOOL_HANDLERS[name],
-                        check_fn=check_octo_requirements,
-                        requires_env=list(_REQUIRED_ENV),
-                        is_async=True,
-                        description=schema.get("description", ""),
-                    )
-                except Exception as e:  # pragma: no cover - isolate registrations
-                    logger.warning("[Octo] register_tool(%s) failed: %s", name, e)
+            logger.warning("[Octo] tool import failed: %s", e)
+
+    for schema, handler, emoji in tool_specs:
+        name = schema["name"]
+        try:
+            kwargs: dict[str, Any] = {
+                "name": name,
+                "toolset": "octo",
+                "schema": schema,
+                "handler": handler,
+                "check_fn": check_octo_requirements,
+                "requires_env": list(_REQUIRED_ENV),
+                "is_async": True,
+                "description": schema.get("description", ""),
+            }
+            if emoji is not None:
+                kwargs["emoji"] = emoji
+            ctx.register_tool(**kwargs)
+        except Exception as e:  # pragma: no cover - isolate registrations
+            logger.warning("[Octo] register_tool(%s) failed: %s", name, e)
 
     if _bot_configured:
         try:

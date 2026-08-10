@@ -168,62 +168,6 @@ def derive_card_capabilities(manifest: CardProfileManifest) -> CardCapabilities:
     )
 
 
-_MULTI_PART_TLDS = frozenset({
-    "ac.uk",
-    "co.jp",
-    "co.kr",
-    "co.uk",
-    "com.au",
-    "com.br",
-    "com.cn",
-    "com.hk",
-    "com.sg",
-    "com.tw",
-    "edu.cn",
-    "gov.uk",
-    "gov.cn",
-    "net.cn",
-    "org.cn",
-    "org.uk",
-})
-_URL_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s)\]}>\"']+")
-_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\r\n]{0,512})\]\(\s*([^\s)]+)(?:\s+[^)]*)?\)")
-_PROTOCOL_RELATIVE_RE = re.compile(
-    r"(^|[^A-Za-z0-9/:])"
-    r"(//[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
-    r"(?::\d+)?(?:/[^\s)\]}>\"']*)?)"
-)
-_SCHEMELESS_USERINFO_RE = re.compile(
-    r"\b[A-Za-z0-9._%+-]+:[^\s/]+@"
-    r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
-    r"(?::\d+)?(?:/[^\s)\]}>\"']*)?"
-)
-_SCHEMELESS_HOST_PATH_RE = re.compile(
-    r"(^|[^A-Za-z0-9@._/:+-])"
-    r"([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
-    r"(?::\d+)?/[^\s)\]}>\"']+)"
-)
-_SECRET_KEYWORD_RE = re.compile(
-    r"token|api[_-]?key|secret|password|passwd|pwd|authorization|bearer|"
-    r"access[_-]?key|client[_-]?secret|credential",
-    re.IGNORECASE,
-)
-_SECRET_PREFIX_RES = (
-    re.compile(r"AKIA[0-9A-Z]{12,}"),
-    re.compile(r"(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}"),
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"[srp]k_(?:live|test)_[A-Za-z0-9]{10,}"),
-    re.compile(r"glpat-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
-    re.compile(r"xapp-[0-9]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"npm_[A-Za-z0-9]{30,}"),
-    re.compile(r"shpat_[A-Fa-f0-9]{32,}"),
-    re.compile(r"dop_v1_[A-Fa-f0-9]{32,}"),
-    re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
-)
-_LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
-_GENERIC_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
 _SUMMARY_STRATEGY = {
     "apply_patch": "path",
     "bash": "shell",
@@ -326,14 +270,6 @@ _INPUT_TYPES = {
 }
 
 
-def _registrable_domain(host: str) -> str:
-    labels = host.rstrip(".").lower().split(".")
-    if len(labels) <= 2 or ":" in host:
-        return host.lower()
-    keep = 3 if ".".join(labels[-2:]) in _MULTI_PART_TLDS else 2
-    return ".".join(labels[-keep:])
-
-
 def _origin_domain(raw_url: str) -> str | None:
     try:
         parsed = urlsplit(raw_url)
@@ -342,83 +278,18 @@ def _origin_domain(raw_url: str) -> str | None:
         return None
     if not parsed.scheme or not host:
         return None
-    safe_host = _registrable_domain(host)
-    if ":" in safe_host:
-        safe_host = f"[{safe_host}]"
-    return f"{parsed.scheme.lower()}://{safe_host}"
-
-
-def _markdown_link(match: re.Match[str]) -> str:
-    label = match.group(1)
-    target = match.group(2)
-    candidate = f"https:{target}" if target.startswith("//") else target
-    origin = _origin_domain(candidate)
-    if origin is None or not origin.startswith(("http://", "https://")):
-        return label
-    return f"[{label}]({origin})"
-
-
-def reduce_urls_in_text(text: str) -> str:
-    """Reduce every URL-shaped visible sink to a disclosure-safe origin."""
-    if len(text.encode("utf-8")) > DEFAULT_MAX_VISIBLE_TEXT_BYTES:
-        raise CardLimitError("card text bytes exceed local limit")
-    reduced = _MARKDOWN_LINK_RE.sub(_markdown_link, text)
-    reduced = _URL_IN_TEXT_RE.sub(
-        lambda match: _origin_domain(match.group(0)) or "",
-        reduced,
-    )
-    reduced = _PROTOCOL_RELATIVE_RE.sub(
-        lambda match: (
-            match.group(1) + (_origin_domain(f"https:{match.group(2)}") or "")
-        ),
-        reduced,
-    )
-    reduced = _SCHEMELESS_USERINFO_RE.sub(
-        lambda match: (
-            _origin_domain(
-                "https://" + match.group(0).rsplit("@", 1)[-1].split("/", 1)[0]
-            )
-            or ""
-        ),
-        reduced,
-    )
-    return _SCHEMELESS_HOST_PATH_RE.sub(
-        lambda match: (
-            match.group(1) + (_origin_domain(f"https://{match.group(2)}") or "")
-        ),
-        reduced,
-    )
-
-
-def is_sensitive(text: str, *, generic: bool = True) -> bool:
-    """Detect credential names and common credential value shapes."""
-    if _SECRET_KEYWORD_RE.search(text):
-        return True
-    if any(pattern.search(text) for pattern in _SECRET_PREFIX_RES):
-        return True
-    if not generic:
-        return False
-    if _LONG_HEX_RE.search(text):
-        return True
-    return any(
-        (
-            any(character.isdigit() for character in run)
-            and any(character.isalpha() for character in run)
-        )
-        or any(character in "+/_=-" for character in run)
-        for run in _GENERIC_SECRET_RUN_RE.findall(text)
-    )
+    return f"{parsed.scheme.lower()}://{host}"
 
 
 def sanitize_visible_text(text: str, *, generic: bool = True) -> str | None:
-    """Reduce URL disclosure and drop a visible sink when it looks sensitive."""
+    """Normalize bounded visible card text without inspecting its meaning."""
+    del generic
+    if len(text.encode("utf-8")) > DEFAULT_MAX_VISIBLE_TEXT_BYTES:
+        raise CardLimitError("card text bytes exceed local limit")
     normalized = re.sub(r"\s+", " ", text).strip()
-    if not normalized:
-        return None
-    reduced = re.sub(r"\s+", " ", reduce_urls_in_text(normalized)).strip()
-    if not reduced or is_sensitive(reduced, generic=generic):
-        return None
-    return reduced
+    return normalized or None
+
+
 
 
 def _first_string(params: Mapping[str, object], keys: Sequence[str]) -> str:
@@ -551,7 +422,7 @@ def summarize_tool_params(
     tool_name: str | None,
     params: object,
 ) -> str:
-    """Return one allowlisted, disclosure-safe tool parameter summary."""
+    """Return one allowlisted, bounded tool parameter summary."""
     if not tool_name or not isinstance(params, Mapping):
         return ""
     strategy = _SUMMARY_STRATEGY.get(tool_name)
@@ -577,8 +448,7 @@ def summarize_tool_params(
     elif strategy == "shell":
         summary = _summarize_shell(params)
     elif strategy == "url":
-        raw_url = _first_string(params, ("url",))
-        summary = _origin_domain(raw_url) or ""
+        summary = _first_string(params, ("url",))
     elif strategy == "name":
         summary = _first_string(
             params,
@@ -599,11 +469,8 @@ def summarize_tool_params(
         )
     else:
         summary = _first_string(params, ("query", "pattern"))
-    summary = re.sub(r"\s+", " ", reduce_urls_in_text(summary)).strip()
-    if not summary or is_sensitive(
-        summary,
-        generic=strategy in {"query", "query_scope", "url", "name"},
-    ):
+    summary = re.sub(r"\s+", " ", summary).strip()
+    if not summary:
         return ""
     if len(summary) > _SUMMARY_MAX_CHARS:
         return f"{summary[:_SUMMARY_MAX_CHARS]}…"
@@ -611,14 +478,12 @@ def summarize_tool_params(
 
 
 def safe_tool_label(tool_name: str | None) -> str:
-    """Return a bounded label without echoing arbitrary MCP or secret text."""
+    """Return a structurally bounded tool label."""
     if not tool_name:
         return "tool"
     if tool_name.startswith("mcp__"):
         return "MCP tool"
-    if not _SAFE_TOOL_LABEL_RE.fullmatch(tool_name) or is_sensitive(
-        tool_name, generic=True
-    ):
+    if not _SAFE_TOOL_LABEL_RE.fullmatch(tool_name):
         return "tool"
     return tool_name
 
@@ -643,12 +508,10 @@ def localized_tool_label(
 
 
 def sanitize_error_text(error: object) -> str:
-    """Return a short visible error summary or an empty fail-closed value."""
+    """Return a short visible error summary without content inspection."""
     if not isinstance(error, str):
         return ""
-    summary = re.sub(r"\s+", " ", reduce_urls_in_text(error)).strip()
-    if not summary or is_sensitive(summary, generic=True):
-        return ""
+    summary = re.sub(r"\s+", " ", error).strip()
     if len(summary) > _ERROR_MAX_CHARS:
         return f"{summary[:_ERROR_MAX_CHARS]}…"
     return summary
@@ -1063,11 +926,11 @@ def _clean_interactive_text(
 ) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    clean = sanitize_visible_text(value.strip())
+    clean = sanitize_visible_text(value)
     if clean is None:
-        raise ValueError(f"{field} must not contain sensitive data")
+        raise ValueError(f"{field} must not be empty")
     if len(clean) > max_chars:
-        return f"{clean[:max_chars]}…"
+        raise ValueError(f"{field} exceeds length limit")
     return clean
 
 
@@ -1081,11 +944,8 @@ def _clean_semantic_value(
         raise ValueError(f"{field} must be a string")
     candidate = value.strip()
     if not candidate or len(candidate) > max_chars:
-        raise ValueError(f"{field} exceeds safe limit")
-    clean = sanitize_visible_text(candidate)
-    if clean is None or clean != candidate:
-        raise ValueError(f"{field} must not contain sensitive or URL data")
-    return clean
+        raise ValueError(f"{field} exceeds length limit")
+    return candidate
 
 
 def _sanitize_action_data(
@@ -1094,18 +954,12 @@ def _sanitize_action_data(
     key: str = "",
     depth: int = 0,
 ) -> object:
-    if _SECRET_KEYWORD_RE.fullmatch(key):
-        return "[redacted]"
+    del key
     if isinstance(value, str):
         candidate = value.strip()
         if len(candidate.encode("utf-8")) > DEFAULT_MAX_ACTION_DATA_VALUE_BYTES:
             raise ValueError("action data value exceeds byte limit")
-        clean = sanitize_visible_text(candidate)
-        if clean is None:
-            return "[redacted]"
-        if clean != candidate:
-            raise ValueError("action data value must not contain URL data")
-        return clean
+        return candidate
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
@@ -1130,10 +984,6 @@ def _sanitize_action_data(
             if (
                 child_key.startswith("_octo_")
                 or not _CARD_ID_RE.fullmatch(child_key)
-                or (
-                    is_sensitive(child_key, generic=True)
-                    and not _SECRET_KEYWORD_RE.fullmatch(child_key)
-                )
             ):
                 raise ValueError("action data key must be a safe identifier")
             sanitized[child_key] = _sanitize_action_data(
@@ -1149,7 +999,7 @@ def _require_card_id(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a safe identifier")
     candidate = value.strip()
-    if not _CARD_ID_RE.fullmatch(candidate) or is_sensitive(candidate, generic=True):
+    if not _CARD_ID_RE.fullmatch(candidate):
         raise ValueError(f"{field} must be a safe identifier")
     return candidate
 

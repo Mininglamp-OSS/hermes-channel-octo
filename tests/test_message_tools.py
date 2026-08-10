@@ -81,7 +81,6 @@ def test_message_tool_schemas_expose_no_model_controlled_route_or_identity():
         "octo_send_file",
         "octo_send_voice",
         "octo_send_video",
-        "octo_card_profile",
         "octo_edit_card",
     }
     for schema in schemas:
@@ -237,6 +236,7 @@ async def test_file_tool_accepts_a_local_path(tmp_path):
         )
     )
     with (
+        patch.object(message_tools.api, "authorize_local_media_path", return_value=str(source)),
         _tool_context(),
         patch.object(message_tools.api, "upload_and_get_url", upload),
         patch.object(message_tools.api, "send_media_message", send),
@@ -265,6 +265,55 @@ async def test_file_tool_accepts_a_local_path(tmp_path):
     assert str(UUID(client_msg_no)) == client_msg_no
     assert send.await_args.kwargs["on_behalf_of"] == "grantor-1"
 
+
+
+@pytest.mark.asyncio
+async def test_file_tool_rejects_local_path_before_read_when_hermes_denies(tmp_path):
+    source = tmp_path / "denied.txt"
+    source.write_text("must not be read", encoding="utf-8")
+    read_local = MagicMock(side_effect=AssertionError("denied path was read"))
+    with (
+        _tool_context(),
+        patch.object(message_tools.api, "authorize_local_media_path", return_value=None),
+        patch.object(message_tools.api, "read_local_media", read_local),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_file_handler({"source": str(source)})
+        )
+
+    assert result == {"error": "local media source is not authorized"}
+    read_local.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_file_tool_reads_only_the_path_authorized_by_hermes(tmp_path):
+    requested = tmp_path / "requested.txt"
+    authorized = tmp_path / "authorized.txt"
+    requested.write_text("requested", encoding="utf-8")
+    authorized.write_text("authorized", encoding="utf-8")
+    upload = AsyncMock(return_value="https://cdn.example/authorized.txt")
+    send = AsyncMock(return_value=SendMessageResult(message_id="media-authorized"))
+    with (
+        _tool_context(),
+        patch.object(
+            message_tools.api,
+            "authorize_local_media_path",
+            return_value=str(authorized),
+        ) as validate,
+        patch.object(message_tools.api, "upload_and_get_url", upload),
+        patch.object(message_tools.api, "send_media_message", send),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_file_handler({"source": str(requested)})
+        )
+
+    assert result["ok"] is True
+    validate.assert_called_once_with(str(requested))
+    assert upload.await_args.args[3:] == (
+        "authorized.txt",
+        b"authorized",
+        "text/plain",
+    )
 @pytest.mark.asyncio
 async def test_remote_media_uses_guarded_session_and_keeps_host_safety_enabled() -> None:
     adapter = SimpleNamespace(**vars(_ADAPTER))
@@ -352,35 +401,13 @@ async def test_image_tool_routes_verified_remote_media_to_current_conversation()
         client_msg_no=ANY,
         on_behalf_of="grantor-1",
     )
-    caption.assert_awaited_once()
-    media_client_msg_no = send.await_args.kwargs["client_msg_no"]
-    assert str(UUID(media_client_msg_no)) == media_client_msg_no
-    caption_client_msg_no = caption.await_args.kwargs["client_msg_no"]
-    assert str(UUID(caption_client_msg_no)) == caption_client_msg_no
-    assert caption.await_args.kwargs["on_behalf_of"] == "grantor-1"
 
 
 @pytest.mark.asyncio
-async def test_card_profile_tool_returns_normalized_negotiated_capabilities():
-    with (
-        _tool_context(),
-        patch.object(message_tools.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
-    ):
-        result = json.loads(await message_tools.octo_card_profile_handler({}))
-
-    assert result["ok"] is True
-    assert result["data"]["available"] is True
-    assert result["data"]["enabled"] is True
-    assert result["data"]["profiles"] == ["octo/v1", "octo/v2"]
-    assert result["data"]["card_version"] == "1.5"
-    assert result["data"]["capabilities"]["max_nodes"] == 20
-
-
-@pytest.mark.asyncio
-async def test_edit_card_tool_renders_controlled_blocks_and_edits_current_channel():
+async def test_edit_card_tool_updates_registered_current_session_card():
+    edit = AsyncMock()
     _CARD_SESSIONS.reset_mock()
     _CARD_SESSIONS.claim_edit.return_value = True
-    edit = AsyncMock(return_value={"ok": True})
     with (
         _tool_context(),
         patch.object(message_tools.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),

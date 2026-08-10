@@ -97,16 +97,16 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 When both required credentials are configured, the plugin registers:
 
 - controlled Type-17 display/interactive send and display-card edit tools;
-- a read-only normalized card-profile diagnostic;
 - controlled RichText text/image delivery;
 - image, file, voice, and video delivery.
 
-These tools derive the destination and requester from Hermes' task-local Octo
-session; their schemas do not accept channel or identity overrides. As in the
-OpenClaw Octo plugin, outbound media accepts local paths, `file://` URLs, or
-HTTP(S) URLs, applies the server-aligned 100 MiB upload limit, and re-uploads
-the content before delivery. Native Hermes media delivery also accepts `data:`
-URLs.
+Card capabilities are negotiated automatically; no card-profile diagnostic is
+exposed to the model. These tools derive the destination and requester from
+Hermes' task-local Octo session, and their schemas accept no channel or identity
+overrides. Outbound local media must first pass the installed Hermes runtime's
+native media-delivery authorization, then uses inode/no-symlink and 100 MiB
+checks before upload. HTTP(S) media retains the guarded download flow. Native
+Hermes media delivery also accepts `data:` URLs.
 
 Interactive card actions are accepted only while the originating in-process
 card session remains registered and only when message, channel, operator,
@@ -116,8 +116,10 @@ tests; production-server card/action/media interoperability still requires the
 separately authorized live acceptance checks.
 
 On Hermes `>=0.20.0`, bounded clarifies with choices use the same trusted
-current-conversation route and Type-17 session binding. Single-select prompts
-render one submit action per choice; multi-select prompts render
+current-conversation route and Type-17 session binding. Native delivery has one
+12-second deadline, waits at most 5 seconds for an active progress card's first
+send, and rechecks the same pending clarify before every POST. Single-select
+prompts render one submit action per choice; multi-select prompts render
 `Input.ChoiceSet` plus Submit; both include an **Other** action that switches
 the existing clarify to Hermes text capture. Choice clicks call Hermes'
 clarify resolution primitive directly and never become a new model turn.

@@ -121,15 +121,6 @@ VOICE_TOOL_SCHEMA = _media_tool_schema(
 VIDEO_TOOL_SCHEMA = _media_tool_schema(
     "octo_send_video", "a video", metadata=("width", "height", "duration")
 )
-CARD_PROFILE_TOOL_SCHEMA = {
-    "name": "octo_card_profile",
-    "description": "Read normalized Type-17 capabilities for the current Octo bot.",
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {},
-    },
-}
 EDIT_CARD_TOOL_SCHEMA = {
     "name": "octo_edit_card",
     "description": (
@@ -160,7 +151,6 @@ MESSAGE_TOOL_SCHEMAS = (
     FILE_TOOL_SCHEMA,
     VOICE_TOOL_SCHEMA,
     VIDEO_TOOL_SCHEMA,
-    CARD_PROFILE_TOOL_SCHEMA,
     EDIT_CARD_TOOL_SCHEMA,
 )
 
@@ -176,6 +166,7 @@ def _receipt_fields(result: SendMessageResult) -> dict[str, object]:
     if result.client_msg_no is not None:
         fields["client_msg_no"] = result.client_msg_no
     return fields
+
 
 def _error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
@@ -230,11 +221,20 @@ async def _read_media_source(
             session,
             source,
             max_size=_MAX_MEDIA_BYTES,
+            policy=getattr(session, "transport_policy", None),
         )
     else:
+        local_source = source
+        if source.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(source)
+            if parsed.netloc not in {"", "localhost"}:
+                raise ValueError("local media source is not authorized")
+            local_source = unquote(parsed.path)
         file_data, filename = await asyncio.to_thread(
-            api.read_local_media,
-            source,
+            api.read_authorized_local_media,
+            local_source,
             max_size=_MAX_MEDIA_BYTES,
         )
         content_type = api.infer_content_type(filename)
@@ -269,6 +269,7 @@ async def _upload_media(
         filename,
         file_data,
         content_type,
+        policy=getattr(session, "transport_policy", None),
     )
     return uploaded_url, file_data, content_type, filename
 
@@ -452,46 +453,6 @@ async def octo_send_video_handler(args: dict[str, Any], **_kwargs: Any) -> str:
     return await _send_media(args, media_kind="video", message_type=MessageType.Video)
 
 
-def _optional_sorted(value: frozenset[str] | None) -> list[str] | None:
-    return sorted(value) if value is not None else None
-
-
-async def octo_card_profile_handler(args: dict[str, Any], **_kwargs: Any) -> str:
-    if args:
-        return _error("octo_card_profile accepts no arguments")
-    context = _context()
-    if isinstance(context, str):
-        return context
-    adapter, _route = context
-    try:
-        async with _new_guarded_http_session(adapter._api_url) as session:
-            manifest = await _get_card_profile(adapter, session)
-        capabilities = cards.derive_card_capabilities(manifest)
-        return _ok(
-            available=manifest.available,
-            enabled=manifest.enabled,
-            profiles=list(manifest.profiles) if manifest.profiles is not None else None,
-            card_version=manifest.card_version,
-            elements=list(manifest.elements) if manifest.elements is not None else None,
-            inputs=list(manifest.inputs) if manifest.inputs is not None else None,
-            actions=list(manifest.actions) if manifest.actions is not None else None,
-            limits=dict(manifest.limits),
-            capabilities={
-                "authoritative": capabilities.authoritative,
-                "profiles": _optional_sorted(capabilities.profiles),
-                "elements": _optional_sorted(capabilities.elements),
-                "inputs": _optional_sorted(capabilities.inputs),
-                "actions": _optional_sorted(capabilities.actions),
-                "max_nodes": capabilities.max_nodes,
-                "max_depth": capabilities.max_depth,
-                "max_payload_bytes": capabilities.max_payload_bytes,
-                "max_input_text_bytes": capabilities.max_input_text_bytes,
-                "max_inputs_bytes": capabilities.max_inputs_bytes,
-            },
-        )
-    except Exception as exc:
-        logger.error("Octo card profile tool failed (%s)", type(exc).__name__)
-        return _error("Octo card profile lookup failed")
 
 
 def _edit_profile_enabled(manifest: CardProfileManifest) -> bool:
@@ -574,6 +535,5 @@ MESSAGE_TOOL_HANDLERS = {
     FILE_TOOL_SCHEMA["name"]: octo_send_file_handler,
     VOICE_TOOL_SCHEMA["name"]: octo_send_voice_handler,
     VIDEO_TOOL_SCHEMA["name"]: octo_send_video_handler,
-    CARD_PROFILE_TOOL_SCHEMA["name"]: octo_card_profile_handler,
     EDIT_CARD_TOOL_SCHEMA["name"]: octo_edit_card_handler,
 }

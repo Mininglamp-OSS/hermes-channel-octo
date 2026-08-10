@@ -12,17 +12,22 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .card_sessions import (
+    CardClaim,
+    CardSession,
+    CardSessionRegistry,
+    ClarifySession,
+)
 
 from gateway.platforms.base import MessageEvent, MessageType as HermesMessageType
 from gateway.session import build_session_key
 
-from . import api, cards
+from . import api, cards, clarify as clarify_integration
 from .cards import CardRenderResult
 from .types import ChannelType
 
@@ -33,8 +38,6 @@ MAX_EVENT_WAIT_SECONDS = 30
 MIN_EVENT_WAIT_SECONDS = 5
 MAX_EVENT_BACKOFF_SECONDS = 30.0
 _HELD_FRACTION = 0.5
-_CARD_SESSION_TTL_SECONDS = 24 * 60 * 60
-_MAX_CARD_SESSIONS = 1000
 _CARD_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _MAX_EVENT_INPUT_FIELDS = 128
 _MAX_EVENT_DATA_FIELDS = 128
@@ -267,180 +270,6 @@ def parse_card_action(event: object) -> CardAction | None:
     )
 
 
-@dataclass(frozen=True)
-class ClarifySession:
-    """Authoritative mapping from opaque card controls to one Hermes clarify."""
-
-    clarify_id: str
-    multi_select: bool
-    question: str
-    choices: tuple[str, ...]
-    action_choices: tuple[tuple[str, str], ...]
-    input_id: str | None
-    confirm_action_id: str | None
-    other_action_id: str
-
-
-
-@dataclass(frozen=True)
-class CardSession:
-    message_id: str
-    binding_id: str
-    session_key: str
-    chat_id: str
-    channel_id: str
-    channel_type: ChannelType
-    requester_uid: str
-    card: dict[str, Any]
-    plain: str
-    action_labels: dict[str, str]
-    input_ids: tuple[str, ...]
-    max_input_text_bytes: int | None = None
-    max_inputs_bytes: int | None = None
-    clarify: ClarifySession | None = None
-
-
-@dataclass
-class _CardSessionEntry:
-    session: CardSession
-    expires_at: float
-    state: str = "pending"
-    claimed_event_id: int | None = None
-    attempt_event_id: int | None = None
-    dispatch_attempts: int = 0
-    card_seq: int = 0
-
-
-
-@dataclass(frozen=True)
-class CardClaim:
-    status: str
-    session: CardSession | None = None
-    attempts: int = 0
-
-
-class CardSessionRegistry:
-    """Bounded, thread-safe session claims for cards sent from tool workers."""
-
-    def __init__(
-        self,
-        *,
-        max_sessions: int = _MAX_CARD_SESSIONS,
-        ttl_seconds: float = _CARD_SESSION_TTL_SECONDS,
-        max_dispatch_attempts: int = 3,
-    ) -> None:
-        self._max_sessions = max(1, max_sessions)
-        self._ttl_seconds = max(1.0, ttl_seconds)
-        self.max_dispatch_attempts = max(1, max_dispatch_attempts)
-        self._entries: OrderedDict[str, _CardSessionEntry] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def register(self, session: CardSession) -> None:
-        if not _bounded_string(session.message_id):
-            return
-        with self._lock:
-            self._prune_locked()
-            self._entries.pop(session.message_id, None)
-            while len(self._entries) >= self._max_sessions:
-                self._entries.popitem(last=False)
-            self._entries[session.message_id] = _CardSessionEntry(
-                session=session,
-                expires_at=time.monotonic() + self._ttl_seconds,
-            )
-
-    def claim_edit(
-        self,
-        *,
-        message_id: str,
-        card_seq: int,
-        session_key: str,
-        channel_id: str,
-        channel_type: ChannelType,
-        requester_uid: str,
-    ) -> bool:
-        """Claim one terminal edit for the exact trusted interactive session."""
-        if _safe_event_id(card_seq) is None or card_seq == 0:
-            return False
-        with self._lock:
-            entry = self._entry_locked(message_id)
-            if entry is None or entry.state != "pending":
-                return False
-            session = entry.session
-            if (
-                session.session_key != session_key
-                or session.channel_id != channel_id
-                or session.channel_type != channel_type
-                or session.requester_uid != requester_uid
-            ):
-                return False
-            entry.state = "processing"
-            entry.claimed_event_id = -card_seq
-            return True
-
-    def claim(self, message_id: str, event_id: int) -> CardClaim:
-        with self._lock:
-            entry = self._entry_locked(message_id)
-            if entry is None:
-                return CardClaim("missing")
-            if entry.state != "pending":
-                return CardClaim("duplicate", entry.session)
-            entry.state = "processing"
-            entry.claimed_event_id = event_id
-            if entry.attempt_event_id != event_id:
-                entry.attempt_event_id = event_id
-                entry.dispatch_attempts = 0
-            entry.dispatch_attempts += 1
-            return CardClaim("claimed", entry.session, entry.dispatch_attempts)
-
-    def next_card_seq(self, message_id: str) -> int | None:
-        with self._lock:
-            entry = self._entry_locked(message_id)
-            if entry is None:
-                return None
-            entry.card_seq += 1
-            return entry.card_seq
-
-
-    def release(self, message_id: str, event_id: int) -> None:
-        with self._lock:
-            entry = self._entry_locked(message_id)
-            if (
-                entry is not None
-                and entry.state == "processing"
-                and entry.claimed_event_id == event_id
-            ):
-                entry.state = "pending"
-                entry.claimed_event_id = None
-
-    def complete(self, message_id: str, event_id: int) -> None:
-        with self._lock:
-            entry = self._entry_locked(message_id)
-            if (
-                entry is not None
-                and entry.state == "processing"
-                and entry.claimed_event_id == event_id
-            ):
-                entry.state = "completed"
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-
-    def _entry_locked(self, message_id: str) -> _CardSessionEntry | None:
-        entry = self._entries.get(message_id)
-        if entry is not None and entry.expires_at <= time.monotonic():
-            self._entries.pop(message_id, None)
-            return None
-        return entry
-
-    def _prune_locked(self) -> None:
-        now = time.monotonic()
-        for message_id in [
-            message_id
-            for message_id, entry in self._entries.items()
-            if entry.expires_at <= now
-        ]:
-            self._entries.pop(message_id, None)
 
 
 def _action_matches_session(action: CardAction, session: CardSession) -> bool:
@@ -463,8 +292,6 @@ def _action_matches_session(action: CardAction, session: CardSession) -> bool:
         if (
             not _CARD_ID_RE.fullmatch(key)
             or key not in allowed_inputs
-            or cards.is_sensitive(key, generic=True)
-            or cards.is_sensitive(value, generic=True)
             or len(value.encode("utf-8")) > max_text
         ):
             return False
@@ -478,8 +305,7 @@ def _action_matches_session(action: CardAction, session: CardSession) -> bool:
     return len(serialized) <= max_inputs
 
 def _neutralize_action_echo(value: str) -> str:
-    reduced = cards.reduce_urls_in_text(value)
-    return re.sub(r"([\\`*_~\[\]<>])", r"\\\1", reduced)
+    return re.sub(r"([\\`*_~\[\]<>])", r"\\\1", value)
 
 
 def _freeze_action_node(
@@ -517,37 +343,6 @@ def _freeze_action_node(
             frozen[key] = value
     return frozen
 
-def _clarify_selected_choices(
-    clarify: ClarifySession,
-    action: CardAction,
-) -> list[str]:
-    if action.action_id == clarify.other_action_id:
-        return []
-    if not clarify.multi_select:
-        return [
-            choice
-            for action_id, choice in clarify.action_choices
-            if action_id == action.action_id
-        ]
-    if action.action_id != clarify.confirm_action_id or clarify.input_id is None:
-        return []
-    raw_selection = action.inputs.get(clarify.input_id, "")
-    selected_ids = raw_selection.split(",") if raw_selection else []
-    if (
-        not selected_ids
-        or any(not value or value.strip() != value for value in selected_ids)
-        or len(set(selected_ids)) != len(selected_ids)
-    ):
-        return []
-    selected = set(selected_ids)
-    known_ids = {choice_id for choice_id, _ in clarify.action_choices}
-    if not selected.issubset(known_ids):
-        return []
-    return [
-        choice
-        for choice_id, choice in clarify.action_choices
-        if choice_id in selected
-    ]
 
 
 def _render_clarify_action_status(
@@ -567,7 +362,7 @@ def _render_clarify_action_status(
     }.get(status, "提交失败，请重试")
     lines = ["需要确认", clarify.question]
     selected = (
-        _clarify_selected_choices(clarify, action)
+        clarify_integration.selected_choices(clarify, action)
         if status in {"processing", "completed"}
         else []
     )
@@ -731,88 +526,12 @@ async def handle_card_action(
     return terminal_status
 
 
-def _clarify_is_current(
-    session: CardSession,
-    clarify: ClarifySession,
-) -> bool:
-    from tools import clarify_gateway
-
-    with clarify_gateway._lock:
-        entry = clarify_gateway._entries.get(clarify.clarify_id)
-        return bool(
-            entry is not None
-            and entry.session_key == session.session_key
-            and entry.question == clarify.question
-            and tuple(entry.choices or ()) == clarify.choices
-            and bool(getattr(entry, "multi_select", False)) == clarify.multi_select
-        )
-
-
-
 async def dispatch_clarify_action(
     session: CardSession,
     action: CardAction,
 ) -> bool | str | None:
     """Resolve an owned clarify card without creating a new user turn."""
-    clarify = session.clarify
-    if clarify is None:
-        return None
-    if not _clarify_is_current(session, clarify):
-        return "expired"
-
-    from tools.clarify_gateway import (
-        mark_awaiting_text,
-        resolve_gateway_clarify,
-    )
-
-    if action.action_id == clarify.other_action_id:
-        return (
-            "awaiting_text"
-            if mark_awaiting_text(clarify.clarify_id)
-            else "expired"
-        )
-
-    if not clarify.multi_select:
-        for action_id, response in clarify.action_choices:
-            if action.action_id == action_id:
-                return (
-                    "completed"
-                    if resolve_gateway_clarify(clarify.clarify_id, response)
-                    else "expired"
-                )
-        return False
-
-    if (
-        action.action_id != clarify.confirm_action_id
-        or clarify.input_id is None
-    ):
-        return False
-    raw_selection = action.inputs.get(clarify.input_id, "")
-    selected_ids = raw_selection.split(",") if raw_selection else []
-    if not selected_ids:
-        return False
-    if any(not value or value.strip() != value for value in selected_ids):
-        return False
-    selected = set(selected_ids)
-    if len(selected) != len(selected_ids):
-        return False
-    known_ids = {choice_id for choice_id, _ in clarify.action_choices}
-    if not selected.issubset(known_ids):
-        return False
-    response = json.dumps(
-        [
-            choice
-            for choice_id, choice in clarify.action_choices
-            if choice_id in selected
-        ],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return (
-        "completed"
-        if resolve_gateway_clarify(clarify.clarify_id, response)
-        else "expired"
-    )
+    return await clarify_integration.dispatch_action(session, action)
 
 
 async def dispatch_card_session_action(

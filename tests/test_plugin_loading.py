@@ -121,7 +121,6 @@ def test_register_with_env_wires_full_surface(monkeypatch):
         "octo_send_file",
         "octo_send_voice",
         "octo_send_video",
-        "octo_card_profile",
         "octo_edit_card",
     }
     for tool in ctx.tools:
@@ -182,7 +181,6 @@ def test_progress_hook_registration_failure_is_isolated(monkeypatch):
         "octo_send_file",
         "octo_send_voice",
         "octo_send_video",
-        "octo_card_profile",
         "octo_edit_card",
     }
     assert {name for name, _ in ctx.hooks} == {

@@ -35,7 +35,7 @@ def test_octo_disables_gateway_edit_streaming() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_posts_one_complete_response_without_message_edit() -> None:
+async def test_gateway_final_response_does_not_quote_trigger_message() -> None:
     adapter = _make_adapter()
     adapter._chat_kind["chatA"] = ChannelType.Group
     complete = "先执行工具，再给出完整最终答案。"
@@ -59,6 +59,7 @@ async def test_send_posts_one_complete_response_without_message_edit() -> None:
             "chatA",
             complete,
             reply_to="inbound-1",
+            metadata={"notify": True},
         )
 
     assert result.success is True
@@ -67,8 +68,25 @@ async def test_send_posts_one_complete_response_without_message_edit() -> None:
     send_call = send_message.await_args
     assert send_call is not None
     assert send_call.kwargs["content"] == complete
-    assert send_call.kwargs["reply_msg_id"] == "inbound-1"
+    assert send_call.kwargs["reply_msg_id"] is None
     edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_reply_still_quotes_target_message() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+
+    with patch(
+        "hermes_octo_plugin.adapter.api.send_message",
+        new=AsyncMock(return_value=SendMessageResult(message_id="server-reply")),
+    ) as send_message:
+        result = await adapter.send("chatA", "明确回复", reply_to="message-42")
+
+    assert result.success is True
+    send_call = send_message.await_args
+    assert send_call is not None
+    assert send_call.kwargs["reply_msg_id"] == "message-42"
 
 
 @pytest.mark.asyncio

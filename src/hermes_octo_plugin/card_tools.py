@@ -450,7 +450,7 @@ async def octo_send_interactive_card_handler(
                 plain=rendered.plain,
                 profile=CARD_PROFILE_V2,
             )
-            from .card_events import CardSession
+            from .card_sessions import CardSession
 
             adapter._register_card_session(
                 CardSession(
