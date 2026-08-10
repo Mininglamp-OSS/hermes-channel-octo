@@ -1289,8 +1289,13 @@ async def get_upload_presign(
     url = f"{api_url.rstrip('/')}{path}?{query}"
     headers = {"Authorization": f"Bearer {bot_token}"}
 
-    async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-        if not resp.ok:
+    async with session.get(
+        url,
+        headers=headers,
+        timeout=DEFAULT_TIMEOUT,
+        allow_redirects=False,
+    ) as resp:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         data = await resp.json()
 
@@ -1825,10 +1830,11 @@ async def fetch_user_info(
             headers=headers,
             params={"uid": uid},
             timeout=aiohttp.ClientTimeout(total=5),
+            allow_redirects=False,
         ) as resp:
             if resp.status == 404:
                 return None
-            if not resp.ok:
+            if not 200 <= resp.status < 300:
                 logger.error("octo: fetchUserInfo(%s) failed: %d", uid, resp.status)
                 return None
             data = await resp.json()
@@ -1862,10 +1868,15 @@ async def get_group_md(
     path = f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/md"
     url = f"{api_url.rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {bot_token}"}
-    async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
+    async with session.get(
+        url,
+        headers=headers,
+        timeout=DEFAULT_TIMEOUT,
+        allow_redirects=False,
+    ) as resp:
         if resp.status == 404:
             return None
-        if not resp.ok:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         return await resp.json()
 
@@ -1911,11 +1922,15 @@ async def delete_json(
         "Authorization": f"Bearer {bot_token}",
         "Content-Type": "application/json",
     }
-    kwargs: dict[str, Any] = {"headers": headers, "timeout": DEFAULT_TIMEOUT}
+    kwargs: dict[str, Any] = {
+        "headers": headers,
+        "timeout": DEFAULT_TIMEOUT,
+        "allow_redirects": False,
+    }
     if payload is not None:
         kwargs["data"] = json.dumps(payload)
     async with session.delete(url, **kwargs) as resp:
-        if not resp.ok:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None
@@ -1935,9 +1950,13 @@ async def put_json(
         "Content-Type": "application/json",
     }
     async with session.put(
-        url, data=json.dumps(payload), headers=headers, timeout=DEFAULT_TIMEOUT
+        url,
+        data=json.dumps(payload),
+        headers=headers,
+        timeout=DEFAULT_TIMEOUT,
+        allow_redirects=False,
     ) as resp:
-        if not resp.ok:
+        if not 200 <= resp.status < 300:
             raise _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None

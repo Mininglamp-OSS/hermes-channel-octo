@@ -75,12 +75,23 @@ class _RedirectResponse:
     ok = True
     status = 302
     headers = {"Location": "http://127.0.0.1/admin"}
+    def __init__(self):
+        self.body_read = False
+
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *_args):
         return None
+    async def text(self):
+        self.body_read = True
+        raise AssertionError("redirect body must not be read")
+
+    async def json(self, **_kwargs):
+        self.body_read = True
+        raise AssertionError("redirect body must not be read")
+
 
 
 class _EmptyDownloadContent:
@@ -209,6 +220,101 @@ class TestApiFailureTruth:
 
         assert session.post.call_args.kwargs["allow_redirects"] is False
         assert session.get.call_args.kwargs["allow_redirects"] is False
+
+    @pytest.mark.asyncio
+    async def test_authenticated_specialized_helpers_reject_redirects_without_following(
+        self,
+    ):
+        session = MagicMock()
+        get_redirect = _RedirectResponse()
+        put_redirect = _RedirectResponse()
+        delete_redirect = _RedirectResponse()
+        session.get = MagicMock(return_value=get_redirect)
+        session.put = MagicMock(return_value=put_redirect)
+        session.delete = MagicMock(return_value=delete_redirect)
+
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await get_upload_presign(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                filename="report.pdf",
+                file_size=7,
+                content_type="application/pdf",
+            )
+        assert (
+            await fetch_user_info(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "user-1",
+            )
+            is None
+        )
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await get_group_md(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "group-1",
+            )
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await api.delete_json(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "/v1/bot/example",
+            )
+        with pytest.raises(api.OctoApiError, match="HTTP 302"):
+            await api.put_json(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "/v1/bot/example",
+                {"value": 1},
+            )
+
+        assert all(
+            call.kwargs["allow_redirects"] is False
+            for call in session.get.call_args_list
+        )
+        assert session.delete.call_args.kwargs["allow_redirects"] is False
+        assert session.put.call_args.kwargs["allow_redirects"] is False
+        assert not get_redirect.body_read
+        assert not put_redirect.body_read
+        assert not delete_redirect.body_read
+
+    @pytest.mark.asyncio
+    async def test_authenticated_get_helpers_preserve_not_found_absence(self):
+        user_not_found = _RedirectResponse()
+        user_not_found.ok = False
+        user_not_found.status = 404
+        group_not_found = _RedirectResponse()
+        group_not_found.ok = False
+        group_not_found.status = 404
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[user_not_found, group_not_found])
+
+        assert (
+            await fetch_user_info(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "user-1",
+            )
+            is None
+        )
+        assert (
+            await get_group_md(
+                session,
+                "https://api.example.invalid",
+                "test-token",
+                "group-1",
+            )
+            is None
+        )
+        assert not user_not_found.body_read
+        assert not group_not_found.body_read
 
     @pytest.mark.asyncio
     async def test_presigned_upload_error_never_exposes_response_body_or_url(self):

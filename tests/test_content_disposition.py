@@ -39,6 +39,7 @@ class TestPresignedUpload:
     async def test_get_presign_sends_exact_size_and_normalizes_signed_headers(self):
         response = AsyncMock()
         response.ok = True
+        response.status = 200
         response.json = AsyncMock(
             return_value={
                 "method": "PUT",
@@ -77,6 +78,7 @@ class TestPresignedUpload:
     async def test_get_presign_preserves_backend_signed_headers(self):
         response = AsyncMock()
         response.ok = True
+        response.status = 200
         response.json = AsyncMock(
             return_value={
                 "method": "PUT",
