@@ -6,7 +6,7 @@ description: >
   Octo (WuKongIM-based) gateway adapter for Hermes Agent.
   Connects via WebSocket binary protocol with ECDH+AES encryption,
   enabling bot-to-user and bot-to-group messaging, threads,
-  @mentions, voice/video/file attachments, and streaming responses.
+  @mentions, voice/video/file attachments, and final-only text replies.
 author: Mininglamp-OSS
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
@@ -43,6 +43,10 @@ optional_env:
   - name: OCTO_EVENT_POLL_LIMIT
     description: "Maximum events requested per polling batch"
     prompt: "Event poll batch limit (optional)"
+    password: false
+  - name: OCTO_PROGRESS_CARD_RENDERER
+    description: "Progress-card renderer: local (default) or registry"
+    prompt: "Progress card renderer (optional)"
     password: false
   - name: OCTO_ALLOWED_USERS
     description: "Comma-separated Octo user IDs allowed to talk to the bot"

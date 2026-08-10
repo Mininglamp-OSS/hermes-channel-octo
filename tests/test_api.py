@@ -4,6 +4,7 @@ Tests for hermes_octo_plugin.api — API function signatures and parameter check
 
 import pytest
 import asyncio
+import json
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import aiohttp
 from hermes_octo_plugin import api
@@ -33,7 +34,7 @@ from hermes_octo_plugin.api import (
     infer_content_type,
     parse_image_dimensions,
 )
-from hermes_octo_plugin.types import ChannelType, MessageType
+from hermes_octo_plugin.types import ChannelType, MentionEntity, MessageType
 
 
 class _FailedApiResponse:
@@ -263,6 +264,31 @@ class TestApiFailureTruth:
         session.get.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+        ],
+    )
+    async def test_outbound_download_policy_never_allows_metadata_hosts(
+        self,
+        url: str,
+    ):
+        session = MagicMock()
+
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(
+                session,
+                url,
+                enforce_host_safety=False,
+            )
+
+        session.get.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_fetch_user_info_passes_uid_as_query_param(self):
         session = MagicMock()
         session.get = MagicMock(return_value=_UserInfoResponse())
@@ -432,6 +458,32 @@ class TestSendIdentity:
             "on_behalf_of": "grantor-1",
         }
         assert "finalize" not in body
+
+    @pytest.mark.asyncio
+    async def test_native_text_edit_serializes_mention_entities(self):
+        entity = MentionEntity(uid="user-1", offset=6, length=4)
+        with patch.object(api, "post_json", AsyncMock(return_value=None)) as post_json:
+            await api.edit_message(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                channel_id="group-1",
+                channel_type=ChannelType.Group,
+                message_id="message-1",
+                content="hello @董振兴",
+                mention_uids=["user-1"],
+                mention_entities=[entity],
+            )
+
+        frame = json.loads(post_json.await_args.args[4]["content_edit"])
+        assert frame == {
+            "type": 1,
+            "content": "hello @董振兴",
+            "mention": {
+                "uids": ["user-1"],
+                "entities": [{"uid": "user-1", "offset": 6, "length": 4}],
+            },
+        }
 
 
 class TestHeartbeatApi:

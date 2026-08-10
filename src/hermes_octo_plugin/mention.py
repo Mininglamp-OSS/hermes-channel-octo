@@ -114,18 +114,24 @@ def parse_structured_mentions(text: str) -> list[StructuredMention]:
     return out
 
 
+
+def _utf16_length(text: str) -> int:
+    """Return JS/NSString/Kotlin string length without allocating encoded bytes."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
 def convert_structured_mentions(
     text: str,
     mentions: list[StructuredMention],
+    valid_uids: set[str] | None = None,
 ) -> tuple[str, list[MentionEntity], list[str]]:
     """Replace each ``@[uid:name]`` in *text* with ``@name`` and emit the
     matching wire-format sidecar.
 
     Algorithm (incremental, single pass):
       Sort mentions by ``offset`` and reconstruct the output string segment
-      by segment. Tracking ``len(content)`` after each insertion gives the
-      exact new offset of every ``@name`` — safer than reusing ``indexOf``
-      which can bind duplicate names to the wrong position.
+      by segment. Track the rebuilt content in UTF-16 code units so entity
+      offsets match JS/NSString/Kotlin indexing, including astral characters.
 
     Returns ``(content, entities, uids)`` where ``entities`` and ``uids``
     are in the same order as the original mentions (after offset sort).
@@ -140,17 +146,18 @@ def convert_structured_mentions(
         # Verbatim text between previous cursor and this mention.
         between = text[cursor:m.offset]
         content_parts.append(between)
-        running_len += len(between)
+        running_len += _utf16_length(between)
 
         replacement = f"@{m.name}"
-        entities.append(MentionEntity(
-            uid=m.uid,
-            offset=running_len,
-            length=len(replacement),
-        ))
-        uids.append(m.uid)
+        if valid_uids is None or m.uid in valid_uids:
+            entities.append(MentionEntity(
+                uid=m.uid,
+                offset=running_len,
+                length=_utf16_length(replacement),
+            ))
+            uids.append(m.uid)
         content_parts.append(replacement)
-        running_len += len(replacement)
+        running_len += _utf16_length(replacement)
 
         cursor = m.offset + m.length
     # Tail after last mention.

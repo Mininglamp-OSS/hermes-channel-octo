@@ -1,6 +1,7 @@
 """Wire-level contracts for outbound Octo Type-17 cards and bot events."""
 
 from __future__ import annotations
+import json
 
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -54,12 +55,17 @@ class TestCardTypes:
         assert getattr(types, "CARD_VERSION", None) == "1.5"
         assert hasattr(types, "card_contains_interaction")
         assert types.card_contains_interaction(_card_with_submit()) is True
-        assert types.card_contains_interaction({"type": "AdaptiveCard", "body": []}) is False
+        assert (
+            types.card_contains_interaction({"type": "AdaptiveCard", "body": []})
+            is False
+        )
 
 
 class TestCardApi:
     @pytest.mark.asyncio
-    async def test_send_card_uses_type17_envelope_auto_upgrades_and_requires_identity(self):
+    async def test_send_card_uses_type17_envelope_auto_upgrades_and_requires_identity(
+        self,
+    ):
         assert hasattr(api, "send_card_message")
         with patch.object(
             api,
@@ -133,7 +139,9 @@ class TestCardApi:
         assert str(UUID(client_msg_no)) == client_msg_no
 
     @pytest.mark.asyncio
-    async def test_edit_card_serializes_complete_type17_frame_with_seq_and_transience(self):
+    async def test_edit_card_serializes_complete_type17_frame_with_seq_and_transience(
+        self,
+    ):
         assert hasattr(api, "edit_card_message")
         with patch.object(api, "post_json", AsyncMock(return_value=None)) as post_json:
             await api.edit_card_message(
@@ -176,6 +184,93 @@ class TestCardApi:
                     message_id="card-42",
                     card={"type": "AdaptiveCard", "body": []},
                     card_seq=0,
+                )
+        post_json.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_template_card_send_and_edit_use_registry_wire_contract(self):
+        template_ref = {"id": "ai.reasoning-process", "version": "0.3.0"}
+        data = {
+            "reasoningId": "session-1:turn-1",
+            "state": "reasoning",
+            "title": "Reasoning",
+        }
+        with patch.object(
+            api,
+            "post_json",
+            AsyncMock(return_value={"message_id": "reasoning-1"}),
+        ) as post_json:
+            result = await api.send_template_card_message(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                channel_id="group-1",
+                channel_type=ChannelType.Group,
+                template_ref=template_ref,
+                state="reasoning",
+                data=data,
+                client_msg_no="template-client-1",
+            )
+            await api.edit_template_card_message(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                channel_id="group-1",
+                channel_type=ChannelType.Group,
+                message_id="reasoning-1",
+                template_ref=template_ref,
+                state="completed",
+                data={**data, "state": "completed"},
+                card_seq=2,
+                transient=False,
+            )
+
+        assert result.message_id == "reasoning-1"
+        assert post_json.await_args_list[0].args[3:] == (
+            "/v1/bot/sendMessage",
+            {
+                "channel_id": "group-1",
+                "channel_type": ChannelType.Group,
+                "client_msg_no": "template-client-1",
+                "payload": {
+                    "type": 17,
+                    "template_ref": template_ref,
+                    "state": "reasoning",
+                    "data": data,
+                },
+            },
+        )
+        assert post_json.await_args_list[1].args[3:] == (
+            "/v1/bot/message/edit",
+            {
+                "message_id": "reasoning-1",
+                "channel_id": "group-1",
+                "channel_type": ChannelType.Group,
+                "template_ref": template_ref,
+                "state": "completed",
+                "data": {**data, "state": "completed"},
+                "card_seq": 2,
+                "transient": False,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_template_card_rejects_mismatched_state_before_network_io(self):
+        post_json = AsyncMock()
+        with patch.object(api, "post_json", post_json):
+            with pytest.raises(ValueError, match="data.state"):
+                await api.send_template_card_message(
+                    MagicMock(),
+                    "https://api.example.invalid",
+                    "test-token",
+                    channel_id="group-1",
+                    channel_type=ChannelType.Group,
+                    template_ref={
+                        "id": "ai.reasoning-process",
+                        "version": "0.3.0",
+                    },
+                    state="reasoning",
+                    data={"state": "completed"},
                 )
         post_json.assert_not_awaited()
 

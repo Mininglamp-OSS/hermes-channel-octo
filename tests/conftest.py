@@ -4,7 +4,6 @@ Shared pytest configuration and fixtures.
 
 import asyncio
 from collections import OrderedDict
-import weakref
 
 import pytest
 
@@ -18,6 +17,7 @@ def pytest_configure(config):
     """
     try:
         from hermes_cli.plugins import discover_plugins  # type: ignore
+
         discover_plugins()
     except Exception:  # pragma: no cover — running tests without hermes is OK
         pass
@@ -68,9 +68,6 @@ def make_bare_adapter():
     a._group_histories = {}
     a._group_cache_timestamps = {}
     a._cache_activity = {}
-    a._active_streams = {}
-    a._stream_locks = weakref.WeakValueDictionary()
-    a._stream_creation_tasks = set()
     a._progress_tasks = set()
     a._gateway_loop = None
     a._event_poller = None
@@ -110,7 +107,7 @@ def make_bare_adapter():
     a._require_mention = True
     a._ignore_mention_all = False
     a._history_prompt_template = DEFAULT_HISTORY_PROMPT_TEMPLATE
-    a._stream_threshold = 500
+    a._progress_card_renderer = "local"
     a._heartbeat_interval_s = float(HEARTBEAT_INTERVAL)
     a._ping_max_retry = int(PING_MAX_RETRY)
     a._event_poll_interval_s = 2.0

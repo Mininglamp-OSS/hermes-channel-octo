@@ -167,12 +167,58 @@ def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_poller_does_not_ack_unowned_card_actions() -> None:
+    cursor = _MemoryCursor(10)
+    callback = AsyncMock(side_effect=["missing", "ignored", "duplicate", "completed"])
+    ack = AsyncMock()
+    with (
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(return_value=[_event(11), _event(12), _event(13), _event(14)]),
+        ),
+        patch.object(card_events.api, "ack_bot_event", ack),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=callback,
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    assert cursor.saved == [11, 12, 13, 14]
+    assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_is_owned_only_after_exact_action_validation() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+    valid = card_events.parse_card_action(_event())
+    forged = card_events.parse_card_action(_event(12, operator_uid="other-user"))
+    assert valid is not None and forged is not None
+    assert await card_events.handle_card_action(
+        registry, valid, AsyncMock(return_value=True)
+    ) == "completed"
+
+    assert await card_events.handle_card_action(
+        registry, forged, AsyncMock(return_value=True)
+    ) == "ignored"
+
+
+
+@pytest.mark.asyncio
 async def test_poller_orders_dispatch_save_ack_and_preserves_cursor_on_failure() -> None:
     operations: list[str] = []
     cursor = _MemoryCursor(10, operations)
 
-    async def dispatch(action) -> None:
+    async def dispatch(action) -> str:
         operations.append(f"dispatch:{action.event_id}")
+        return "completed"
 
     async def ack(*_args, event_id: int, **_kwargs) -> None:
         operations.append(f"ack:{event_id}")
@@ -284,8 +330,9 @@ async def test_ack_is_retried_after_durable_cursor_save() -> None:
     operations: list[str] = []
     cursor = _MemoryCursor(10, operations)
 
-    async def dispatch(_action) -> None:
+    async def dispatch(_action) -> str:
         operations.append("dispatch")
+        return "completed"
 
     async def ack(*_args, **_kwargs) -> None:
         operations.append("ack")
@@ -382,6 +429,57 @@ async def test_dispatch_failures_retry_then_dead_letter() -> None:
     assert await card_events.handle_card_action(registry, action, dispatch) == "duplicate"
     assert dispatch.await_count == 3
 
+@pytest.mark.asyncio
+async def test_action_status_edits_are_processing_then_terminal() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+    action = card_events.parse_card_action(_event())
+    assert action is not None
+    update = AsyncMock()
+
+    assert await card_events.handle_card_action(
+        registry,
+        action,
+        AsyncMock(return_value=True),
+        update_status=update,
+    ) == "completed"
+
+    assert [call.args[2] for call in update.await_args_list] == [
+        "processing",
+        "completed",
+    ]
+    assert update.await_args_list[0].kwargs == {"transient": True}
+    assert update.await_args_list[1].kwargs == {"transient": False}
+
+
+def test_action_status_renderer_freezes_inputs_and_removes_actions() -> None:
+    rendered = card_events.render_card_action_status(
+        _session(
+            card={
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "Input.Text", "id": "note", "label": "Note"},
+                    {"type": "TextBlock", "text": "Review", "wrap": True},
+                ],
+                "actions": [{"type": "Action.Submit", "title": "Approve"}],
+            }
+        ),
+        _event_action := card_events.parse_card_action(
+            _event(inputs={"note": "[click](https://evil.example/path?token=x)"})
+        ),
+        "completed",
+    )
+    assert _event_action is not None
+    assert "actions" not in rendered.card
+    assert all(not node["type"].startswith("Input.") for node in rendered.card["body"])
+    visible = "\n".join(node.get("text", "") for node in rendered.card["body"])
+    assert "token=x" not in visible
+    assert "https://evil.example/path" not in visible
+    assert "Completed" in rendered.plain
+
+
+
 
 
 @pytest.mark.asyncio
@@ -396,6 +494,24 @@ async def test_cancelled_dispatch_releases_the_card_claim_for_replay() -> None:
             registry,
             action,
             AsyncMock(side_effect=asyncio.CancelledError),
+        )
+
+    assert registry.claim("message-1", action.event_id).status == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_processing_status_edit_releases_claim_for_replay() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+    action = card_events.parse_card_action(_event())
+    assert action is not None
+
+    with pytest.raises(asyncio.CancelledError):
+        await card_events.handle_card_action(
+            registry,
+            action,
+            AsyncMock(return_value=True),
+            update_status=AsyncMock(side_effect=asyncio.CancelledError),
         )
 
     assert registry.claim("message-1", action.event_id).status == "claimed"

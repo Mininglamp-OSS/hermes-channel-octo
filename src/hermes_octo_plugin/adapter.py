@@ -13,7 +13,6 @@ import re
 import socket
 import time
 import uuid
-import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -56,6 +55,7 @@ from .protocol import (
     try_unpack_one,
 )
 from .types import (
+    CARD_PROFILE_V2,
     BotMessage,
     BotRegisterResp,
     ChannelType,
@@ -74,6 +74,7 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 def _delivery_result(result: SendMessageResult) -> SendResult:
     if result.message_id is None:
@@ -234,18 +235,69 @@ FILE_TEMP_RETENTION_S = 60 * 60  # 1 hour
 # (.png, .zip, .pdf, ...) falls through to the regular "[文件: name]\nurl"
 # placeholder — the LLM gets a URL but doesn't see content.
 _TEXT_FILE_EXTS = frozenset({
-    ".txt", ".md", ".markdown", ".rst", ".log",
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-    ".csv", ".tsv", ".tab",
-    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".go", ".rs", ".java", ".kt", ".swift",
-    ".c", ".h", ".cc", ".cpp", ".hpp", ".cxx",
-    ".rb", ".php", ".pl", ".lua", ".scala", ".clj", ".ex", ".exs",
-    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat",
-    ".html", ".htm", ".xml", ".svg", ".css", ".scss", ".less",
-    ".sql", ".graphql", ".proto",
-    ".env", ".gitignore", ".dockerignore",
-    ".diff", ".patch",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".log",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".tsv",
+    ".tab",
+    ".py",
+    ".pyi",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cxx",
+    ".rb",
+    ".php",
+    ".pl",
+    ".lua",
+    ".scala",
+    ".clj",
+    ".ex",
+    ".exs",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".bat",
+    ".html",
+    ".htm",
+    ".xml",
+    ".svg",
+    ".css",
+    ".scss",
+    ".less",
+    ".sql",
+    ".graphql",
+    ".proto",
+    ".env",
+    ".gitignore",
+    ".dockerignore",
+    ".diff",
+    ".patch",
 })
 # Inbound media (Image/GIF/Voice/Video) gets streamed to a local temp file
 # before being handed to hermes-core so vision/audio pipelines don't hang on
@@ -265,15 +317,6 @@ UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP = 32
 # Path: ${HERMES_HOME}/workspace/octo/{owner_short}/groups/{group_no}/GROUP.md
 #       + .../GROUP.meta.json   (or .../threads/{short_id}/THREAD.md)
 GROUP_MD_DISK_ROOT_NAME = "workspace/octo"
-# Cross-segment finalization window. Hermes treats each LLM segment (text
-# between tool calls / API calls) as a finalize=True boundary, although a later
-# segment may still belong to the same logical answer. Octo provides native
-# message editing, so the first frame creates one server message and later
-# frames update it in place. After this much true idle we issue the
-# protocol-level finalize for that message.
-STREAM_FLUSH_DELAY_S = 3.0
-STREAM_FINALIZE_RETRY_BASE_S = 1.0
-STREAM_FINALIZE_MAX_ATTEMPTS = 3
 # Hermes' streaming cursor is appended to every mid-stream frame to signal
 # "still typing" on platforms that render it as a visual hint (Telegram,
 # etc). Octo clients render it as a literal ▉ block, which looks like a
@@ -285,6 +328,7 @@ HERMES_STREAM_CURSOR = " ▉"
 DEFAULT_HISTORY_PROMPT_TEMPLATE = (
     "[Group Chat History ({count} messages)]\n{messages}\n---\n"
 )
+PROGRESS_CARD_RENDERERS = frozenset({"local", "registry"})
 
 # Group is any of these channel types
 _GROUP_CHANNEL_TYPES = frozenset([ChannelType.Group, ChannelType.CommunityTopic])
@@ -312,12 +356,12 @@ def _validate_octo_path_segment(seg: str, kind: str) -> str:
 # Hostnames that resolve to cloud / container metadata services (token theft
 # vectors when an attacker controls OCTO_API_URL / OCTO_CDN_URL).
 _METADATA_HOSTS = frozenset({
-    "169.254.169.254",                # AWS / GCP / Azure IMDS
-    "fd00:ec2::254",                  # AWS IMDSv6
-    "metadata.google.internal",       # GCP
-    "metadata.goog",                  # GCP
-    "metadata",                       # GCP short form
-    "100.100.100.200",                # Aliyun
+    "169.254.169.254",  # AWS / GCP / Azure IMDS
+    "fd00:ec2::254",  # AWS IMDSv6
+    "metadata.google.internal",  # GCP
+    "metadata.goog",  # GCP
+    "metadata",  # GCP short form
+    "100.100.100.200",  # Aliyun
 })
 
 
@@ -333,7 +377,10 @@ def _is_private_or_metadata_host(hostname: str) -> bool:
     lowered = hostname.lower()
     if lowered in _METADATA_HOSTS:
         return True
-    if lowered.endswith((".local", ".internal", ".localhost")) or lowered == "localhost":
+    if (
+        lowered.endswith((".local", ".internal", ".localhost"))
+        or lowered == "localhost"
+    ):
         return True
     try:
         ip = ipaddress.ip_address(lowered.strip("[]"))
@@ -402,9 +449,7 @@ class _SSRFGuardResolver(AbstractResolver):
             if _is_unconditionally_unsafe_address(address) or (
                 not trusted and _is_private_or_metadata_host(address)
             ):
-                raise OSError(
-                    f"unsafe address blocked by SSRF guard for {normalized}"
-                )
+                raise OSError(f"unsafe address blocked by SSRF guard for {normalized}")
         return records
 
     async def close(self) -> None:
@@ -474,9 +519,11 @@ class _SSRFGuardConnector(aiohttp.TCPConnector):
 def _new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
     """Create one SSRF-guarded session for live and ephemeral API clients."""
     trusted_hosts: set[str] = set()
-    allow_private_hosts = os.getenv(
-        "OCTO_ALLOW_PRIVATE_HOSTS", ""
-    ).lower() in {"1", "true", "yes"}
+    allow_private_hosts = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     if allow_private_hosts:
         for configured_url in configured_urls:
             if not configured_url:
@@ -511,7 +558,9 @@ def _validate_octo_endpoint(
             f"{name} points at blocked metadata host {parsed.hostname!r} (SSRF guard)."
         )
     allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in (
-        "1", "true", "yes"
+        "1",
+        "true",
+        "yes",
     )
     if not allow_private and _is_private_or_metadata_host(hostname):
         raise ValueError(
@@ -621,11 +670,11 @@ def _strip_emoji(s: str) -> str:
     # surgical accuracy — false positives only mean we add an alias that's
     # never queried.
     pattern = (
-        "[\U0001F300-\U0001F9FF"   # most emoji (faces, symbols)
-        "☀-➿"             # misc symbols + dingbats
-        "︀-️"             # variation selectors
-        "\U0001F000-\U0001F02F"     # mahjong / dominos
-        "\U0001F0A0-\U0001F0FF]"    # playing cards
+        "[\U0001f300-\U0001f9ff"  # most emoji (faces, symbols)
+        "☀-➿"  # misc symbols + dingbats
+        "︀-️"  # variation selectors
+        "\U0001f000-\U0001f02f"  # mahjong / dominos
+        "\U0001f0a0-\U0001f0ff]"  # playing cards
     )
     return re.sub(pattern, "", s).strip()
 
@@ -689,9 +738,7 @@ async def _standalone_send(
         configured_on_behalf_of, str
     ):
         return {"error": "on_behalf_of must be a string"}
-    on_behalf_of = (
-        configured_on_behalf_of.strip() if configured_on_behalf_of else None
-    )
+    on_behalf_of = configured_on_behalf_of.strip() if configured_on_behalf_of else None
     if not api_url or not bot_token:
         return {"error": "OCTO_API_URL and OCTO_BOT_TOKEN must be configured"}
 
@@ -714,15 +761,20 @@ async def _standalone_send(
             from .mention import (
                 parse_structured_mentions as _parse_sm,
             )
+
             send_content = message
             send_uids = None
             send_entities = None
             structured = _parse_sm(message)
             if structured:
-                send_content, send_entities, send_uids = _convert_sm(message, structured)
+                send_content, send_entities, send_uids = _convert_sm(
+                    message, structured
+                )
             client_msg_no = str(uuid.uuid4())
             send_result = await _octo_send(
-                session, api_url, bot_token,
+                session,
+                api_url,
+                bot_token,
                 channel_id=chat_id,
                 channel_type=(
                     _ChannelType.CommunityTopic
@@ -787,6 +839,11 @@ class OctoAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    # Octo's Bot API message/edit persists content_edit but does not provide a
+    # dependable client-visible text streaming surface.  Let Hermes buffer the
+    # model output and deliver one complete message instead of exposing the
+    # first token fragment and suppressing the authoritative final response.
+    SUPPORTS_MESSAGE_EDITING: bool = False
 
     def __init__(self, config: PlatformConfig) -> None:
         # Platform("octo") works via _missing_() dynamic enum creation
@@ -849,29 +906,6 @@ class OctoAdapter(BasePlatformAdapter):
         # groups / DMs the bot hasn't seen in a while.
         self._cache_activity: dict[str, float] = {}
 
-        # Streaming buffers keyed by chat_id. Each value:
-        #   {
-        #     "message_id": str,             # private pre-send buffer key
-        #     "channel_type": ChannelType,
-        #     "segments": list[str],         # finalized text segments
-        #     "current_segment": str,        # in-progress (cursor-frame) text
-        #     "flush_task": asyncio.Task | None,
-        #   }
-        # Hermes can split one logical response into N send() calls — one per
-        # segment between tool/API calls. Keep one server-backed stream per chat:
-        # the first send creates a real Octo message, subsequent sends and edits
-        # update that identity, and an idle watchdog finalizes it.
-        self._active_streams: dict[str, dict[str, Any]] = {}
-        # Every transition that can mutate or finalize a chat stream is
-        # serialized across its server await. This makes message identity and
-        # local buffer state linearizable under concurrent gateway callbacks.
-        self._stream_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
-        # First-frame sends do not enter _active_streams until the server returns
-        # a real message_id. Disconnect blocks new sends and drains these tasks
-        # before snapshotting streams, so no stream can appear after teardown.
-        self._stream_creation_tasks: set[asyncio.Task[Any]] = set()
         self._disconnecting: bool = False
 
         # Reconnection
@@ -916,7 +950,7 @@ class OctoAdapter(BasePlatformAdapter):
         # O(1) instead of scanning _uid_to_name every miss. Written in lock-
         # step with _uid_to_name via _record_uid_name().
         self._base_uid_to_name: dict[str, str] = {}
-        self._member_map: dict[str, str] = {}   # displayName → uid
+        self._member_map: dict[str, str] = {}  # displayName → uid
         # Parent-group roster used for prompt and mention context.  The
         # global uid/name cache remains a fallback for name resolution, but
         # must never determine which members appear in another group's prompt.
@@ -948,9 +982,6 @@ class OctoAdapter(BasePlatformAdapter):
         # peer UID before it is sent over the Bot API.
         self._space_dm_targets: dict[str, str] = {}
 
-        # Streaming config
-        self._stream_threshold: int = extra.get("stream_threshold", 500)
-
         # GROUP.md cache: channel_id → {content, version}
         self._group_md_cache: dict[str, dict[str, Any]] = {}
         self._group_md_checked: set[str] = set()
@@ -971,8 +1002,7 @@ class OctoAdapter(BasePlatformAdapter):
         # placeholders are substituted. Falls back to the module-level
         # default when not set.
         self._history_prompt_template: str = (
-            extra.get("history_prompt_template")
-            or DEFAULT_HISTORY_PROMPT_TEMPLATE
+            extra.get("history_prompt_template") or DEFAULT_HISTORY_PROMPT_TEMPLATE
         )
         # Per-account heartbeat / reconnect tuning. Bots on flaky links can
         # raise ping_max_retry; bots in latency-sensitive deployments can
@@ -980,9 +1010,7 @@ class OctoAdapter(BasePlatformAdapter):
         self._heartbeat_interval_s: float = float(
             extra.get("heartbeat_interval_s", HEARTBEAT_INTERVAL)
         )
-        self._ping_max_retry: int = int(
-            extra.get("ping_max_retry", PING_MAX_RETRY)
-        )
+        self._ping_max_retry: int = int(extra.get("ping_max_retry", PING_MAX_RETRY))
         event_interval = extra.get("event_poll_interval_s")
         if event_interval is None:
             event_interval = os.getenv("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
@@ -995,11 +1023,27 @@ class OctoAdapter(BasePlatformAdapter):
         self._event_poll_interval_s = float(event_interval)
         self._event_poll_wait_s = int(event_wait)
         self._event_poll_limit = int(event_limit)
+        progress_renderer = extra.get("progress_card_renderer")
+        if progress_renderer is None:
+            progress_renderer = os.getenv("OCTO_PROGRESS_CARD_RENDERER", "local")
+        if (
+            not isinstance(progress_renderer, str)
+            or progress_renderer not in PROGRESS_CARD_RENDERERS
+        ):
+            raise ValueError(
+                "progress_card_renderer must be 'local' or 'registry'"
+            )
+        self._progress_card_renderer = progress_renderer
 
     @property
     def on_behalf_of(self) -> str | None:
         """Trusted configured grantor identity for outbound delivery."""
         return self._on_behalf_of or None
+
+    @property
+    def progress_card_renderer(self) -> str:
+        """Configured renderer for lifecycle-driven progress cards."""
+        return self._progress_card_renderer
 
     @property
     def name(self) -> str:
@@ -1025,7 +1069,9 @@ class OctoAdapter(BasePlatformAdapter):
             try:
                 task = loop.create_task(factory())
             except Exception:
-                logger.debug("[%s] progress task creation failed", self.name, exc_info=True)
+                logger.debug(
+                    "[%s] progress task creation failed", self.name, exc_info=True
+                )
                 return
             self._progress_tasks.add(task)
 
@@ -1052,11 +1098,39 @@ class OctoAdapter(BasePlatformAdapter):
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
 
-    async def _handle_card_action_event(self, action: CardAction) -> None:
+    async def _handle_card_action_event(self, action: CardAction) -> str:
         from .card_events import (
             dispatch_card_action_event,
             handle_card_action,
+            render_card_action_status,
         )
+
+        async def update_status(
+            session: CardSession,
+            claimed: CardAction,
+            status_name: str,
+            *,
+            transient: bool,
+        ) -> None:
+            if self._http_session is None:
+                return
+            card_seq = self._card_sessions.next_card_seq(session.message_id)
+            if card_seq is None:
+                return
+            rendered = render_card_action_status(session, claimed, status_name)
+            await api.edit_card_message(
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=session.channel_id,
+                channel_type=session.channel_type,
+                message_id=session.message_id,
+                card=rendered.card,
+                card_seq=card_seq,
+                plain=rendered.plain,
+                transient=transient,
+                profile=CARD_PROFILE_V2,
+            )
 
         status = await handle_card_action(
             self._card_sessions,
@@ -1066,6 +1140,7 @@ class OctoAdapter(BasePlatformAdapter):
                 session,
                 claimed,
             ),
+            update_status=update_status,
         )
         if status == "dead_letter":
             logger.warning(
@@ -1073,6 +1148,7 @@ class OctoAdapter(BasePlatformAdapter):
                 self.name,
                 action.event_id,
             )
+        return status
 
     def _start_card_event_poller(self) -> None:
         if (
@@ -1171,12 +1247,16 @@ class OctoAdapter(BasePlatformAdapter):
             )
             if should_force_refresh:
                 self._last_token_refresh = now
-                logger.info("[%s] Forcing IM token refresh (attempt %d)",
-                            self.name, self._reconnect_attempts)
+                logger.info(
+                    "[%s] Forcing IM token refresh (attempt %d)",
+                    self.name,
+                    self._reconnect_attempts,
+                )
             elif self._reconnect_attempts > 0:
                 logger.info(
                     "[%s] Skipping token refresh (in cooldown, %.0fs since last)",
-                    self.name, now - self._last_token_refresh,
+                    self.name,
+                    now - self._last_token_refresh,
                 )
             self._registration = await api.register_bot(
                 self._http_session,
@@ -1186,10 +1266,16 @@ class OctoAdapter(BasePlatformAdapter):
             )
             self._robot_id = self._registration.robot_id
             self._owner_uid = self._registration.owner_uid or ""
-            logger.info("[%s] Bot registered: robot_id=%s owner=%s",
-                        self.name, self._robot_id, self._owner_uid or "<none>")
+            logger.info(
+                "[%s] Bot registered: robot_id=%s owner=%s",
+                self.name,
+                self._robot_id,
+                self._owner_uid or "<none>",
+            )
         except Exception as e:
-            logger.error("[%s] Bot registration failed: %s", self.name, redact_log(str(e)))
+            logger.error(
+                "[%s] Bot registration failed: %s", self.name, redact_log(str(e))
+            )
             raise
 
         ws_url = self._ws_url or self._registration.ws_url
@@ -1197,12 +1283,16 @@ class OctoAdapter(BasePlatformAdapter):
         try:
             self._ws = await websockets.connect(
                 ws_url,
-                max_size=8 * 1024 * 1024,   # 8 MiB cap — defends against malformed/malicious frames
+                max_size=8
+                * 1024
+                * 1024,  # 8 MiB cap — defends against malformed/malicious frames
                 ping_interval=20,
                 ping_timeout=20,
             )
         except Exception as e:
-            logger.error("[%s] WebSocket connection failed: %s", self.name, redact_log(str(e)))
+            logger.error(
+                "[%s] WebSocket connection failed: %s", self.name, redact_log(str(e))
+            )
             raise
 
         self._temp_buffer = bytearray()
@@ -1242,7 +1332,9 @@ class OctoAdapter(BasePlatformAdapter):
             if pkt_type == PacketType.CONNACK:
                 if result.reason_code == 1:
                     server_pub_key = base64.b64decode(result.server_key)
-                    shared_secret = compute_shared_secret(self._dh_private_key, server_pub_key)
+                    shared_secret = compute_shared_secret(
+                        self._dh_private_key, server_pub_key
+                    )
                     self._aes_key = derive_aes_key(shared_secret)
                     salt = result.salt or ""
                     # AES-CBC requires a 16-byte IV. WuKongIM v4 CONNACK salt
@@ -1255,7 +1347,8 @@ class OctoAdapter(BasePlatformAdapter):
                     else:
                         logger.warning(
                             "[%s] CONNACK salt shorter than 16 bytes (len=%d); padding IV",
-                            self.name, len(salt),
+                            self.name,
+                            len(salt),
                         )
                         self._aes_iv = salt.ljust(16, "\x00")
                     self._server_version = result.server_version
@@ -1265,7 +1358,8 @@ class OctoAdapter(BasePlatformAdapter):
                     connack_success = True
                     logger.info(
                         "[%s] Connected (server_version=%d)",
-                        self.name, self._server_version,
+                        self.name,
+                        self._server_version,
                     )
                 elif result.reason_code == 0:
                     logger.error("[%s] Kicked by server", self.name)
@@ -1274,9 +1368,12 @@ class OctoAdapter(BasePlatformAdapter):
                 else:
                     logger.error(
                         "[%s] Connect failed: reasonCode=%d",
-                        self.name, result.reason_code,
+                        self.name,
+                        result.reason_code,
                     )
-                    raise RuntimeError(f"Connect failed: reasonCode={result.reason_code}")
+                    raise RuntimeError(
+                        f"Connect failed: reasonCode={result.reason_code}"
+                    )
 
         if not connack_success:
             raise RuntimeError("CONNACK not received")
@@ -1308,9 +1405,7 @@ class OctoAdapter(BasePlatformAdapter):
                 except asyncio.CancelledError:
                     pass
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        self._http_heartbeat_task = asyncio.create_task(
-            self._http_heartbeat_loop()
-        )
+        self._http_heartbeat_task = asyncio.create_task(self._http_heartbeat_loop())
 
     async def _finalize_disconnect_resources(self) -> None:
         """Cancel owned tasks and close transports exactly once."""
@@ -1322,31 +1417,21 @@ class OctoAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] progress state cleanup failed", self.name, exc_info=True)
         event_task = self._event_task
-        stream_watchdogs = [
-            state.get("flush_task")
-            for state in self._active_streams.values()
-            if state.get("flush_task") is not None
-        ]
         owned_tasks = [
-            getattr(self, "_reconnect_task", None),
+            self._reconnect_task,
             self._heartbeat_task,
             self._http_heartbeat_task,
             self._recv_task,
             self._cache_cleanup_task,
             self._prefetch_task,
             event_task,
-            *stream_watchdogs,
-            *self._stream_creation_tasks,
             *self._progress_tasks,
         ]
         for task in owned_tasks:
             if task and task is not current_task and not task.done():
                 task.cancel()
         await asyncio.gather(
-            *(
-                task for task in owned_tasks
-                if task and task is not current_task
-            ),
+            *(task for task in owned_tasks if task and task is not current_task),
             return_exceptions=True,
         )
         self._reconnect_task = None
@@ -1356,10 +1441,6 @@ class OctoAdapter(BasePlatformAdapter):
         self._cache_cleanup_task = None
         self._prefetch_task = None
         self._event_task = None
-        for state in self._active_streams.values():
-            state["flush_task"] = None
-        self._active_streams.clear()
-        self._stream_creation_tasks.clear()
         self._progress_tasks.clear()
         ws, self._ws = self._ws, None
         if ws:
@@ -1400,7 +1481,11 @@ class OctoAdapter(BasePlatformAdapter):
             self._event_poller.stop()
         reconnect_task = self._reconnect_task
         current = asyncio.current_task()
-        if reconnect_task and reconnect_task is not current and not reconnect_task.done():
+        if (
+            reconnect_task
+            and reconnect_task is not current
+            and not reconnect_task.done()
+        ):
             reconnect_task.cancel()
             drain = asyncio.gather(reconnect_task, return_exceptions=True)
             while not drain.done():
@@ -1438,53 +1523,26 @@ class OctoAdapter(BasePlatformAdapter):
         if self._event_poller is not None:
             self._event_poller.stop()
 
+        cleanup_task = asyncio.create_task(self._finalize_disconnect_resources())
         try:
-            creation_tasks = [
-                task
-                for task in self._stream_creation_tasks
-                if task is not asyncio.current_task() and not task.done()
-            ]
-            if creation_tasks:
-                drain_task = asyncio.gather(*creation_tasks, return_exceptions=True)
-                while not drain_task.done():
-                    try:
-                        await asyncio.shield(drain_task)
-                    except asyncio.CancelledError as exc:
-                        cancellation = cancellation or exc
-                        continue
-            # Flush buffered outbound content while the HTTP session is still
-            # available. Cancellation skips the remaining best-effort flushes
-            # but must not skip transport teardown below.
-            for chat_id in list(self._active_streams.keys()):
+            while not cleanup_task.done():
                 try:
-                    await self._close_active_stream(chat_id)
-                except Exception:
-                    pass
-        except asyncio.CancelledError as exc:
-            cancellation = exc
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError as exc:
+                    # Repeated cancellation applies to the caller, never to the
+                    # separately owned transport cleanup task.
+                    cancellation = cancellation or exc
+                    continue
+            cleanup_task.result()
+        except Exception as exc:
+            logger.error(
+                "[%s] disconnect cleanup failed: %s",
+                self.name,
+                type(exc).__name__,
+            )
         finally:
-            cleanup_task = asyncio.create_task(self._finalize_disconnect_resources())
-            try:
-                while not cleanup_task.done():
-                    try:
-                        await asyncio.shield(cleanup_task)
-                    except asyncio.CancelledError as exc:
-                        # Repeated cancellation applies to the caller, never to
-                        # the separately owned transport cleanup task.
-                        cancellation = cancellation or exc
-                        continue
-                # Retrieve a possible cleanup exception without allowing it to
-                # skip the disconnected state transition.
-                cleanup_task.result()
-            except Exception as exc:
-                logger.error(
-                    "[%s] disconnect cleanup failed: %s",
-                    self.name,
-                    type(exc).__name__,
-                )
-            finally:
-                self._mark_disconnected()
-                logger.info("[%s] Disconnected", self.name)
+            self._mark_disconnected()
+            logger.info("[%s] Disconnected", self.name)
 
         if cancellation is not None:
             raise cancellation
@@ -1506,9 +1564,9 @@ class OctoAdapter(BasePlatformAdapter):
         path = rel_url
         for prefix in ("file/preview/", "file/"):
             if path.startswith(prefix):
-                path = path[len(prefix):]
+                path = path[len(prefix) :]
                 break
-        if getattr(self, "_cdn_url", ""):
+        if self._cdn_url:
             return f"{self._cdn_url.rstrip('/')}/{path}"
         base = (self._api_url or "").rstrip("/")
         return f"{base}/file/{path}"
@@ -1540,7 +1598,7 @@ class OctoAdapter(BasePlatformAdapter):
         candidate_origin = _origin(url)
         if candidate_origin is None:
             return {}
-        for configured_url in (self._api_url, getattr(self, "_cdn_url", "")):
+        for configured_url in (self._api_url, self._cdn_url):
             if candidate_origin == _origin(configured_url):
                 return {"Authorization": f"Bearer {self._bot_token}"}
         return {}
@@ -1567,11 +1625,13 @@ class OctoAdapter(BasePlatformAdapter):
         if hostname in _METADATA_HOSTS:
             return False
         if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() not in {
-            "1", "true", "yes",
+            "1",
+            "true",
+            "yes",
         }:
             return False
 
-        for configured in (self._api_url, getattr(self, "_cdn_url", "")):
+        for configured in (self._api_url, self._cdn_url):
             if not configured:
                 continue
             try:
@@ -1584,7 +1644,9 @@ class OctoAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 continue
             if (scheme, hostname, port) == (
-                candidate_scheme, candidate_host, candidate_port,
+                candidate_scheme,
+                candidate_host,
+                candidate_port,
             ):
                 return True
         return False
@@ -1691,9 +1753,7 @@ class OctoAdapter(BasePlatformAdapter):
             for gid in sorted(groups)
         ]
 
-    def _cache_group_members(
-        self, group_no: str, members: list[GroupMember]
-    ) -> int:
+    def _cache_group_members(self, group_no: str, members: list[GroupMember]) -> int:
         """Refresh global lookup caches and the parent-scoped prompt roster."""
         parent_group_no = group_no.split("____", 1)[0]
         roster: dict[str, str] = {}
@@ -1722,13 +1782,19 @@ class OctoAdapter(BasePlatformAdapter):
         self._update_user_group_index(parent_group_no, members)
         return len(roster)
 
-    async def _refresh_group_member_cache(self, group_no: str, force: bool = False) -> bool:
+    async def _refresh_group_member_cache(
+        self, group_no: str, force: bool = False
+    ) -> bool:
         if not self._http_session:
             return False
         parent_group_no = group_no.split("____", 1)[0]
         now = int(time.time() * 1000)
         last_fetched = self._group_cache_timestamps.get(parent_group_no, 0)
-        if not force and (now - last_fetched) <= GROUP_CACHE_EXPIRY_MS and last_fetched > 0:
+        if (
+            not force
+            and (now - last_fetched) <= GROUP_CACHE_EXPIRY_MS
+            and last_fetched > 0
+        ):
             return False
         generation = self._group_scope_generation(parent_group_no)
         try:
@@ -1740,12 +1806,18 @@ class OctoAdapter(BasePlatformAdapter):
             if members:
                 self._cache_group_members(parent_group_no, members)
                 self._group_cache_timestamps[parent_group_no] = now
-                logger.info("[%s] Group member cache refreshed: %s (%d members)",
-                            self.name, parent_group_no, len(members))
+                logger.info(
+                    "[%s] Group member cache refreshed: %s (%d members)",
+                    self.name,
+                    parent_group_no,
+                    len(members),
+                )
                 return True
             else:
                 self._cache_group_members(parent_group_no, [])
-                self._group_cache_timestamps[parent_group_no] = now - GROUP_CACHE_EXPIRY_MS + 30000
+                self._group_cache_timestamps[parent_group_no] = (
+                    now - GROUP_CACHE_EXPIRY_MS + 30000
+                )
                 return False
         except Exception as e:
             if generation != self._group_scope_generation(parent_group_no):
@@ -1756,7 +1828,9 @@ class OctoAdapter(BasePlatformAdapter):
             # scoped display data, but make sender verification unknown until
             # the server returns a fresh member list.
             self._group_robot_map.pop(parent_group_no, None)
-            self._group_cache_timestamps[parent_group_no] = now - GROUP_CACHE_EXPIRY_MS + 30000
+            self._group_cache_timestamps[parent_group_no] = (
+                now - GROUP_CACHE_EXPIRY_MS + 30000
+            )
             return False
 
     # ── Group History ─────────────────────────────────────────────────────
@@ -1837,8 +1911,11 @@ class OctoAdapter(BasePlatformAdapter):
         half_limit = max(1, self._history_limit // 2)
 
         if len(entries) < half_limit and self._http_session:
-            logger.info("[%s] [HISTORY] Cache insufficient (%d), fetching from API...",
-                        self.name, len(entries))
+            logger.info(
+                "[%s] [HISTORY] Cache insufficient (%d), fetching from API...",
+                self.name,
+                len(entries),
+            )
             try:
                 fetch_limit = min(self._history_limit, 100)
                 history_channel_type = (
@@ -1864,8 +1941,10 @@ class OctoAdapter(BasePlatformAdapter):
                     )
                     # For media types, resolve and append full URL
                     if msg_type in (
-                        OctoMessageType.Image, OctoMessageType.File,
-                        OctoMessageType.Voice, OctoMessageType.Video,
+                        OctoMessageType.Image,
+                        OctoMessageType.File,
+                        OctoMessageType.Voice,
+                        OctoMessageType.Video,
                     ) and m.get("url"):
                         full_url = self._build_media_url(m["url"])
                         if full_url:
@@ -1877,9 +1956,13 @@ class OctoAdapter(BasePlatformAdapter):
                         "timestamp": m.get("timestamp", 0),
                     })
                 if api_entries:
-                    entries = api_entries[-self._history_limit:]
-                    logger.info("[%s] [HISTORY] Fetched %d from API for %s",
-                                self.name, len(entries), channel_id)
+                    entries = api_entries[-self._history_limit :]
+                    logger.info(
+                        "[%s] [HISTORY] Fetched %d from API for %s",
+                        self.name,
+                        len(entries),
+                        channel_id,
+                    )
             except Exception as e:
                 logger.error("[%s] [HISTORY] API fetch failed: %s", self.name, e)
 
@@ -1887,7 +1970,7 @@ class OctoAdapter(BasePlatformAdapter):
             return ""
 
         # Apply sliding window
-        entries = entries[-self._history_limit:]
+        entries = entries[-self._history_limit :]
         parent_group_no = channel_id.split("____", 1)[0]
         roster = self._group_member_rosters.get(parent_group_no, {})
         formatted = []
@@ -1895,7 +1978,9 @@ class OctoAdapter(BasePlatformAdapter):
             sender_uid = e.get("sender", "unknown")
             sender_name = roster.get(sender_uid, sender_uid)
             sender_label = (
-                f"{sender_name}({sender_uid})" if sender_name != sender_uid else sender_uid
+                f"{sender_name}({sender_uid})"
+                if sender_name != sender_uid
+                else sender_uid
             )
             body = e.get("body", "")
             # Convert mentions to @[uid:name] format for LLM
@@ -1916,21 +2001,21 @@ class OctoAdapter(BasePlatformAdapter):
         """Compute the on-disk directory for a GROUP.md / THREAD.md cache
         entry. *key* is either ``<group_no>`` or ``<group_no>____<short_id>``.
 
-        Returns ``None`` when HERMES_HOME isn't resolvable (e.g. the adapter
-        is being constructed outside a hermes context — tests), or when the
-        adapter hasn't been fully initialised yet (object.__new__ in unit
-        tests skips __init__).
+        Returns ``None`` when HERMES_HOME isn't resolvable, or when a server
+        identifier cannot be represented safely below the cache root.
         """
         try:
             from hermes_constants import get_hermes_home
+
             home = get_hermes_home()
         except Exception:
             return None
         from pathlib import Path
+
         # Owner namespace so multi-bot-on-different-tenants doesn't collide.
         try:
             owner_short = _validate_octo_path_segment(
-                (getattr(self, "_owner_uid", None) or "unknown")[:16],
+                (self._owner_uid or "unknown")[:16],
                 "owner_uid",
             )
             if "____" in key:
@@ -1938,8 +2023,13 @@ class OctoAdapter(BasePlatformAdapter):
                 group_no = _validate_octo_path_segment(group_no, "group_no")
                 short_id = _validate_octo_path_segment(short_id, "short_id")
                 return (
-                    Path(home) / GROUP_MD_DISK_ROOT_NAME / owner_short
-                    / "groups" / group_no / "threads" / short_id
+                    Path(home)
+                    / GROUP_MD_DISK_ROOT_NAME
+                    / owner_short
+                    / "groups"
+                    / group_no
+                    / "threads"
+                    / short_id
                 )
             key = _validate_octo_path_segment(key, "group_key")
             return Path(home) / GROUP_MD_DISK_ROOT_NAME / owner_short / "groups" / key
@@ -1964,8 +2054,9 @@ class OctoAdapter(BasePlatformAdapter):
                 "fetched_at": time.time(),
                 "owner_uid": self._owner_uid,
             }
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         except Exception as e:
             logger.debug("[%s] MD disk write failed for %s: %s", self.name, key, e)
 
@@ -2067,11 +2158,19 @@ class OctoAdapter(BasePlatformAdapter):
                     "content": md_data["content"],
                     "version": md_data.get("version", 0),
                 }
-                self._write_md_to_disk(group_no, md_data["content"], md_data.get("version", 0))
-                logger.info("[%s] GROUP.md cached for %s (v%d)",
-                            self.name, group_no, md_data.get("version", 0))
+                self._write_md_to_disk(
+                    group_no, md_data["content"], md_data.get("version", 0)
+                )
+                logger.info(
+                    "[%s] GROUP.md cached for %s (v%d)",
+                    self.name,
+                    group_no,
+                    md_data.get("version", 0),
+                )
         except Exception as e:
-            logger.debug("[%s] GROUP.md fetch failed for %s: %s", self.name, group_no, e)
+            logger.debug(
+                "[%s] GROUP.md fetch failed for %s: %s", self.name, group_no, e
+            )
 
     async def _ensure_thread_md(self, group_no: str, short_id: str) -> None:
         """Fetch+cache THREAD.md (keyed on the composite ``group_no____short_id``).
@@ -2090,8 +2189,11 @@ class OctoAdapter(BasePlatformAdapter):
             return
         try:
             md_data = await api.get_thread_md(
-                self._http_session, self._api_url, self._bot_token,
-                group_no=group_no, short_id=short_id,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                group_no=group_no,
+                short_id=short_id,
             )
             if generation != self._group_scope_generation(group_no):
                 return
@@ -2101,9 +2203,15 @@ class OctoAdapter(BasePlatformAdapter):
                     "content": md_data["content"],
                     "version": md_data.get("version", 0),
                 }
-                self._write_md_to_disk(key, md_data["content"], md_data.get("version", 0))
-                logger.info("[%s] THREAD.md cached for %s (v%d)",
-                            self.name, key, md_data.get("version", 0))
+                self._write_md_to_disk(
+                    key, md_data["content"], md_data.get("version", 0)
+                )
+                logger.info(
+                    "[%s] THREAD.md cached for %s (v%d)",
+                    self.name,
+                    key,
+                    md_data.get("version", 0),
+                )
         except Exception as e:
             logger.debug("[%s] THREAD.md fetch failed for %s: %s", self.name, key, e)
 
@@ -2163,8 +2271,11 @@ class OctoAdapter(BasePlatformAdapter):
                 )
             else:
                 md_data = await api.get_thread_md(
-                    self._http_session, self._api_url, self._bot_token,
-                    group_no=parent, short_id=short_id,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    group_no=parent,
+                    short_id=short_id,
                 )
             if generation != self._group_scope_generation(parent):
                 return
@@ -2173,7 +2284,9 @@ class OctoAdapter(BasePlatformAdapter):
                     "content": md_data["content"],
                     "version": md_data.get("version", 0),
                 }
-                self._write_md_to_disk(channel_id, md_data["content"], md_data.get("version", 0))
+                self._write_md_to_disk(
+                    channel_id, md_data["content"], md_data.get("version", 0)
+                )
             else:
                 self._group_md_cache.pop(channel_id, None)
                 self._delete_md_from_disk(channel_id)
@@ -2188,10 +2301,14 @@ class OctoAdapter(BasePlatformAdapter):
                 try:
                     raw = await self._ws.recv()
                 except websockets.exceptions.ConnectionClosed as e:
-                    logger.warning("[%s] WebSocket closed: %s", self.name, redact_log(str(e)))
+                    logger.warning(
+                        "[%s] WebSocket closed: %s", self.name, redact_log(str(e))
+                    )
                     break
                 except Exception as e:
-                    logger.error("[%s] WebSocket recv error: %s", self.name, redact_log(str(e)))
+                    logger.error(
+                        "[%s] WebSocket recv error: %s", self.name, redact_log(str(e))
+                    )
                     break
 
                 data = raw if isinstance(raw, bytes) else raw.encode("latin-1")
@@ -2203,8 +2320,11 @@ class OctoAdapter(BasePlatformAdapter):
                     try:
                         frame, self._temp_buffer = try_unpack_one(self._temp_buffer)
                     except Exception as e:
-                        logger.error("[%s] Frame unpack error, resetting buffer: %s",
-                                     self.name, redact_log(str(e)))
+                        logger.error(
+                            "[%s] Frame unpack error, resetting buffer: %s",
+                            self.name,
+                            redact_log(str(e)),
+                        )
                         self._temp_buffer = bytearray()
                         break
                     if frame is None:
@@ -2212,14 +2332,19 @@ class OctoAdapter(BasePlatformAdapter):
                     try:
                         await self._handle_frame(frame)
                     except Exception as e:
-                        logger.error("[%s] Frame handle error (skipping): %s",
-                                     self.name, redact_log(str(e)))
+                        logger.error(
+                            "[%s] Frame handle error (skipping): %s",
+                            self.name,
+                            redact_log(str(e)),
+                        )
         except asyncio.CancelledError:
             return
         finally:
             self._connected = False
             if self._need_reconnect:
-                logger.debug("[%s] Receive loop exited — scheduling reconnect", self.name)
+                logger.debug(
+                    "[%s] Receive loop exited — scheduling reconnect", self.name
+                )
                 self._spawn_reconnect_task()
 
     async def _handle_frame(self, frame: bytes) -> None:
@@ -2233,7 +2358,9 @@ class OctoAdapter(BasePlatformAdapter):
             # uid+device_flag connected (WuKongIM "kicked by another login").
             # Keep _need_reconnect=True so the bot recovers automatically once
             # the competing connection goes away.
-            logger.debug("[%s] Server sent DISCONNECT — will attempt reconnect", self.name)
+            logger.debug(
+                "[%s] Server sent DISCONNECT — will attempt reconnect", self.name
+            )
             self._connected = False
             if self._ws:
                 try:
@@ -2255,7 +2382,9 @@ class OctoAdapter(BasePlatformAdapter):
             decrypted = aes_decrypt(recv.encrypted_payload, self._aes_key, self._aes_iv)
             payload_dict = json.loads(decrypted.decode("utf-8"))
         except Exception as e:
-            logger.debug("[%s] Payload decrypt/parse error: %s", self.name, redact_log(str(e)))
+            logger.debug(
+                "[%s] Payload decrypt/parse error: %s", self.name, redact_log(str(e))
+            )
             return
 
         payload = MessagePayload.from_dict(payload_dict)
@@ -2288,7 +2417,9 @@ class OctoAdapter(BasePlatformAdapter):
         is_group = msg.channel_type in _GROUP_CHANNEL_TYPES
 
         # Handle GROUP.md events — don't pass to LLM
-        event_type = payload.event.get("type") if isinstance(payload.event, dict) else None
+        event_type = (
+            payload.event.get("type") if isinstance(payload.event, dict) else None
+        )
         if event_type in ("group_md_updated", "group_md_deleted") and msg.channel_id:
             self._handle_group_md_event(msg.channel_id, event_type)
             if event_type == "group_md_updated" and self._http_session:
@@ -2328,10 +2459,13 @@ class OctoAdapter(BasePlatformAdapter):
 
         # Send read receipt (fire-and-forget)
         if self._http_session:
-            asyncio.create_task(self._send_read_receipt_safe(
-                channel_id, channel_type_enum,
-                [msg.message_id] if msg.message_id else [],
-            ))
+            asyncio.create_task(
+                self._send_read_receipt_safe(
+                    channel_id,
+                    channel_type_enum,
+                    [msg.message_id] if msg.message_id else [],
+                )
+            )
 
         # Resolve content
         content = self._resolve_content(payload)
@@ -2348,7 +2482,8 @@ class OctoAdapter(BasePlatformAdapter):
             known_size = payload.extra.get("size") if payload.extra else None
             if file_url:
                 resolved = await self._resolve_inbound_file(
-                    file_url, file_name,
+                    file_url,
+                    file_name,
                     known_size if isinstance(known_size, int) else None,
                 )
                 if resolved:
@@ -2407,8 +2542,12 @@ class OctoAdapter(BasePlatformAdapter):
             self._record_history_entry(
                 msg.channel_id, msg.from_uid, content, payload.mention
             )
-            logger.info("[%s] [HISTORY] Non-@ message cached | from=%s | channel=%s",
-                        self.name, msg.from_uid, msg.channel_id)
+            logger.info(
+                "[%s] [HISTORY] Non-@ message cached | from=%s | channel=%s",
+                self.name,
+                msg.from_uid,
+                msg.channel_id,
+            )
             return
 
         if is_group and not self._require_mention and not is_mentioned:
@@ -2484,7 +2623,9 @@ class OctoAdapter(BasePlatformAdapter):
         # ── Group history context (injected on @mention) ──
         history_context: str | None = None
         if is_group and msg.channel_id:
-            history_prefix = await self._build_history_context(msg.channel_id, self._robot_id)
+            history_prefix = await self._build_history_context(
+                msg.channel_id, self._robot_id
+            )
             if history_prefix:
                 history_context = history_prefix
 
@@ -2496,7 +2637,9 @@ class OctoAdapter(BasePlatformAdapter):
         parent_group_no = None
         thread_short_id = None
         if is_group and msg.channel_id:
-            parent_group_no, thread_short_id = self._split_thread_channel_id(msg.channel_id)
+            parent_group_no, thread_short_id = self._split_thread_channel_id(
+                msg.channel_id
+            )
             asyncio.create_task(self._ensure_group_md(parent_group_no))
             if thread_short_id:
                 asyncio.create_task(
@@ -2637,6 +2780,7 @@ class OctoAdapter(BasePlatformAdapter):
         _session_tokens = None
         try:
             from gateway.session_context import set_session_vars
+
             _session_tokens = set_session_vars(
                 platform="octo",
                 chat_id=channel_id,
@@ -2649,11 +2793,22 @@ class OctoAdapter(BasePlatformAdapter):
             pass
 
         try:
+            from .card_progress import on_octo_inbound_message
+
+            on_octo_inbound_message(
+                chat_id=channel_id,
+                requester_uid=msg.from_uid or "",
+            )
+        except Exception:
+            pass
+
+        try:
             await self.handle_message(event)
         finally:
             if _session_tokens is not None:
                 try:
                     from gateway.session_context import clear_session_vars
+
                     clear_session_vars(_session_tokens)
                 except Exception:
                     pass
@@ -2747,6 +2902,7 @@ class OctoAdapter(BasePlatformAdapter):
         are swallowed — cleanup is opportunistic, never blocks the call."""
         try:
             import os as _os
+
             cutoff = time.time() - retention_s
             for entry in _os.listdir(dir_path):
                 p = _os.path.join(dir_path, entry)
@@ -2783,6 +2939,7 @@ class OctoAdapter(BasePlatformAdapter):
             return None
         import os as _os
         from pathlib import PurePosixPath
+
         ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
 
         # Hard size cap — never download files above the limit even if we
@@ -2807,7 +2964,9 @@ class OctoAdapter(BasePlatformAdapter):
             try:
                 # Cap connection + read timeout based on known size, with a
                 # generous floor for small files and a 30 min ceiling.
-                timeout_s = max(60.0, min(1800.0, (known_size or 0) / (256 * 1024) + 30))
+                timeout_s = max(
+                    60.0, min(1800.0, (known_size or 0) / (256 * 1024) + 30)
+                )
                 timeout = aiohttp.ClientTimeout(total=timeout_s)
                 async with self._http_session.get(
                     url,
@@ -2822,9 +2981,8 @@ class OctoAdapter(BasePlatformAdapter):
                         raise RuntimeError(f"HTTP {resp.status}")
 
                     # Decide inline vs download path
-                    inline_eligible = (
-                        ext in _TEXT_FILE_EXTS
-                        and (known_size is None or known_size <= FILE_INLINE_MAX_BYTES)
+                    inline_eligible = ext in _TEXT_FILE_EXTS and (
+                        known_size is None or known_size <= FILE_INLINE_MAX_BYTES
                     )
                     if inline_eligible:
                         # Stream up to FILE_INLINE_MAX_BYTES, if exceeded fall
@@ -2849,10 +3007,14 @@ class OctoAdapter(BasePlatformAdapter):
 
                     # Download to temp file
                     import uuid as _uuid
-                    safe_name = "".join(
-                        c if c.isalnum() or c in "._-" else "_"
-                        for c in PurePosixPath(filename).name
-                    ) or "file"
+
+                    safe_name = (
+                        "".join(
+                            c if c.isalnum() or c in "._-" else "_"
+                            for c in PurePosixPath(filename).name
+                        )
+                        or "file"
+                    )
                     tmp_name = f"{_uuid.uuid4().hex}-{safe_name}"
                     tmp_path = _os.path.join(FILE_TEMP_DIR, tmp_name)
                     total = 0
@@ -2874,12 +3036,19 @@ class OctoAdapter(BasePlatformAdapter):
 
             except TimeoutError as e:
                 last_err = f"下载超时 (attempt {attempt}/{max_retries})"
-                logger.warning("[%s] file download timeout for %s: %s",
-                               self.name, filename, e)
+                logger.warning(
+                    "[%s] file download timeout for %s: %s", self.name, filename, e
+                )
             except Exception as e:
                 last_err = str(e)
-                logger.warning("[%s] file download error for %s (attempt %d/%d): %s",
-                               self.name, filename, attempt, max_retries, e)
+                logger.warning(
+                    "[%s] file download error for %s (attempt %d/%d): %s",
+                    self.name,
+                    filename,
+                    attempt,
+                    max_retries,
+                    e,
+                )
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
 
@@ -2905,6 +3074,7 @@ class OctoAdapter(BasePlatformAdapter):
             return None
         import os as _os
         import uuid as _uuid
+
         _os.makedirs(MEDIA_TEMP_DIR, exist_ok=True)
         # Opportunistic sweep of old temp files; failures swallowed.
         try:
@@ -2937,8 +3107,12 @@ class OctoAdapter(BasePlatformAdapter):
                 allow_redirects=False,
             ) as resp:
                 if not resp.ok:
-                    logger.warning("[%s] inbound media download HTTP %d for %s",
-                                   self.name, resp.status, url)
+                    logger.warning(
+                        "[%s] inbound media download HTTP %d for %s",
+                        self.name,
+                        resp.status,
+                        url,
+                    )
                     return None
                 total = 0
                 with open(tmp_path, "wb") as f:
@@ -2952,14 +3126,16 @@ class OctoAdapter(BasePlatformAdapter):
                                 pass
                             logger.info(
                                 "[%s] inbound media too large (>%s) — using remote URL",
-                                self.name, _format_size(MEDIA_DOWNLOAD_MAX_BYTES),
+                                self.name,
+                                _format_size(MEDIA_DOWNLOAD_MAX_BYTES),
                             )
                             return None
                         f.write(chunk)
             return tmp_path
         except Exception as e:
-            logger.warning("[%s] inbound media download failed for %s: %s",
-                           self.name, url, e)
+            logger.warning(
+                "[%s] inbound media download failed for %s: %s", self.name, url, e
+            )
             try:
                 _os.unlink(tmp_path)
             except Exception:
@@ -3067,9 +3243,7 @@ class OctoAdapter(BasePlatformAdapter):
                 continue
             from_uid = m.get("from_uid", "unknown")
             sender_name = (
-                user_map.get(from_uid)
-                or self._uid_to_name.get(from_uid)
-                or from_uid
+                user_map.get(from_uid) or self._uid_to_name.get(from_uid) or from_uid
             )
             inner_payload = m.get("payload") or {}
             if inner_payload.get("type") == OctoMessageType.MultipleForward:
@@ -3116,7 +3290,9 @@ class OctoAdapter(BasePlatformAdapter):
                 raw_blocks = [{"type": RICH_TEXT_BLOCK_TEXT, "text": raw_content}]
             else:
                 raw_blocks = None
-            top_plain = payload.get("plain") if isinstance(payload.get("plain"), str) else None
+            top_plain = (
+                payload.get("plain") if isinstance(payload.get("plain"), str) else None
+            )
 
         blocks = raw_blocks or []
 
@@ -3242,20 +3418,29 @@ class OctoAdapter(BasePlatformAdapter):
         try:
             outbound_channel_id = self._outbound_channel_id(channel_id, channel_type)
             await api.send_read_receipt(
-                self._http_session, self._api_url, self._bot_token,
-                outbound_channel_id, channel_type, message_ids,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                outbound_channel_id,
+                channel_type,
+                message_ids,
             )
         except Exception as e:
             logger.debug("[%s] Read receipt failed: %s", self.name, e)
 
-    async def _send_typing_safe(self, channel_id: str, channel_type: ChannelType) -> None:
+    async def _send_typing_safe(
+        self, channel_id: str, channel_type: ChannelType
+    ) -> None:
         if not self._http_session:
             return
         try:
             outbound_channel_id = self._outbound_channel_id(channel_id, channel_type)
             await api.send_typing(
-                self._http_session, self._api_url, self._bot_token,
-                channel_id=outbound_channel_id, channel_type=channel_type,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=outbound_channel_id,
+                channel_type=channel_type,
                 on_behalf_of=self.on_behalf_of,
             )
         except Exception as e:
@@ -3307,27 +3492,35 @@ class OctoAdapter(BasePlatformAdapter):
         ):
             return
         try:
-            await api.send_heartbeat(
-                self._http_session, self._api_url, self._bot_token
-            )
+            await api.send_heartbeat(self._http_session, self._api_url, self._bot_token)
         except api.OctoApiError as exc:
             status = exc.status
             if status == 404:
                 # Compatibility mode for deployments that have not rolled out
                 # the route yet: WS liveness remains authoritative.
                 self._http_heartbeat_disabled = True
-                logger.info("[%s] HTTP heartbeat unavailable (404); using WS only", self.name)
+                logger.info(
+                    "[%s] HTTP heartbeat unavailable (404); using WS only", self.name
+                )
             elif status == 429 or (status is not None and status >= 500):
-                logger.debug("[%s] transient HTTP heartbeat failure (%s)", self.name, status)
+                logger.debug(
+                    "[%s] transient HTTP heartbeat failure (%s)", self.name, status
+                )
             else:
                 # Authentication/other 4xx are terminal for this optional
                 # heartbeat feature. Avoid retry storms while preserving the
                 # already-established WS connection lifecycle.
                 self._http_heartbeat_disabled = True
-                logger.warning("[%s] HTTP heartbeat disabled after HTTP %s", self.name, status)
+                logger.warning(
+                    "[%s] HTTP heartbeat disabled after HTTP %s", self.name, status
+                )
         except Exception as exc:
             # Transport failures are transient and retry on the next interval.
-            logger.debug("[%s] transient HTTP heartbeat failure (%s)", self.name, type(exc).__name__)
+            logger.debug(
+                "[%s] transient HTTP heartbeat failure (%s)",
+                self.name,
+                type(exc).__name__,
+            )
 
     # ── Reconnection ──────────────────────────────────────────────────────
 
@@ -3346,7 +3539,8 @@ class OctoAdapter(BasePlatformAdapter):
                     if removed:
                         logger.info(
                             "[%s] cache cleanup: evicted %d inactive channel(s)",
-                            self.name, removed,
+                            self.name,
+                            removed,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -3387,8 +3581,7 @@ class OctoAdapter(BasePlatformAdapter):
                 self._http_session, self._api_url, self._bot_token
             )
         except Exception as e:
-            logger.warning("[%s] prefetch: fetch_bot_groups failed: %s",
-                           self.name, e)
+            logger.warning("[%s] prefetch: fetch_bot_groups failed: %s", self.name, e)
             return
 
         snapshot_group_ids: set[str] = set()
@@ -3429,7 +3622,10 @@ class OctoAdapter(BasePlatformAdapter):
             self._hydrate_md_cache_from_disk(gid)
             try:
                 md = await api.get_group_md(
-                    self._http_session, self._api_url, self._bot_token, gid,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    gid,
                 )
                 if generation != self._group_scope_generation(gid):
                     continue
@@ -3444,15 +3640,19 @@ class OctoAdapter(BasePlatformAdapter):
             except Exception as e:
                 if generation != self._group_scope_generation(gid):
                     continue
-                logger.debug("[%s] prefetch GROUP.md for %s skipped: %s",
-                             self.name, gid, e)
+                logger.debug(
+                    "[%s] prefetch GROUP.md for %s skipped: %s", self.name, gid, e
+                )
 
             # Member list prefetch — best effort; fills uid↔name maps so
             # the first @-mention in this group doesn't have to do a
             # blocking refresh.
             try:
                 members = await api.get_group_members(
-                    self._http_session, self._api_url, self._bot_token, gid,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    gid,
                 )
                 if generation != self._group_scope_generation(gid):
                     continue
@@ -3465,13 +3665,17 @@ class OctoAdapter(BasePlatformAdapter):
             except Exception as e:
                 if generation != self._group_scope_generation(gid):
                     continue
-                logger.debug("[%s] prefetch members for %s skipped: %s",
-                             self.name, gid, e)
+                logger.debug(
+                    "[%s] prefetch members for %s skipped: %s", self.name, gid, e
+                )
 
         if groups:
             logger.info(
                 "[%s] prefetch complete: %d groups, %d GROUP.md cached, %d member names",
-                self.name, len(groups), md_count, member_count,
+                self.name,
+                len(groups),
+                md_count,
+                member_count,
             )
 
     def _evict_group_membership_cache(self, group_no: str) -> None:
@@ -3497,30 +3701,22 @@ class OctoAdapter(BasePlatformAdapter):
             self._group_md_cache,
             self._chat_kind,
             self._cache_activity,
-            self._active_streams,
-            # A first-frame send owns its per-chat lock before it can publish
-            # active stream state. Include those locks so eviction waits for
-            # the transition and removes any state committed at its end.
-            self._stream_locks,
         ):
             scoped_keys.update(
                 key for key in mapping if key == group_no or key.startswith(prefix)
             )
         scoped_keys.update(
-            key for key in self._group_md_checked
+            key
+            for key in self._group_md_checked
             if key == group_no or key.startswith(prefix)
         )
         for key in scoped_keys:
-            async with self._stream_lock_for(key):
-                stream = self._active_streams.pop(key, None)
-                if stream:
-                    self._cancel_stream_timeout(stream)
-                self._group_histories.pop(key, None)
-                self._group_md_cache.pop(key, None)
-                self._group_md_checked.discard(key)
-                self._chat_kind.pop(key, None)
-                self._cache_activity.pop(key, None)
-                self._delete_md_from_disk(key)
+            self._group_histories.pop(key, None)
+            self._group_md_cache.pop(key, None)
+            self._group_md_checked.discard(key)
+            self._chat_kind.pop(key, None)
+            self._cache_activity.pop(key, None)
+            self._delete_md_from_disk(key)
 
     def _cleanup_caches(self) -> int:
         """Evict per-channel state for channels untouched for > CACHE_MAX_AGE_S.
@@ -3560,14 +3756,14 @@ class OctoAdapter(BasePlatformAdapter):
         """Start one owned reconnect task and retain it for shutdown."""
         if not self._need_reconnect:
             return None
-        current = getattr(self, "_reconnect_task", None)
+        current = self._reconnect_task
         if current and not current.done():
             return current
         task = asyncio.create_task(self._schedule_reconnect())
         self._reconnect_task = task
 
         def _clear(done: asyncio.Task[Any]) -> None:
-            if getattr(self, "_reconnect_task", None) is done:
+            if self._reconnect_task is done:
                 self._reconnect_task = None
 
         task.add_done_callback(_clear)
@@ -3588,7 +3784,7 @@ class OctoAdapter(BasePlatformAdapter):
         self._reconnect_in_progress = True
         try:
             exponential = min(
-                RECONNECT_BASE_DELAY * (2 ** self._reconnect_attempts),
+                RECONNECT_BASE_DELAY * (2**self._reconnect_attempts),
                 RECONNECT_MAX_DELAY,
             )
             # Jitter the exponential delay (±25%) AND add a flat stagger drawn
@@ -3599,8 +3795,12 @@ class OctoAdapter(BasePlatformAdapter):
             delay = exponential * (0.75 + random.random() * 0.5)
             delay += random.random() * RECONNECT_STAGGER_MAX_S
             self._reconnect_attempts += 1
-            logger.info("[%s] Reconnecting in %.1fs (attempt %d)...",
-                        self.name, delay, self._reconnect_attempts)
+            logger.info(
+                "[%s] Reconnecting in %.1fs (attempt %d)...",
+                self.name,
+                delay,
+                self._reconnect_attempts,
+            )
             await asyncio.sleep(delay)
             if not self._need_reconnect:
                 return
@@ -3622,7 +3822,7 @@ class OctoAdapter(BasePlatformAdapter):
                     # Reset the in-progress flag BEFORE re-scheduling so the
                     # next attempt's dedup check sees a clear lane.
                     self._reconnect_in_progress = False
-                    if getattr(self, "_reconnect_task", None) is asyncio.current_task():
+                    if self._reconnect_task is asyncio.current_task():
                         self._reconnect_task = None
                     self._spawn_reconnect_task()
                     return
@@ -3653,20 +3853,11 @@ class OctoAdapter(BasePlatformAdapter):
             return ChannelType.DM
         return ChannelType.Group
 
-    def _outbound_channel_id(
-        self, chat_id: str, channel_type: ChannelType
-    ) -> str:
+    def _outbound_channel_id(self, chat_id: str, channel_type: ChannelType) -> str:
         """Map a Hermes session ID to the wire ID expected by Octo."""
         if channel_type == ChannelType.DM:
             return self._space_dm_targets.get(chat_id, _extract_base_uid(chat_id))
         return chat_id
-
-    def _stream_lock_for(self, chat_id: str) -> asyncio.Lock:
-        lock = self._stream_locks.get(chat_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._stream_locks[chat_id] = lock
-        return lock
 
     async def send(
         self,
@@ -3679,288 +3870,13 @@ class OctoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         if not _OCTO_CHAT_ID_RE.fullmatch(str(chat_id)):
-            return SendResult(success=False, error=f"invalid chat_id format: {chat_id!r}")
+            return SendResult(
+                success=False, error=f"invalid chat_id format: {chat_id!r}"
+            )
 
         channel_type = self._resolve_channel_type(chat_id, metadata)
 
-        async with self._stream_lock_for(chat_id):
-            # ``metadata.no_stream`` is the only direct-send opt-out. Streaming
-            # replies ignore reply_to because the gateway passes the initial reply
-            # ID on the first frame; preserving it here would fragment one logical
-            # server-backed stream into separate messages.
-            if metadata and metadata.get("no_stream"):
-                return await self._send_normal(chat_id, content, channel_type, reply_to)
-
-            # Everything else uses one server-backed stream per chat. The first
-            # frame creates the Octo message; subsequent frames edit that message;
-            # true idle finalizes it.
-            return await self._buffer_streamed(chat_id, content, channel_type)
-
-    async def _buffer_streamed(
-        self,
-        chat_id: str,
-        content: str,
-        channel_type: ChannelType,
-    ) -> SendResult:
-        """Create or update one server-backed message for a streamed response.
-
-        The first frame is sent immediately so ``success=True`` always means
-        Octo accepted a real message and returned its identity. Follow-on
-        segments edit that same message. Local state is committed only after
-        the server accepts the edit, so failures preserve the last confirmed
-        body for retry/finalization.
-        """
-        cleaned = self._strip_hermes_cursor(content)
-        state = self._active_streams.get(chat_id)
-
-        if state is None:
-            if self._disconnecting:
-                return SendResult(success=False, error="Not connected")
-            creation_task = asyncio.current_task()
-            if creation_task is not None:
-                self._stream_creation_tasks.add(creation_task)
-            try:
-                result = await self._send_normal(
-                    chat_id,
-                    cleaned,
-                    channel_type,
-                    None,
-                    allow_chunking=False,
-                )
-                if not result.success or not result.message_id:
-                    return result
-                state = {
-                    "message_id": result.message_id,
-                    "channel_type": channel_type,
-                    "segments": [],
-                    "current_segment": cleaned,
-                    "flush_task": None,
-                    "finalize_attempts": 0,
-                }
-                self._active_streams[chat_id] = state
-                self._arm_stream_timeout(chat_id, result.message_id)
-                return result
-            finally:
-                if creation_task is not None:
-                    self._stream_creation_tasks.discard(creation_task)
-
-        self._cancel_stream_timeout(state)
-        candidate_segments = list(state.get("segments", []))
-        if state.get("current_segment"):
-            candidate_segments.append(state["current_segment"])
-        candidate = {
-            **state,
-            "channel_type": channel_type,
-            "segments": candidate_segments,
-            "current_segment": cleaned,
-            "flush_task": None,
-        }
-        try:
-            result = await self._edit_stream_on_server(
-                chat_id,
-                candidate,
-                finalize=False,
-            )
-        except asyncio.CancelledError:
-            if (
-                not self._disconnecting
-                and self._active_streams.get(chat_id) is state
-            ):
-                self._arm_stream_timeout(chat_id, state["message_id"])
-            raise
-        if not result.success:
-            self._arm_stream_timeout(chat_id, state["message_id"])
-            return result
-
-        state.update(
-            channel_type=channel_type,
-            segments=candidate_segments,
-            current_segment=cleaned,
-            finalize_attempts=0,
-        )
-        self._arm_stream_timeout(chat_id, state["message_id"])
-        return result
-
-    async def _edit_stream_on_server(
-        self,
-        chat_id: str,
-        state: dict[str, Any],
-        *,
-        finalize: bool,
-    ) -> SendResult:
-        """Apply one candidate stream body without mutating local state."""
-        if not self._http_session:
-            return SendResult(success=False, error="Not connected")
-        message_id = state.get("message_id")
-        channel_type = state.get("channel_type")
-        if not message_id or channel_type is None:
-            return SendResult(success=False, error="Missing stream message identity")
-        body = self._joined_buffer(state)
-        outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-        try:
-            raw_response = await api.edit_message(
-                self._http_session,
-                self._api_url,
-                self._bot_token,
-                channel_id=outbound_channel_id,
-                channel_type=channel_type,
-                message_id=message_id,
-                content=body,
-                finalize=finalize,
-                on_behalf_of=self.on_behalf_of,
-            )
-        except Exception as exc:
-            logger.error(
-                "[%s] stream message edit failed (%s)",
-                self.name,
-                type(exc).__name__,
-            )
-            return SendResult(success=False, error="Octo API edit failed")
-        return SendResult(
-            success=True,
-            message_id=message_id,
-            raw_response=raw_response,
-        )
-
-    async def edit_message(
-        self,
-        chat_id: str,
-        message_id: str | None,
-        content: str,
-        *,
-        finalize: bool = False,
-    ) -> SendResult:
-        async with self._stream_lock_for(chat_id):
-            return await self._edit_message_locked(
-                chat_id,
-                message_id,
-                content,
-                finalize=finalize,
-            )
-
-    async def _edit_message_locked(
-        self,
-        chat_id: str,
-        message_id: str | None,
-        content: str,
-        *,
-        finalize: bool = False,
-    ) -> SendResult:
-        """Update the in-progress segment while holding the per-chat lock.
-
-        Non-finalize edits replace ``current_segment``. finalize=True closes
-        ``current_segment`` into ``segments`` (the segment is "done"), but
-        does NOT flush — the flush waits until STREAM_FLUSH_DELAY_S of true
-        idle, so a follow-on segment (next LLM round) can join the buffer.
-        """
-        if not self._http_session:
-            return SendResult(success=False, error="Not connected")
-
-        state = self._active_streams.get(chat_id)
-        if not state or (message_id is not None and state.get("message_id") != message_id):
-            if message_id is None:
-                return SendResult(
-                    success=False,
-                    error="No server message identity available for edit",
-                )
-            channel_type = self._resolve_channel_type(chat_id)
-            outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-            try:
-                raw_response = await api.edit_message(
-                    self._http_session,
-                    self._api_url,
-                    self._bot_token,
-                    channel_id=outbound_channel_id,
-                    channel_type=channel_type,
-                    message_id=message_id,
-                    content=content,
-                    finalize=finalize,
-                    on_behalf_of=self.on_behalf_of,
-                )
-            except Exception as exc:
-                logger.error(
-                    "[%s] native message edit failed (%s)",
-                    self.name,
-                    type(exc).__name__,
-                )
-                return SendResult(success=False, error="Octo API edit failed")
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response=raw_response,
-            )
-
-        self._cancel_stream_timeout(state)
-        candidate_segments = list(state.get("segments", []))
-        cleaned = self._strip_hermes_cursor(content)
-
-        if finalize:
-            if cleaned:
-                candidate_segments.append(cleaned)
-            candidate_current = ""
-        else:
-            candidate_current = cleaned
-
-        candidate = {
-            **state,
-            "segments": candidate_segments,
-            "current_segment": candidate_current,
-            "flush_task": None,
-        }
-        try:
-            result = await self._edit_stream_on_server(
-                chat_id,
-                candidate,
-                # A Hermes segment boundary is not necessarily the final answer;
-                # the idle watchdog performs the protocol-level finalize.
-                finalize=False,
-            )
-        except asyncio.CancelledError:
-            if (
-                not self._disconnecting
-                and self._active_streams.get(chat_id) is state
-            ):
-                self._arm_stream_timeout(chat_id, state["message_id"])
-            raise
-        if not result.success:
-            self._arm_stream_timeout(chat_id, state["message_id"])
-            return result
-
-        state.update(
-            segments=candidate_segments,
-            current_segment=candidate_current,
-            finalize_attempts=0,
-        )
-        self._arm_stream_timeout(chat_id, state["message_id"])
-        return result
-
-    def _arm_stream_timeout(
-        self,
-        chat_id: str,
-        message_id: str,
-        *,
-        delay_s: float = STREAM_FLUSH_DELAY_S,
-    ) -> None:
-        """Re-arm protocol-level finalization after stream inactivity/backoff."""
-        state = self._active_streams.get(chat_id)
-        if not state or state.get("message_id") != message_id:
-            return
-        self._cancel_stream_timeout(state)
-        try:
-            task = asyncio.create_task(
-                self._close_stream_after_idle(chat_id, message_id, delay_s=delay_s)
-            )
-        except RuntimeError:
-            return
-        state["flush_task"] = task
-
-    @staticmethod
-    def _cancel_stream_timeout(state: dict) -> None:
-        task = state.get("flush_task")
-        current = asyncio.current_task()
-        if task and task is not current and not task.done():
-            task.cancel()
-        state["flush_task"] = None
+        return await self._send_normal(chat_id, content, channel_type, reply_to)
 
     @staticmethod
     def _strip_hermes_cursor(content: str) -> str:
@@ -3974,113 +3890,24 @@ class OctoAdapter(BasePlatformAdapter):
             content = content.replace(bare, "")
         return content
 
-    @staticmethod
-    def _joined_buffer(state: dict) -> str:
-        """Concatenate finalized segments + current segment into one body.
-
-        Segments are joined as-is (no separator) — each segment is a complete
-        LLM accumulation that already starts/ends with whatever whitespace
-        the model emitted. Adding artificial separators would distort the
-        markdown structure (e.g. mid-list `\\n\\n` would close a list).
-        """
-        parts = list(state.get("segments", []))
-        cur = state.get("current_segment", "")
-        if cur:
-            parts.append(cur)
-        return "".join(parts)
-
-    async def _close_stream_after_idle(
-        self,
-        chat_id: str,
-        message_id: str,
-        *,
-        delay_s: float = STREAM_FLUSH_DELAY_S,
-    ) -> None:
-        """Finalize a server-backed message after idle or retry backoff."""
-        try:
-            await asyncio.sleep(delay_s)
-            async with self._stream_lock_for(chat_id):
-                state = self._active_streams.get(chat_id)
-                if not state or state.get("message_id") != message_id:
-                    return
-                body = self._joined_buffer(state)
-                if not body or state.get("channel_type") is None:
-                    self._active_streams.pop(chat_id, None)
-                    return
-                result = await self._edit_stream_on_server(
-                    chat_id,
-                    state,
-                    finalize=True,
-                )
-                if result.success:
-                    if self._active_streams.get(chat_id) is state:
-                        self._active_streams.pop(chat_id, None)
-                    return
-
-                attempts = int(state.get("finalize_attempts", 0)) + 1
-                state["finalize_attempts"] = attempts
-                if attempts >= STREAM_FINALIZE_MAX_ATTEMPTS:
-                    logger.error(
-                        "[%s] dropping stale stream after %d finalize failures",
-                        self.name,
-                        attempts,
-                    )
-                    if self._active_streams.get(chat_id) is state:
-                        self._active_streams.pop(chat_id, None)
-                    return
-                retry_delay = STREAM_FINALIZE_RETRY_BASE_S * (2 ** (attempts - 1))
-                self._arm_stream_timeout(
-                    chat_id,
-                    message_id,
-                    delay_s=retry_delay,
-                )
-        except asyncio.CancelledError:
-            return
-
-    async def _close_active_stream(self, chat_id: str) -> None:
-        """Flush one chat while holding its transition lock."""
-        async with self._stream_lock_for(chat_id):
-            state = self._active_streams.get(chat_id)
-            if not state:
-                return
-            self._cancel_stream_timeout(state)
-            body = self._joined_buffer(state)
-            if not body or state.get("channel_type") is None:
-                self._active_streams.pop(chat_id, None)
-                return
-            result = await self._edit_stream_on_server(
-                chat_id,
-                state,
-                finalize=True,
-            )
-            if result.success and self._active_streams.get(chat_id) is state:
-                self._active_streams.pop(chat_id, None)
-
     async def _send_normal(
         self,
         chat_id: str,
         content: str,
         channel_type: ChannelType,
         reply_to: str | None = None,
-        *,
-        allow_chunking: bool = True,
     ) -> SendResult:
         if not self._http_session:
             return SendResult(success=False, error="Not connected")
         content = self._strip_hermes_cursor(content)
         outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
         chunks = self.truncate_message(content, MAX_MESSAGE_LENGTH)
-        if not allow_chunking and len(chunks) != 1:
-            return SendResult(
-                success=False,
-                error=(
-                    "Stream frame exceeds Octo single-message limit; "
-                    "no server message was created"
-                ),
-            )
         logger.debug(
             "[%s] _send_normal chat=%s chunks=%d total=%d",
-            self.name, chat_id[:8], len(chunks), len(content),
+            self.name,
+            chat_id[:8],
+            len(chunks),
+            len(content),
         )
         # Thread membership is changed only through the explicit owner-only
         # management actions; sending must not perform a hidden join/leave.
@@ -4095,17 +3922,32 @@ class OctoAdapter(BasePlatformAdapter):
                 send_uids: list[str] | None = None
                 send_entities: list | None = None
                 structured = parse_structured_mentions(chunk)
-                if structured:
-                    send_content, send_entities, send_uids = convert_structured_mentions(
-                        chunk, structured,
+                valid_uids = None
+                if channel_type in _GROUP_CHANNEL_TYPES:
+                    parent_group_no = chat_id.split("____", 1)[0]
+                    valid_uids = set(
+                        self._group_member_rosters.get(parent_group_no, {})
                     )
-                client_msg_no = str(uuid.uuid4())
+                if structured:
+                    send_content, send_entities, send_uids = (
+                        convert_structured_mentions(
+                            chunk,
+                            structured,
+                            valid_uids,
+                        )
+                    )
+                chunk_client_msg_no = str(uuid.uuid4())
                 last_send_result = await api.send_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
-                    content=send_content, reply_msg_id=reply_to,
-                    mention_uids=send_uids, mention_entities=send_entities,
-                    client_msg_no=client_msg_no,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
+                    content=send_content,
+                    reply_msg_id=reply_to,
+                    mention_uids=send_uids,
+                    mention_entities=send_entities,
+                    client_msg_no=chunk_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
             if last_send_result is None:
@@ -4129,7 +3971,6 @@ class OctoAdapter(BasePlatformAdapter):
             chat_id, metadata if isinstance(metadata, dict) else None
         )
         await self._send_typing_safe(chat_id, channel_type)
-
 
     async def _load_outbound_media(
         self,
@@ -4209,8 +4050,11 @@ class OctoAdapter(BasePlatformAdapter):
                 send_entities: list | None = None
                 structured = parse_structured_mentions(caption)
                 if structured:
-                    caption_text, send_entities, send_uids = convert_structured_mentions(
-                        caption, structured,
+                    caption_text, send_entities, send_uids = (
+                        convert_structured_mentions(
+                            caption,
+                            structured,
+                        )
                     )
                 blocks = [
                     RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=caption_text),
@@ -4223,8 +4067,11 @@ class OctoAdapter(BasePlatformAdapter):
                 ]
                 client_msg_no = str(uuid.uuid4())
                 send_result = await api.send_rich_text_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
                     blocks=blocks,
                     plain=f"{caption_text}{RICH_TEXT_IMAGE_PLACEHOLDER}",
                     mention_uids=send_uids,
@@ -4237,10 +4084,15 @@ class OctoAdapter(BasePlatformAdapter):
 
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
-                self._http_session, self._api_url, self._bot_token,
-                channel_id=outbound_channel_id, channel_type=channel_type,
-                msg_type=OctoMessageType.Image, url=final_url,
-                width=width, height=height,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=outbound_channel_id,
+                channel_type=channel_type,
+                msg_type=OctoMessageType.Image,
+                url=final_url,
+                width=width,
+                height=height,
                 reply_msg_id=reply_to,
                 client_msg_no=media_client_msg_no,
                 on_behalf_of=self.on_behalf_of,
@@ -4248,8 +4100,11 @@ class OctoAdapter(BasePlatformAdapter):
             if caption:
                 caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
                     content=caption,
                     reply_msg_id=reply_to,
                     client_msg_no=caption_client_msg_no,
@@ -4274,9 +4129,7 @@ class OctoAdapter(BasePlatformAdapter):
         try:
             metadata = _merged_media_metadata(kwargs)
             channel_type = self._resolve_channel_type(chat_id, metadata)
-            _media_metadata_fields(
-                metadata, allowed=frozenset(), media_name="file"
-            )
+            _media_metadata_fields(metadata, allowed=frozenset(), media_name="file")
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
             file_data, content_type, filename = await self._load_outbound_media(
                 file_path
@@ -4286,15 +4139,24 @@ class OctoAdapter(BasePlatformAdapter):
                 filename = file_name
 
             uploaded_url = await api.upload_and_get_url(
-                self._http_session, self._api_url, self._bot_token,
-                filename, file_data, content_type,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                filename,
+                file_data,
+                content_type,
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
-                self._http_session, self._api_url, self._bot_token,
-                channel_id=outbound_channel_id, channel_type=channel_type,
-                msg_type=OctoMessageType.File, url=uploaded_url,
-                name=filename, size=len(file_data),
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=outbound_channel_id,
+                channel_type=channel_type,
+                msg_type=OctoMessageType.File,
+                url=uploaded_url,
+                name=filename,
+                size=len(file_data),
                 reply_msg_id=reply_to,
                 client_msg_no=media_client_msg_no,
                 on_behalf_of=self.on_behalf_of,
@@ -4302,9 +4164,13 @@ class OctoAdapter(BasePlatformAdapter):
             if caption:
                 caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
-                    content=caption, reply_msg_id=reply_to,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
+                    content=caption,
+                    reply_msg_id=reply_to,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4334,24 +4200,38 @@ class OctoAdapter(BasePlatformAdapter):
                 audio_path
             )
             uploaded_url = await api.upload_and_get_url(
-                self._http_session, self._api_url, self._bot_token,
-                filename, file_data, content_type,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                filename,
+                file_data,
+                content_type,
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
-                self._http_session, self._api_url, self._bot_token,
-                channel_id=outbound_channel_id, channel_type=channel_type,
-                msg_type=OctoMessageType.Voice, url=uploaded_url, name=filename,
-                duration=media_metadata.get("duration"), reply_msg_id=reply_to,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=outbound_channel_id,
+                channel_type=channel_type,
+                msg_type=OctoMessageType.Voice,
+                url=uploaded_url,
+                name=filename,
+                duration=media_metadata.get("duration"),
+                reply_msg_id=reply_to,
                 client_msg_no=media_client_msg_no,
                 on_behalf_of=self.on_behalf_of,
             )
             if caption:
                 caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
-                    content=caption, reply_msg_id=reply_to,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
+                    content=caption,
+                    reply_msg_id=reply_to,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4383,14 +4263,23 @@ class OctoAdapter(BasePlatformAdapter):
                 video_path
             )
             uploaded_url = await api.upload_and_get_url(
-                self._http_session, self._api_url, self._bot_token,
-                filename, file_data, content_type,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                filename,
+                file_data,
+                content_type,
             )
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
-                self._http_session, self._api_url, self._bot_token,
-                channel_id=outbound_channel_id, channel_type=channel_type,
-                msg_type=OctoMessageType.Video, url=uploaded_url, name=filename,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                channel_id=outbound_channel_id,
+                channel_type=channel_type,
+                msg_type=OctoMessageType.Video,
+                url=uploaded_url,
+                name=filename,
                 width=media_metadata.get("width"),
                 height=media_metadata.get("height"),
                 duration=media_metadata.get("duration"),
@@ -4401,9 +4290,13 @@ class OctoAdapter(BasePlatformAdapter):
             if caption:
                 caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
-                    self._http_session, self._api_url, self._bot_token,
-                    channel_id=outbound_channel_id, channel_type=channel_type,
-                    content=caption, reply_msg_id=reply_to,
+                    self._http_session,
+                    self._api_url,
+                    self._bot_token,
+                    channel_id=outbound_channel_id,
+                    channel_type=channel_type,
+                    content=caption,
+                    reply_msg_id=reply_to,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4417,7 +4310,10 @@ class OctoAdapter(BasePlatformAdapter):
             return {"name": chat_id, "type": "group", "chat_id": chat_id}
         try:
             info = await api.get_group_info(
-                self._http_session, self._api_url, self._bot_token, group_no=chat_id,
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                group_no=chat_id,
             )
             return {
                 "name": info.name,
@@ -4479,6 +4375,7 @@ def register(ctx) -> None:
                 TOOL_SCHEMA,
                 octo_management_handler,
             )
+
             ctx.register_tool(
                 name="octo_management",
                 toolset="octo",
@@ -4549,8 +4446,10 @@ def register(ctx) -> None:
     if _bot_configured:
         try:
             from .card_progress import (
+                on_post_api_request,
                 on_post_llm_call,
                 on_post_tool_call,
+                on_pre_api_request,
                 on_pre_llm_call,
                 on_pre_tool_call,
                 on_session_end,
@@ -4561,6 +4460,8 @@ def register(ctx) -> None:
             progress_hooks = (
                 ("pre_llm_call", on_pre_llm_call),
                 ("post_llm_call", on_post_llm_call),
+                ("pre_api_request", on_pre_api_request),
+                ("post_api_request", on_post_api_request),
                 ("pre_tool_call", on_pre_tool_call),
                 ("post_tool_call", on_post_tool_call),
                 ("on_session_end", on_session_end),
@@ -4581,6 +4482,7 @@ def register(ctx) -> None:
     if _bot_configured:
         try:
             from pathlib import Path
+
             skill_path = Path(__file__).parent / "skills" / "octo-bot-api" / "SKILL.md"
             if skill_path.exists():
                 ctx.register_skill(
@@ -4603,6 +4505,7 @@ def register(ctx) -> None:
     if _bot_configured:
         try:
             from .commands import register_all as _register_commands
+
             _register_commands(ctx)
         except Exception as e:
             logger.warning("[Octo] slash command registration failed: %s", e)

@@ -87,6 +87,32 @@ async def test_ai_broadcast_or_explicit_bot_uid_activates_the_bot(mention):
 
 
 @pytest.mark.asyncio
+async def test_eligible_inbound_rolls_progress_before_gateway_busy_dispatch():
+    adapter = _inbound_adapter()
+    order: list[str] = []
+    adapter.handle_message = AsyncMock(side_effect=lambda _event: order.append("gateway"))
+    raw = (
+        b'{"type": 1, "content": "follow up", '
+        b'"mention": {"uids": ["bot-1"]}}'
+    )
+
+    with (
+        patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw),
+        patch(
+            "hermes_octo_plugin.card_progress.on_octo_inbound_message",
+            side_effect=lambda **_kwargs: order.append("progress"),
+        ) as rollover,
+    ):
+        await adapter._handle_recv(_group_recv(raw))
+
+    rollover.assert_called_once_with(
+        chat_id="group-1",
+        requester_uid="human-1",
+    )
+    assert order == ["progress", "gateway"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("robot_value", [True, None])
 async def test_relaxed_mention_gate_fails_closed_for_robot_or_unknown_sender(robot_value):
     adapter = _inbound_adapter()

@@ -29,6 +29,7 @@ def test_constructor_reads_transport_and_event_poll_overrides():
                 "event_poll_interval_s": 3.5,
                 "event_poll_wait_s": 12,
                 "event_poll_limit": 80,
+                "progress_card_renderer": "registry",
             }
         )
     )
@@ -38,6 +39,20 @@ def test_constructor_reads_transport_and_event_poll_overrides():
     assert adapter._event_poll_interval_s == 3.5
     assert adapter._event_poll_wait_s == 12
     assert adapter._event_poll_limit == 80
+    assert adapter.progress_card_renderer == "registry"
+
+
+def test_constructor_defaults_progress_cards_to_local_renderer():
+    adapter = OctoAdapter(SimpleNamespace(extra={}))
+
+    assert adapter.progress_card_renderer == "local"
+
+
+def test_constructor_rejects_unknown_progress_card_renderer():
+    with pytest.raises(ValueError, match="progress_card_renderer"):
+        OctoAdapter(
+            SimpleNamespace(extra={"progress_card_renderer": "automatic"})
+        )
 
 
 

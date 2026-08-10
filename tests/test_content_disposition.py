@@ -214,3 +214,75 @@ class TestPresignedUpload:
             content_type="text/plain",
         )
         put_file.assert_awaited_once()
+
+
+    @pytest.mark.asyncio
+    async def test_presign_private_storage_origin_is_narrowly_trusted_with_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        session = MagicMock()
+        session.connector._ssrf_resolver._trusted_hosts = {"api.internal"}
+        presign = {
+            "uploadUrl": "http://minio.internal/upload?signature=secret",
+            "downloadUrl": "http://cdn.internal/report.txt",
+            "contentType": "text/plain",
+        }
+
+        async def assert_trusted(active_session, **_kwargs):
+            assert active_session.connector._ssrf_resolver._trusted_hosts == {
+                "api.internal",
+                "minio.internal",
+            }
+            return presign["downloadUrl"]
+
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                side_effect=assert_trusted,
+            ),
+        ):
+            result = await upload_and_get_url(
+                session,
+                "http://api.internal",
+                "bot-token",
+                "report.txt",
+                b"data",
+                "text/plain",
+            )
+
+        assert result == presign["downloadUrl"]
+
+    @pytest.mark.asyncio
+    async def test_presign_metadata_upload_origin_is_never_trusted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        session = MagicMock()
+        session.connector._ssrf_resolver._trusted_hosts = {"api.internal"}
+        presign = {
+            "uploadUrl": "http://169.254.169.254/latest/meta-data/",
+            "downloadUrl": "http://cdn.internal/report.txt",
+            "contentType": "text/plain",
+        }
+        with patch(
+            "hermes_octo_plugin.api.get_upload_presign",
+            AsyncMock(return_value=presign),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    session,
+                    "http://api.internal",
+                    "bot-token",
+                    "report.txt",
+                    b"data",
+                    "text/plain",
+                )
+
+        assert session.connector._ssrf_resolver._trusted_hosts == {"api.internal"}

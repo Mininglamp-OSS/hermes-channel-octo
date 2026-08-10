@@ -330,7 +330,7 @@ async def test_cancellation_while_draining_reconnect_still_finishes_disconnect()
 
 
 @pytest.mark.asyncio
-async def test_disconnect_stops_card_event_poller_before_stream_drain():
+async def test_disconnect_stops_card_event_poller() -> None:
     a = _make_adapter()
     a._reconnect_task = None
     a._heartbeat_task = None
@@ -339,26 +339,15 @@ async def test_disconnect_stops_card_event_poller_before_stream_drain():
     a._cache_cleanup_task = None
     a._prefetch_task = None
     a._ws = None
-    a._mark_disconnected = MagicMock()
     a._http_session = None
-    a._active_streams = {"group-1": {}}
+    a._mark_disconnected = MagicMock()
     poller = MagicMock()
     a._event_poller = poller
     a._event_task = None
-    entered_flush = asyncio.Event()
-    release_flush = asyncio.Event()
 
-    async def blocking_flush(_chat_id):
-        entered_flush.set()
-        await release_flush.wait()
+    await a.disconnect()
 
-    a._close_active_stream = blocking_flush  # type: ignore[method-assign]
-    task = asyncio.create_task(a.disconnect())
-    await entered_flush.wait()
-
-    assert poller.stop.called
-    release_flush.set()
-    await task
+    poller.stop.assert_called()
 
 
 @pytest.mark.asyncio
@@ -389,43 +378,6 @@ async def test_disconnect_cancels_prefetch_before_closing_session():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_disconnect_still_closes_owned_http_session():
-    a = _make_adapter()
-    a._need_reconnect = True
-    a._connected = True
-    a._reconnect_task = None
-    a._heartbeat_task = None
-    a._http_heartbeat_task = None
-    a._recv_task = None
-    a._cache_cleanup_task = None
-    a._ws = None
-    a._mark_disconnected = MagicMock()
-    a._active_streams = {"group-1": {}}
-
-    session = MagicMock()
-    session.close = AsyncMock()
-    a._http_session = session
-    entered_flush = asyncio.Event()
-    block_flush = asyncio.Event()
-
-    async def blocking_flush(chat_id):
-        del chat_id
-        entered_flush.set()
-        await block_flush.wait()
-
-    a._close_active_stream = blocking_flush  # type: ignore[method-assign]
-
-    task = asyncio.create_task(a.disconnect())
-    await entered_flush.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    session.close.assert_awaited_once()
-    assert a._http_session is None
-
-
-@pytest.mark.asyncio
 async def test_repeated_disconnect_cancellation_cannot_cancel_transport_cleanup():
     a = _make_adapter()
     a._reconnect_task = None
@@ -435,7 +387,6 @@ async def test_repeated_disconnect_cancellation_cannot_cancel_transport_cleanup(
     a._cache_cleanup_task = None
     a._prefetch_task = None
     a._ws = None
-    a._active_streams = {}
     a._mark_disconnected = MagicMock()
     close_entered = asyncio.Event()
     release_close = asyncio.Event()
@@ -497,8 +448,12 @@ async def test_reconnect_reschedules_on_connect_failure():
         spawned.append(task)
         return task
 
-    with patch("hermes_octo_plugin.adapter.asyncio.sleep", new=AsyncMock()), \
-         patch("hermes_octo_plugin.adapter.asyncio.create_task", new=capture_create_task):
+    with (
+        patch("hermes_octo_plugin.adapter.asyncio.sleep", new=AsyncMock()),
+        patch(
+            "hermes_octo_plugin.adapter.asyncio.create_task", new=capture_create_task
+        ),
+    ):
         await a._schedule_reconnect()
         # Drain the rescheduled task that was create_task'd.
         for t in spawned:
@@ -562,8 +517,10 @@ async def test_token_refresh_skipped_within_cooldown():
     # (e.g. fresh CI containers).
     a._last_token_refresh = time.monotonic() - (TOKEN_REFRESH_COOLDOWN_S + 10)
 
-    with patch("hermes_octo_plugin.adapter.api.register_bot", new=fake_register_bot), \
-         patch.object(a, "_ws", None):
+    with (
+        patch("hermes_octo_plugin.adapter.api.register_bot", new=fake_register_bot),
+        patch.object(a, "_ws", None),
+    ):
         # Stop _do_connect at the registration call — anything beyond would
         # need a real WS. We only care about the force_refresh decision.
         try:
@@ -591,7 +548,10 @@ async def test_token_refresh_resumes_after_cooldown():
     async def fake_register_bot(_session, _api_url, _bot_token, *, force_refresh=False):
         refresh_calls.append(force_refresh)
         m = MagicMock()
-        m.robot_id = "bot"; m.owner_uid = "owner"; m.im_token = "t"; m.ws_url = "wss://e"
+        m.robot_id = "bot"
+        m.owner_uid = "owner"
+        m.im_token = "t"
+        m.ws_url = "wss://e"
         return m
 
     a._reconnect_attempts = 1

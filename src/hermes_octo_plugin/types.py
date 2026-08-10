@@ -14,6 +14,7 @@ from typing import Any
 
 class ChannelType(IntEnum):
     """Octo channel types."""
+
     DM = 1
     Group = 2
     CommunityTopic = 5  # Thread / sub-channel (子区)
@@ -21,6 +22,7 @@ class ChannelType(IntEnum):
 
 class MessageType(IntEnum):
     """Octo message content types."""
+
     Text = 1
     Image = 2
     GIF = 3
@@ -145,6 +147,7 @@ class RichTextBlock:
     the fields. Do NOT introduce `entities`/`offset`/`length` here — the
     RichText contract is deliberately positional, not offset-based.
     """
+
     type: str
     text: str | None = None
     url: str | None = None
@@ -178,6 +181,7 @@ class MentionEntity:
 
     offset/length units are UTF-16 code units (matching JS string.length).
     """
+
     uid: str
     offset: int
     length: int
@@ -186,6 +190,7 @@ class MentionEntity:
 @dataclass
 class MentionPayload:
     """Mention metadata attached to a message."""
+
     uids: list[str] | None = None
     entities: list[MentionEntity] | None = None
     all: bool | None = None  # True or 1 = @all
@@ -205,6 +210,7 @@ def _coerce_wire_bool(value: Any) -> bool | None:
 @dataclass
 class ReplyPayload:
     """Reply context for a message."""
+
     payload: dict[str, Any] | None = None
     from_uid: str | None = None
     from_name: str | None = None
@@ -218,6 +224,7 @@ class MessagePayload:
     The `type` field determines which other fields are populated.
     Additional unknown fields are captured in `extra`.
     """
+
     type: MessageType | int = MessageType.Text
     content: str | None = None
     url: str | None = None
@@ -237,8 +244,14 @@ class MessagePayload:
     def from_dict(cls, data: dict[str, Any]) -> MessagePayload:
         """Parse a MessagePayload from a raw dict (e.g. from JSON)."""
         known_keys = {
-            "type", "content", "url", "name",
-            "mention", "reply", "event", "plain",
+            "type",
+            "content",
+            "url",
+            "name",
+            "mention",
+            "reply",
+            "event",
+            "plain",
         }
         extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -275,7 +288,11 @@ class MessagePayload:
         try:
             msg_type = MessageType(raw_type)
         except (TypeError, ValueError):
-            msg_type = raw_type if isinstance(raw_type, int) and not isinstance(raw_type, bool) else -1
+            msg_type = (
+                raw_type
+                if isinstance(raw_type, int) and not isinstance(raw_type, bool)
+                else -1
+            )
 
         # RichText(=14): wire `content` is a list of blocks, and `plain`
         # is a top-level string. Legacy string-typed `content` on RichText
@@ -313,6 +330,7 @@ class BotMessage:
 
     Represents a fully decoded RECV packet with decrypted payload.
     """
+
     message_id: str
     message_seq: int
     from_uid: str
@@ -325,6 +343,7 @@ class BotMessage:
 @dataclass
 class BotRegisterResp:
     """Response from /v1/bot/register API."""
+
     robot_id: str
     im_token: str
     ws_url: str
@@ -336,6 +355,7 @@ class BotRegisterResp:
 @dataclass
 class SendMessageResult:
     """Response from /v1/bot/sendMessage API."""
+
     message_id: str | None = None
     message_seq: int | None = None
     client_msg_no: str | None = None
@@ -344,6 +364,7 @@ class SendMessageResult:
 @dataclass
 class GroupMember:
     """A member of a Octo group."""
+
     uid: str
     name: str
     role: str | None = None  # admin/member
@@ -353,6 +374,7 @@ class GroupMember:
 @dataclass
 class GroupInfo:
     """Basic group information."""
+
     group_no: str
     name: str
     extra: dict[str, Any] = field(default_factory=dict)

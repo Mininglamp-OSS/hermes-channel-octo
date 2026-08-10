@@ -7,8 +7,8 @@ Octo (WuKongIM-based corporate IM) channel plugin for
 
 Connects a hermes-agent gateway to an Octo bot via the WuKongIM binary
 WebSocket protocol (ECDH + AES). Supports bot-to-user DMs, group
-messaging, threads, `@`-mentions, voice / video / file attachments, and
-streaming responses.
+messaging, threads, `@`-mentions, and voice / video / file attachments.
+Hermes buffers text replies and sends one complete final message.
 
 ## Compatibility
 
@@ -88,6 +88,7 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_EVENT_POLL_INTERVAL_S` | no | Minimum event polling interval in seconds (default `2.0`, minimum `0.5`) |
 | `OCTO_EVENT_POLL_WAIT_S` | no | Event long-poll hold in seconds (default `25`, `0` disables, capped at `30`) |
 | `OCTO_EVENT_POLL_LIMIT` | no | Events requested per batch (default `50`, clamped to `1..100`) |
+| `OCTO_PROGRESS_CARD_RENDERER` | no | Progress-card renderer: `local` (default, Chinese Type-17 execution trace) or `registry` (server `ai.reasoning-process` template when advertised, otherwise local fallback) |
 
 ## Current-conversation tools
 

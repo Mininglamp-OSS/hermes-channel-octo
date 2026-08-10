@@ -10,7 +10,7 @@ from pathlib import Path
 import uuid
 from typing import Any
 
-import aiohttp
+
 
 from . import api, cards
 from .card_tools import (
@@ -218,6 +218,7 @@ def _positive_integer(value: object, field: str) -> int | None:
 
 
 async def _read_media_source(
+    session: Any,
     source: object,
     *,
     media_kind: str,
@@ -225,13 +226,11 @@ async def _read_media_source(
     if not isinstance(source, str) or not source or len(source) > _MAX_SOURCE_CHARS:
         raise ValueError("source must be a bounded URL or local path")
     if source.startswith(("http://", "https://")):
-        async with aiohttp.ClientSession() as download_session:
-            file_data, content_type, filename = await api.download_file(
-                download_session,
-                source,
-                max_size=_MAX_MEDIA_BYTES,
-                enforce_host_safety=False,
-            )
+        file_data, content_type, filename = await api.download_file(
+            session,
+            source,
+            max_size=_MAX_MEDIA_BYTES,
+        )
     else:
         file_data, filename = await asyncio.to_thread(
             api.read_local_media,
@@ -261,7 +260,7 @@ async def _upload_media(
     media_kind: str,
 ) -> tuple[str, bytes, str, str]:
     file_data, content_type, filename = await _read_media_source(
-        source, media_kind=media_kind
+        session, source, media_kind=media_kind
     )
     uploaded_url = await api.upload_and_get_url(
         session,
@@ -283,7 +282,10 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
     if not isinstance(raw_blocks, list) or not 0 < len(raw_blocks) <= _MAX_BLOCKS:
         return _error("blocks must contain 1-50 controlled RichText blocks")
     try:
-        async with _new_guarded_http_session(adapter._api_url) as session:
+        async with _new_guarded_http_session(
+            adapter._api_url,
+            adapter._cdn_url,
+        ) as session:
             blocks: list[RichTextBlock] = []
             plain_parts: list[str] = []
             failed_images = 0
@@ -375,7 +377,10 @@ async def _send_media(
             not isinstance(caption, str) or len(caption) > _MAX_TEXT_CHARS
         ):
             raise ValueError("caption must be bounded text")
-        async with _new_guarded_http_session(adapter._api_url) as session:
+        async with _new_guarded_http_session(
+            adapter._api_url,
+            adapter._cdn_url,
+        ) as session:
             uploaded_url, data, content_type, detected_name = await _upload_media(
                 session, adapter, args.get("source"), media_kind=media_kind
             )

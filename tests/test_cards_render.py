@@ -397,7 +397,7 @@ def test_progress_uses_specialized_layout_only_when_manifest_supports_it() -> No
 
     assert enhanced.card["metadata"] == {"octo_layout": "agent_progress_v1"}
     assert [element["type"] for element in enhanced.card["body"]] == [
-        "ColumnSet",
+        "Container",
         "Container",
     ]
     assert "metadata" not in flat.card

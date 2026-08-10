@@ -38,6 +38,7 @@ _ROUTE = TrustedOctoRoute(
 _ADAPTER = SimpleNamespace(
     _api_url="https://octo.invalid",
     _bot_token="test-token",
+    _cdn_url="https://cdn.octo.invalid/assets",
     on_behalf_of="grantor-1",
     _card_profile_cache=message_tools.cards.CardProfileCache(),
 )
@@ -264,6 +265,37 @@ async def test_file_tool_accepts_a_local_path(tmp_path):
     assert str(UUID(client_msg_no)) == client_msg_no
     assert send.await_args.kwargs["on_behalf_of"] == "grantor-1"
 
+@pytest.mark.asyncio
+async def test_remote_media_uses_guarded_session_and_keeps_host_safety_enabled() -> None:
+    adapter = SimpleNamespace(**vars(_ADAPTER))
+    session_factory = MagicMock(return_value=_Session())
+    download = AsyncMock(return_value=(b"data", "application/octet-stream", "a.bin"))
+    upload = AsyncMock(return_value="https://cdn.octo.invalid/a.bin")
+    send = AsyncMock(return_value=SendMessageResult(message_id="media-safe"))
+    with (
+        patch.object(message_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(message_tools, "_trusted_route", return_value=_ROUTE),
+        patch.object(message_tools, "_new_guarded_http_session", session_factory),
+        patch.object(message_tools.api, "download_file", download),
+        patch.object(message_tools.api, "upload_and_get_url", upload),
+        patch.object(message_tools.api, "send_media_message", send),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_file_handler(
+                {"source": "https://files.example/report.bin"}
+            )
+        )
+
+    assert result["ok"] is True
+    session_factory.assert_called_once_with(
+        "https://octo.invalid",
+        "https://cdn.octo.invalid/assets",
+    )
+    assert download.await_args.args[0].__class__ is _Session
+    assert "enforce_host_safety" not in download.await_args.kwargs
+
+
+
 
 @pytest.mark.asyncio
 async def test_image_tool_routes_verified_remote_media_to_current_conversation():
@@ -302,7 +334,7 @@ async def test_image_tool_routes_verified_remote_media_to_current_conversation()
             "client_msg_no": "media-client-2",
         },
     }
-    assert download.await_args.kwargs["enforce_host_safety"] is False
+    assert "enforce_host_safety" not in download.await_args.kwargs
     send.assert_awaited_once_with(
         ANY,
         "https://octo.invalid",

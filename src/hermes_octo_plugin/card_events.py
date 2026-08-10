@@ -18,10 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+
 from gateway.platforms.base import MessageEvent, MessageType as HermesMessageType
 from gateway.session import build_session_key
 
 from . import api, cards
+from .cards import CardRenderResult
 from .types import ChannelType
 
 MAX_SAFE_EVENT_ID = (1 << 53) - 1
@@ -290,6 +292,8 @@ class _CardSessionEntry:
     claimed_event_id: int | None = None
     attempt_event_id: int | None = None
     dispatch_attempts: int = 0
+    card_seq: int = 0
+
 
 
 @dataclass(frozen=True)
@@ -372,6 +376,15 @@ class CardSessionRegistry:
             entry.dispatch_attempts += 1
             return CardClaim("claimed", entry.session, entry.dispatch_attempts)
 
+    def next_card_seq(self, message_id: str) -> int | None:
+        with self._lock:
+            entry = self._entry_locked(message_id)
+            if entry is None:
+                return None
+            entry.card_seq += 1
+            return entry.card_seq
+
+
     def release(self, message_id: str, event_id: int) -> None:
         with self._lock:
             entry = self._entry_locked(message_id)
@@ -448,16 +461,125 @@ def _action_matches_session(action: CardAction, session: CardSession) -> bool:
     ).encode("utf-8")
     return len(serialized) <= max_inputs
 
+def _neutralize_action_echo(value: str) -> str:
+    reduced = cards.reduce_urls_in_text(value)
+    return re.sub(r"([\\`*_~\[\]<>])", r"\\\1", reduced)
+
+
+def _freeze_action_node(
+    node: Mapping[str, Any],
+    inputs: Mapping[str, str],
+) -> dict[str, Any] | None:
+    node_type = node.get("type")
+    if isinstance(node_type, str) and node_type.startswith("Input."):
+        input_id = node.get("id")
+        if not isinstance(input_id, str) or input_id not in inputs:
+            return None
+        label = node.get("label")
+        safe_label = label.strip() if isinstance(label, str) and label.strip() else input_id
+        return {
+            "type": "TextBlock",
+            "text": f"{safe_label}: {_neutralize_action_echo(inputs[input_id])}",
+            "wrap": True,
+            "spacing": "Small",
+        }
+    frozen: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "actions":
+            continue
+        if isinstance(value, list):
+            children: list[Any] = []
+            for item in value:
+                if isinstance(item, Mapping):
+                    child = _freeze_action_node(item, inputs)
+                    if child is not None:
+                        children.append(child)
+                else:
+                    children.append(item)
+            frozen[key] = children
+        else:
+            frozen[key] = value
+    return frozen
+
+
+def render_card_action_status(
+    session: CardSession,
+    action: CardAction,
+    status: str,
+) -> CardRenderResult:
+    """Freeze submitted controls and append a disclosure-safe terminal status."""
+    source_body = session.card.get("body")
+    body: list[dict[str, Any]] = []
+    if isinstance(source_body, list):
+        for item in source_body:
+            if not isinstance(item, Mapping):
+                continue
+            frozen = _freeze_action_node(item, action.inputs)
+            if frozen is not None:
+                body.append(frozen)
+    label = session.action_labels.get(action.action_id, action.action_id)
+    operator = _neutralize_action_echo(action.operator_uid)
+    status_line = (
+        f"Processing {label} for {operator}"
+        if status == "processing"
+        else (
+            f"Completed {label} for {operator}"
+            if status == "completed"
+            else f"Failed {label} for {operator}"
+        )
+    )
+    body.append(
+        {
+            "type": "TextBlock",
+            "text": status_line,
+            "wrap": True,
+            "spacing": "Medium",
+            "separator": True,
+        }
+    )
+    card = {key: value for key, value in session.card.items() if key != "actions"}
+    card["body"] = body
+    plain_base = session.plain.strip()
+    plain = "\n".join(part for part in (plain_base, status_line) if part)
+    return CardRenderResult(card=card, plain=plain)
+
+
+async def _update_action_status(
+    callback: Callable[..., Awaitable[None]] | None,
+    session: CardSession,
+    action: CardAction,
+    status: str,
+    *,
+    transient: bool,
+) -> None:
+    if callback is None:
+        return
+    try:
+        await callback(session, action, status, transient=transient)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Octo card action status update failed", exc_info=True)
+
+
+
 
 async def handle_card_action(
     registry: CardSessionRegistry,
     action: CardAction,
     dispatch: Callable[[CardSession, CardAction], Awaitable[bool]],
+    *,
+    update_status: Callable[..., Awaitable[None]] | None = None,
 ) -> str:
     """Claim, validate, dispatch, and bound retries for one card action."""
     claim = registry.claim(action.message_id, action.event_id)
-    if claim.status != "claimed" or claim.session is None:
+    if claim.session is None:
         return claim.status
+    if claim.status != "claimed":
+        try:
+            return "duplicate" if _action_matches_session(action, claim.session) else "ignored"
+        except (TypeError, ValueError, UnicodeError):
+            return "ignored"
     session = claim.session
     try:
         matches = _action_matches_session(action, session)
@@ -468,6 +590,13 @@ async def handle_card_action(
         registry.release(action.message_id, action.event_id)
         return "ignored"
     try:
+        await _update_action_status(
+            update_status,
+            session,
+            action,
+            "processing",
+            transient=True,
+        )
         accepted = await dispatch(session, action)
     except asyncio.CancelledError:
         registry.release(action.message_id, action.event_id)
@@ -475,6 +604,13 @@ async def handle_card_action(
     except Exception:
         if claim.attempts >= registry.max_dispatch_attempts:
             registry.complete(action.message_id, action.event_id)
+            await _update_action_status(
+                update_status,
+                session,
+                action,
+                "failed",
+                transient=False,
+            )
             return "dead_letter"
         registry.release(action.message_id, action.event_id)
         raise
@@ -482,6 +618,13 @@ async def handle_card_action(
         registry.release(action.message_id, action.event_id)
         return "ignored"
     registry.complete(action.message_id, action.event_id)
+    await _update_action_status(
+        update_status,
+        session,
+        action,
+        "completed",
+        transient=False,
+    )
     return "completed"
 
 
@@ -553,7 +696,7 @@ class EventPoller:
         api_url: str,
         bot_token: str,
         cursor_store: EventCursorStore,
-        on_card_action: Callable[[CardAction], Awaitable[None]],
+        on_card_action: Callable[[CardAction], Awaitable[str]],
         interval_seconds: float = DEFAULT_EVENT_INTERVAL_SECONDS,
         wait_seconds: int = DEFAULT_EVENT_WAIT_SECONDS,
         limit: int = 50,
@@ -634,11 +777,10 @@ class EventPoller:
             for event in ordered:
                 event_id = int(event["event_id"])
                 action = parse_card_action(event)
-                if action is not None:
-                    await self._on_card_action(action)
+                status = await self._on_card_action(action) if action is not None else None
                 await self._cursor_store.save(event_id)
                 self._cursor = event_id
-                if action is not None:
+                if status in {"completed", "dead_letter", "duplicate"}:
                     await self._ack(event_id)
             self._consecutive_errors = 0
             if self._wait_seconds == 0:

@@ -87,20 +87,35 @@ def _response_error(path: str, response: aiohttp.ClientResponse) -> OctoApiError
 MAX_OUTBOUND_MEDIA_BYTES = 100 * 1024 * 1024
 
 _MIME_MAP: dict[str, str] = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
-    ".bmp": "image/bmp", ".ico": "image/x-icon",
-    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
-    ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
-    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
-    ".m4a": "audio/mp4", ".aac": "audio/aac", ".opus": "audio/opus",
-    ".pdf": "application/pdf", ".zip": "application/zip",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".opus": "audio/opus",
+    ".pdf": "application/pdf",
+    ".zip": "application/zip",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".txt": "text/plain", ".md": "text/markdown",
-    ".csv": "text/csv", ".html": "text/html",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".html": "text/html",
     ".json": "application/json",
 }
 _DATA_URI_EXTENSION_MAP = {
@@ -122,6 +137,7 @@ def infer_content_type(filename: str) -> str:
     """Infer MIME type from filename extension."""
     ext = os.path.splitext(filename)[1].lower()
     return _MIME_MAP.get(ext, "application/octet-stream")
+
 
 def decode_media_data_uri(
     source: str,
@@ -157,7 +173,6 @@ def decode_media_data_uri(
     return data, content_type, f"file{extension}"
 
 
-
 def read_local_media(
     source: str,
     *,
@@ -183,9 +198,9 @@ def read_local_media(
         raise ValueError("local media source is unavailable") from exc
     try:
         opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
         ):
             raise ValueError("local media source is unavailable")
         if opened.st_size > max_size:
@@ -222,10 +237,10 @@ def parse_image_dimensions(data: bytes, mime: str) -> tuple[int, int] | None:
                     break
                 marker = data[offset + 1]
                 if marker in (0xC0, 0xC2):
-                    height = struct.unpack(">H", data[offset + 5:offset + 7])[0]
-                    width = struct.unpack(">H", data[offset + 7:offset + 9])[0]
+                    height = struct.unpack(">H", data[offset + 5 : offset + 7])[0]
+                    width = struct.unpack(">H", data[offset + 7 : offset + 9])[0]
                     return width, height
-                seg_len = struct.unpack(">H", data[offset + 2:offset + 4])[0]
+                seg_len = struct.unpack(">H", data[offset + 2 : offset + 4])[0]
                 offset += 2 + seg_len
         if mime == "image/gif" and len(data) > 10:
             width = struct.unpack("<H", data[6:8])[0]
@@ -634,6 +649,112 @@ async def send_message(
     )
 
 
+def _validate_template_frame(
+    template_ref: Mapping[str, str],
+    state: str,
+    data: dict[str, Any],
+) -> None:
+    if not isinstance(template_ref, Mapping) or set(template_ref) != {"id", "version"}:
+        raise ValueError("template_ref must contain exactly id and version")
+    template_id = template_ref.get("id")
+    version = template_ref.get("version")
+    if (
+        not isinstance(template_id, str)
+        or not template_id.strip()
+        or not isinstance(version, str)
+        or not version.strip()
+    ):
+        raise ValueError("template_ref id/version are required")
+    if not isinstance(state, str) or not state.strip():
+        raise ValueError("template state is required")
+    if not isinstance(data, dict) or "state" not in data:
+        raise ValueError("data must be a plain object with own state")
+    if data["state"] != state:
+        raise ValueError("data.state must match state")
+
+
+async def send_template_card_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    channel_id: str,
+    channel_type: ChannelType,
+    template_ref: Mapping[str, str],
+    state: str,
+    data: dict[str, Any],
+    client_msg_no: str | None = None,
+) -> SendMessageResult:
+    """Send one server-Registry Type-17 card frame."""
+    if not isinstance(channel_id, str) or not channel_id.strip():
+        raise ValueError("channel_id is required")
+    _validate_template_frame(template_ref, state, data)
+    requested_client_msg_no = client_msg_no or str(uuid.uuid4())
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/sendMessage",
+        {
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "client_msg_no": requested_client_msg_no,
+            "payload": {
+                "type": MessageType.InteractiveCard,
+                "template_ref": dict(template_ref),
+                "state": state,
+                "data": data,
+            },
+        },
+    )
+    return _parse_send_message_result(
+        result,
+        requested_client_msg_no=requested_client_msg_no,
+    )
+
+
+async def edit_template_card_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    channel_id: str,
+    channel_type: ChannelType,
+    message_id: str,
+    template_ref: Mapping[str, str],
+    state: str,
+    data: dict[str, Any],
+    card_seq: int,
+    transient: bool | None = None,
+) -> Any | None:
+    """Replace a server-Registry Type-17 card frame."""
+    if not isinstance(message_id, str) or not message_id:
+        raise ValueError("message_id is required")
+    if not isinstance(channel_id, str) or not channel_id.strip():
+        raise ValueError("channel_id is required")
+    if isinstance(card_seq, bool) or not isinstance(card_seq, int) or card_seq <= 0:
+        raise ValueError("card_seq must be a positive integer")
+    _validate_template_frame(template_ref, state, data)
+    body: dict[str, Any] = {
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "template_ref": dict(template_ref),
+        "state": state,
+        "data": data,
+        "card_seq": card_seq,
+    }
+    if transient is not None:
+        body["transient"] = transient
+    return await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/message/edit",
+        body,
+    )
+
+
 async def send_card_message(
     session: aiohttp.ClientSession,
     api_url: str,
@@ -757,6 +878,8 @@ async def edit_message(
     message_id: str,
     content: str,
     finalize: bool = False,
+    mention_uids: list[str] | None = None,
+    mention_entities: list[MentionEntity] | None = None,
     on_behalf_of: str | None = None,
 ) -> Any | None:
     """Edit a text message using Octo's native edit envelope.
@@ -766,11 +889,22 @@ async def edit_message(
     serialized.
     """
     del finalize
+    frame: dict[str, Any] = {"type": MessageType.Text, "content": content}
+    if mention_uids or mention_entities:
+        mention: dict[str, Any] = {}
+        if mention_uids:
+            mention["uids"] = mention_uids
+        if mention_entities:
+            mention["entities"] = [
+                {"uid": item.uid, "offset": item.offset, "length": item.length}
+                for item in mention_entities
+            ]
+        frame["mention"] = mention
     body: dict[str, Any] = {
         "message_id": str(message_id),
         "channel_id": channel_id,
         "channel_type": channel_type,
-        "content_edit": json.dumps({"type": MessageType.Text, "content": content}),
+        "content_edit": json.dumps(frame),
     }
     if on_behalf_of:
         body["on_behalf_of"] = on_behalf_of
@@ -953,9 +1087,7 @@ async def send_rich_text_message(
     }
     if on_behalf_of:
         body["on_behalf_of"] = on_behalf_of
-    result = await post_json(
-        session, api_url, bot_token, "/v1/bot/sendMessage", body
-    )
+    result = await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", body)
     return _parse_send_message_result(
         result,
         requested_client_msg_no=body["client_msg_no"],
@@ -1012,15 +1144,22 @@ async def stream_start(
         stream_no (stream identifier) or None on failure.
     """
     import json
+
     payload_b64 = base64.b64encode(
         json.dumps({"type": 1, "content": initial_content}).encode("utf-8")
     ).decode("ascii")
 
-    result = await post_json(session, api_url, bot_token, "/v1/bot/stream/start", {
-        "channel_id": channel_id,
-        "channel_type": channel_type,
-        "payload": payload_b64,
-    })
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/stream/start",
+        {
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "payload": payload_b64,
+        },
+    )
     return result.get("stream_no") if result else None
 
 
@@ -1040,11 +1179,17 @@ async def stream_end(
         channel_id: Target channel.
         channel_type: DM or Group.
     """
-    await post_json(session, api_url, bot_token, "/v1/bot/stream/end", {
-        "stream_no": stream_no,
-        "channel_id": channel_id,
-        "channel_type": channel_type,
-    })
+    await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/stream/end",
+        {
+            "stream_no": stream_no,
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+        },
+    )
 
 
 # ─── Backend-agnostic presigned upload ───────────────────────────────────────
@@ -1062,13 +1207,11 @@ async def get_upload_presign(
     """Fetch a server-issued presigned PUT target for the exact file body."""
     if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size <= 0:
         raise ValueError("file_size must be a positive integer")
-    query = urlencode(
-        {
-            "filename": filename,
-            "fileSize": str(file_size),
-            **({"contentType": content_type} if content_type else {}),
-        }
-    )
+    query = urlencode({
+        "filename": filename,
+        "fileSize": str(file_size),
+        **({"contentType": content_type} if content_type else {}),
+    })
     path = "/v1/bot/upload/presigned"
     url = f"{api_url.rstrip('/')}{path}?{query}"
     headers = {"Authorization": f"Bearer {bot_token}"}
@@ -1118,6 +1261,45 @@ async def get_upload_presign(
     if signed_headers:
         result["headers"] = signed_headers
     return result
+
+def _trust_presigned_upload_origin(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+) -> None:
+    """Trust one authenticated server-issued private upload host after opt-in."""
+    try:
+        parsed = urlparse(upload_url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("unsafe presigned upload URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or host in _DOWNLOAD_METADATA_HOSTS
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
+    literal = _canonical_download_ip(host)
+    if literal is not None and (
+        literal.is_link_local
+        or literal.is_multicast
+        or literal.is_reserved
+        or literal.is_unspecified
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
+    if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
+    connector = getattr(session, "connector", None)
+    resolver = getattr(connector, "_ssrf_resolver", None)
+    trusted_hosts = getattr(resolver, "_trusted_hosts", None)
+    if isinstance(trusted_hosts, set):
+        trusted_hosts.add(host)
+
 
 
 async def upload_file_to_presigned_url(
@@ -1187,6 +1369,7 @@ async def upload_and_get_url(
         file_size=len(file_data),
         content_type=content_type,
     )
+    _trust_presigned_upload_origin(session, presign["uploadUrl"])
     return await upload_file_to_presigned_url(
         session,
         upload_url=presign["uploadUrl"],
@@ -1209,7 +1392,9 @@ _DOWNLOAD_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_DOWNLOAD_REDIRECTS = 5
 
 
-def _canonical_download_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+def _canonical_download_ip(
+    host: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     normalized = host.lower().strip("[]").rstrip(".")
     try:
         return ipaddress.ip_address(normalized)
@@ -1236,8 +1421,6 @@ def _validate_download_url(
         raise RuntimeError("unsafe download URL")
     if parsed.username is not None or parsed.password is not None:
         raise RuntimeError("unsafe download URL")
-    if not enforce_host_safety:
-        return url
     if host in _DOWNLOAD_METADATA_HOSTS:
         raise RuntimeError("unsafe download URL")
 
@@ -1249,6 +1432,8 @@ def _validate_download_url(
         or literal.is_unspecified
     ):
         raise RuntimeError("unsafe download URL")
+    if not enforce_host_safety:
+        return url
     if (
         literal is not None
         and (literal.is_loopback or literal.is_private)
@@ -1320,9 +1505,7 @@ async def download_file(
                 # exceptions that can reach logs or SendResult.error.
                 raise RuntimeError(f"Download failed (HTTP {resp.status})")
 
-            content_type = resp.headers.get(
-                "Content-Type", "application/octet-stream"
-            )
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
             # Extract filename from URL or Content-Disposition.
             filename = "file"
@@ -1376,14 +1559,20 @@ async def get_channel_messages(
     Returns:
         List of dicts with from_uid, content, timestamp, type, url, name, payload.
     """
-    result = await post_json(session, api_url, bot_token, "/v1/bot/messages/sync", {
-        "channel_id": channel_id,
-        "channel_type": channel_type,
-        "limit": limit,
-        "start_message_seq": start_message_seq,
-        "end_message_seq": end_message_seq,
-        "pull_mode": 1,  # 1 = pull up (newer messages)
-    })
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/messages/sync",
+        {
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "limit": limit,
+            "start_message_seq": start_message_seq,
+            "end_message_seq": end_message_seq,
+            "pull_mode": 1,  # 1 = pull up (newer messages)
+        },
+    )
 
     if not result:
         return []
@@ -1397,6 +1586,7 @@ async def get_channel_messages(
             try:
                 decoded = base64.b64decode(raw_payload).decode("utf-8")
                 import json
+
                 payload = json.loads(decoded)
             except Exception:
                 if isinstance(raw_payload, dict):
@@ -1449,7 +1639,10 @@ async def get_group_members(
         List of GroupMember objects.
     """
     data = await get_json(
-        session, api_url, bot_token, f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members"
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members",
     )
     # Normalize: API may return {members: [...]} or bare [...].  A successful
     # but structurally empty response remains a legitimate empty roster.
@@ -1486,7 +1679,10 @@ async def get_group_info(
         RuntimeError: If the API call fails.
     """
     data = await get_json(
-        session, api_url, bot_token, f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}"
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}",
     )
     if not isinstance(data, dict):
         raise RuntimeError("Octo group info returned an invalid response")
@@ -1689,7 +1885,9 @@ async def create_group(
         payload["name"] = name
     if space_id is not None:
         payload["space_id"] = space_id
-    result = await post_json(session, api_url, bot_token, "/v1/bot/createGroup", payload)
+    result = await post_json(
+        session, api_url, bot_token, "/v1/bot/createGroup", payload
+    )
     return result or {}
 
 
@@ -1715,8 +1913,11 @@ async def update_group(
     if not payload:
         raise ValueError("update_group requires at least one of: name, notice")
     await put_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/info", payload,
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/info",
+        payload,
     )
 
 
@@ -1729,8 +1930,11 @@ async def add_group_members(
     members: list[str],
 ) -> dict[str, Any]:
     result = await post_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/add", {"members": members},
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/add",
+        {"members": members},
     )
     return result or {}
 
@@ -1744,8 +1948,11 @@ async def remove_group_members(
     members: list[str],
 ) -> dict[str, Any]:
     result = await post_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/remove", {"members": members},
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/remove",
+        {"members": members},
     )
     return result or {}
 
@@ -1766,8 +1973,11 @@ async def create_thread(
     if source_message_id is not None:
         payload["source_message_id"] = source_message_id
     result = await post_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads", payload,
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads",
+        payload,
     )
     return result or {}
 
@@ -1780,7 +1990,9 @@ async def list_threads(
     group_no: str,
 ) -> list[dict[str, Any]]:
     result = await get_json(
-        session, api_url, bot_token,
+        session,
+        api_url,
+        bot_token,
         f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads",
     )
     if not result:
@@ -1802,7 +2014,9 @@ async def get_thread(
     short_id: str,
 ) -> dict[str, Any]:
     result = await get_json(
-        session, api_url, bot_token,
+        session,
+        api_url,
+        bot_token,
         f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}",
     )
     return result or {}
@@ -1817,7 +2031,9 @@ async def delete_thread(
     short_id: str,
 ) -> None:
     await delete_json(
-        session, api_url, bot_token,
+        session,
+        api_url,
+        bot_token,
         f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}",
     )
 
@@ -1831,7 +2047,9 @@ async def list_thread_members(
     short_id: str,
 ) -> list[dict[str, Any]]:
     result = await get_json(
-        session, api_url, bot_token,
+        session,
+        api_url,
+        bot_token,
         f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/members",
     )
     if not result:
@@ -1853,8 +2071,11 @@ async def join_thread(
     short_id: str,
 ) -> None:
     await post_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/join", {},
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/join",
+        {},
     )
 
 
@@ -1867,8 +2088,11 @@ async def leave_thread(
     short_id: str,
 ) -> None:
     await post_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/leave", {},
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/leave",
+        {},
     )
 
 
@@ -1883,7 +2107,9 @@ async def get_thread_md(
     """Read THREAD.md. Returns {} on 404."""
     try:
         result = await get_json(
-            session, api_url, bot_token,
+            session,
+            api_url,
+            bot_token,
             f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/md",
         )
     except OctoApiError as e:
@@ -1903,8 +2129,11 @@ async def update_thread_md(
     content: str,
 ) -> dict[str, Any]:
     result = await put_json(
-        session, api_url, bot_token,
-        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/md", {"content": content},
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/md",
+        {"content": content},
     )
     return result or {}
 
@@ -1938,7 +2167,9 @@ async def update_voice_context(
     content: str,
 ) -> None:
     # Server expects {"context": "..."} (NOT "content").
-    await put_json(session, api_url, bot_token, "/v1/bot/voice/context", {"context": content})
+    await put_json(
+        session, api_url, bot_token, "/v1/bot/voice/context", {"context": content}
+    )
 
 
 async def delete_voice_context(

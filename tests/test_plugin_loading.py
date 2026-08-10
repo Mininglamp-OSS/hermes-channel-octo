@@ -57,7 +57,9 @@ class FakeCtx:
 def test_entry_point_declared():
     """`pip install`-time metadata exposes the octo plugin under the
     hermes-agent entry-point group."""
-    eps = [e for e in md.entry_points(group=ENTRY_POINT_GROUP) if e.name == EXPECTED_NAME]
+    eps = [
+        e for e in md.entry_points(group=ENTRY_POINT_GROUP) if e.name == EXPECTED_NAME
+    ]
     assert len(eps) == 1, (
         f"expected exactly one '{EXPECTED_NAME}' entry-point in group "
         f"'{ENTRY_POINT_GROUP}', got {len(eps)}"
@@ -69,7 +71,9 @@ def test_entry_point_loads_to_register_callable():
     """The advertised entry-point target resolves to the ``hermes_octo_plugin``
     module, which exposes ``register`` — matching hermes_cli's
     ``getattr(module, "register")`` lookup."""
-    (ep,) = (e for e in md.entry_points(group=ENTRY_POINT_GROUP) if e.name == EXPECTED_NAME)
+    (ep,) = (
+        e for e in md.entry_points(group=ENTRY_POINT_GROUP) if e.name == EXPECTED_NAME
+    )
     loaded = ep.load()
     assert loaded is hermes_octo_plugin
     assert callable(getattr(loaded, "register", None))
@@ -127,6 +131,8 @@ def test_register_with_env_wires_full_surface(monkeypatch):
     assert {name for name, _ in ctx.hooks} == {
         "pre_llm_call",
         "post_llm_call",
+        "pre_api_request",
+        "post_api_request",
         "pre_tool_call",
         "post_tool_call",
         "on_session_end",
@@ -182,6 +188,8 @@ def test_progress_hook_registration_failure_is_isolated(monkeypatch):
     assert {name for name, _ in ctx.hooks} == {
         "pre_llm_call",
         "post_llm_call",
+        "pre_api_request",
+        "post_api_request",
         "post_tool_call",
         "on_session_end",
     }
@@ -265,6 +273,7 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
             # for is_registered() lookup, which is what resolve_toolset's
             # fallback branch checks.
             from types import SimpleNamespace
+
             platform_registry._entries[kwargs["name"]] = SimpleNamespace(
                 name=kwargs["name"], **{k: v for k, v in kwargs.items() if k != "name"}
             )

@@ -367,6 +367,20 @@ class TestConvertStructuredMentions:
         assert content[entities[1].offset:entities[1].offset + entities[1].length] == "@Alice"
         assert uids == ["u1", "u2"]
 
+    def test_offsets_and_lengths_use_utf16_code_units(self):
+        from hermes_octo_plugin.mention import (
+            convert_structured_mentions, parse_structured_mentions,
+        )
+
+        text = "😀 @[u1:A😀] tail"
+        content, entities, _ = convert_structured_mentions(
+            text, parse_structured_mentions(text),
+        )
+
+        assert content == "😀 @A😀 tail"
+        assert entities[0].offset == 3
+        assert entities[0].length == 4
+
     def test_duplicate_names_get_distinct_offsets(self):
         from hermes_octo_plugin.mention import (
             parse_structured_mentions, convert_structured_mentions,
