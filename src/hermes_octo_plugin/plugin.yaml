@@ -24,6 +24,26 @@ optional_env:
     description: "Optional CDN prefix for media acceleration"
     prompt: "CDN URL (optional)"
     password: false
+  - name: OCTO_WS_URL
+    description: "Optional WuKongIM WebSocket URL override"
+    prompt: "WebSocket URL override (optional)"
+    password: false
+  - name: OCTO_ON_BEHALF_OF
+    description: "Trusted grantor user ID for authorized persona delivery"
+    prompt: "Send on behalf of user ID (optional)"
+    password: false
+  - name: OCTO_EVENT_POLL_INTERVAL_S
+    description: "Minimum event polling interval in seconds"
+    prompt: "Event poll interval seconds (optional)"
+    password: false
+  - name: OCTO_EVENT_POLL_WAIT_S
+    description: "Server long-poll hold in seconds; 0 disables long polling"
+    prompt: "Event long-poll wait seconds (optional)"
+    password: false
+  - name: OCTO_EVENT_POLL_LIMIT
+    description: "Maximum events requested per polling batch"
+    prompt: "Event poll batch limit (optional)"
+    password: false
   - name: OCTO_ALLOWED_USERS
     description: "Comma-separated Octo user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
@@ -35,4 +55,8 @@ optional_env:
   - name: OCTO_HOME_CHANNEL
     description: "Default group/chat ID for cron / notification delivery"
     prompt: "Home channel (or empty)"
+    password: false
+  - name: OCTO_CARD_MESSAGE_ENABLED
+    description: "Legacy local Type-17 enablement fallback when the server has no card profile endpoint"
+    prompt: "Enable legacy card messages? (1/0)"
     password: false

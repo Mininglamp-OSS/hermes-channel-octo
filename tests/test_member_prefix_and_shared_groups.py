@@ -21,14 +21,28 @@ def _make_adapter() -> OctoAdapter:
 
 
 class TestMemberListPrefix:
+    def test_prompt_roster_is_scoped_to_the_current_parent_group(self):
+        a = _make_adapter()
+        a._group_member_rosters = {
+            "group-1": OrderedDict([("u1", "Alice")]),
+            "group-2": OrderedDict([("u2", "Bob")]),
+        }
+
+        out = a._build_member_list_prefix("group-1")
+
+        assert "Alice (u1)" in out
+        assert "Bob (u2)" not in out
+
     def test_empty_returns_empty_string(self):
         a = _make_adapter()
-        assert a._build_member_list_prefix() == ""
+        assert a._build_member_list_prefix("group-1") == ""
 
     def test_small_group_lists_all_members(self):
         a = _make_adapter()
-        a._uid_to_name = OrderedDict([("u1", "Alice"), ("u2", "Bob")])
-        out = a._build_member_list_prefix()
+        a._group_member_rosters["group-1"] = OrderedDict([
+            ("u1", "Alice"), ("u2", "Bob"),
+        ])
+        out = a._build_member_list_prefix("group-1")
         assert "[Group Members]" in out
         assert "Alice (u1)" in out
         assert "Bob (u2)" in out
@@ -38,8 +52,10 @@ class TestMemberListPrefix:
 
     def test_large_group_shows_count_only(self):
         a = _make_adapter()
-        a._uid_to_name = {f"u{i}": f"User{i}" for i in range(15)}
-        out = a._build_member_list_prefix()
+        a._group_member_rosters["group-1"] = {
+            f"u{i}": f"User{i}" for i in range(15)
+        }
+        out = a._build_member_list_prefix("group-1")
         assert "15 members" in out
         assert "octo_management" in out
         # Should NOT list every member
@@ -47,8 +63,10 @@ class TestMemberListPrefix:
 
     def test_boundary_exactly_ten_lists(self):
         a = _make_adapter()
-        a._uid_to_name = OrderedDict((f"u{i}", f"User{i}") for i in range(10))
-        out = a._build_member_list_prefix()
+        a._group_member_rosters["group-1"] = OrderedDict(
+            (f"u{i}", f"User{i}") for i in range(10)
+        )
+        out = a._build_member_list_prefix("group-1")
         assert "[Group Members]" in out
         assert "User9 (u9)" in out
 

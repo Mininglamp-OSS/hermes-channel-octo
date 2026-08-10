@@ -16,6 +16,7 @@ from hermes_octo_plugin.types import (
     MessagePayload,
     MessageType,
     RichTextBlock,
+    SendMessageResult,
 )
 from tests.conftest import make_bare_adapter
 
@@ -244,8 +245,12 @@ class TestSendRichTextMessage:
                 height=50,
             ),
         ]
-        with patch("hermes_octo_plugin.api.post_json", new_callable=AsyncMock) as mock_post:
-            await api.send_rich_text_message(
+        with patch(
+            "hermes_octo_plugin.api.post_json",
+            new_callable=AsyncMock,
+            return_value={"message_id": "rich-1", "message_seq": 8},
+        ) as mock_post:
+            result = await api.send_rich_text_message(
                 session=session,
                 api_url="https://api.example.com",
                 bot_token="tok",
@@ -253,7 +258,12 @@ class TestSendRichTextMessage:
                 channel_type=ChannelType.Group,
                 blocks=blocks,
                 plain="caption[图片]",
+                client_msg_no="rich-dedup-1",
+                on_behalf_of="grantor-1",
             )
+        assert result.message_id == "rich-1"
+        assert result.message_seq == 8
+        assert result.client_msg_no == "rich-dedup-1"
         mock_post.assert_awaited_once()
         args, _ = mock_post.call_args
         # signature: (session, api_url, bot_token, path, body)
@@ -261,6 +271,8 @@ class TestSendRichTextMessage:
         body = args[4]
         assert body["channel_id"] == "G1"
         assert body["channel_type"] == ChannelType.Group
+        assert body["client_msg_no"] == "rich-dedup-1"
+        assert body["on_behalf_of"] == "grantor-1"
         payload = body["payload"]
         assert payload["type"] == MessageType.RichText
         assert payload["plain"] == "caption[图片]"
@@ -280,7 +292,11 @@ class TestSendRichTextMessage:
     async def test_mention_and_reply_included(self):
         session = MagicMock()
         blocks = [RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text="hi")]
-        with patch("hermes_octo_plugin.api.post_json", new_callable=AsyncMock) as mock_post:
+        with patch(
+            "hermes_octo_plugin.api.post_json",
+            new_callable=AsyncMock,
+            return_value={"message_id": "rich-2"},
+        ) as mock_post:
             await api.send_rich_text_message(
                 session=session,
                 api_url="https://api.example.com",
@@ -316,8 +332,15 @@ class TestSendImageWithCaption:
                    return_value=(200, 100)), \
              patch("hermes_octo_plugin.adapter.api.upload_and_get_url",
                    new_callable=AsyncMock, return_value="https://cdn/y.png"), \
-             patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
-                   new_callable=AsyncMock) as mock_rich, \
+             patch(
+                 "hermes_octo_plugin.adapter.api.send_rich_text_message",
+                 new_callable=AsyncMock,
+                 return_value=SendMessageResult(
+                     message_id="rich-message-1",
+                     message_seq=11,
+                     client_msg_no="rich-client-1",
+                 ),
+             ) as mock_rich, \
              patch("hermes_octo_plugin.adapter.api.send_media_message",
                    new_callable=AsyncMock) as mock_media, \
              patch("hermes_octo_plugin.adapter.api.send_message",
@@ -329,6 +352,12 @@ class TestSendImageWithCaption:
             )
 
         assert result.success is True
+        assert result.message_id == "rich-message-1"
+        assert result.raw_response == {
+            "message_id": "rich-message-1",
+            "message_seq": 11,
+            "client_msg_no": "rich-client-1",
+        }
         mock_rich.assert_awaited_once()
         mock_media.assert_not_awaited()
         mock_text.assert_not_awaited()
@@ -357,8 +386,14 @@ class TestSendImageWithCaption:
                    new_callable=AsyncMock, return_value="https://cdn/y.webp"), \
              patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
                    new_callable=AsyncMock) as mock_rich, \
-             patch("hermes_octo_plugin.adapter.api.send_media_message",
-                   new_callable=AsyncMock) as mock_media, \
+             patch(
+                 "hermes_octo_plugin.adapter.api.send_media_message",
+                 new_callable=AsyncMock,
+                 return_value=SendMessageResult(
+                     message_id="media-message-1",
+                     client_msg_no="media-client-1",
+                 ),
+             ) as mock_media, \
              patch("hermes_octo_plugin.adapter.api.send_message",
                    new_callable=AsyncMock) as mock_text:
             result = await a.send_image(
@@ -368,6 +403,7 @@ class TestSendImageWithCaption:
             )
 
         assert result.success is True
+        assert result.message_id == "media-message-1"
         mock_rich.assert_not_awaited()
         mock_media.assert_awaited_once()
         mock_text.assert_awaited_once()
@@ -388,8 +424,14 @@ class TestSendImageWithCaption:
                    new_callable=AsyncMock, return_value="https://cdn/y.png"), \
              patch("hermes_octo_plugin.adapter.api.send_rich_text_message",
                    new_callable=AsyncMock) as mock_rich, \
-             patch("hermes_octo_plugin.adapter.api.send_media_message",
-                   new_callable=AsyncMock) as mock_media, \
+             patch(
+                 "hermes_octo_plugin.adapter.api.send_media_message",
+                 new_callable=AsyncMock,
+                 return_value=SendMessageResult(
+                     message_id="media-message-2",
+                     client_msg_no="media-client-2",
+                 ),
+             ) as mock_media, \
              patch("hermes_octo_plugin.adapter.api.send_message",
                    new_callable=AsyncMock) as mock_text:
             result = await a.send_image(
@@ -399,6 +441,7 @@ class TestSendImageWithCaption:
             )
 
         assert result.success is True
+        assert result.message_id == "media-message-2"
         mock_rich.assert_not_awaited()
         mock_media.assert_awaited_once()
         mock_text.assert_not_awaited()

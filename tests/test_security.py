@@ -61,6 +61,20 @@ class TestValidateOctoUrl:
         with mock.patch.dict(os.environ, {"OCTO_ALLOW_PRIVATE_HOSTS": "true"}):
             assert _validate_octo_url("http://127.0.0.1/", "OCTO_API_URL") == "http://127.0.0.1/"
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+        ],
+    )
+    def test_private_opt_in_never_allows_metadata_endpoints(self, url):
+        with mock.patch.dict(os.environ, {"OCTO_ALLOW_PRIVATE_HOSTS": "true"}):
+            with pytest.raises(ValueError, match="metadata"):
+                _validate_octo_url(url, "OCTO_API_URL")
+
     def test_error_message_names_the_env_var(self):
         # Operators reading the error need to know which env var to fix.
         try:

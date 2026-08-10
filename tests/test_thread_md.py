@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -86,17 +87,185 @@ class TestEnsureMd:
         }
         assert "g1____thr_abc" in a._group_md_checked
 
-    async def test_ensure_group_md_swallows_errors(self):
+    async def test_ensure_thread_md_transport_failure_remains_retryable(self):
         a = _make_adapter()
+        get_thread_md = AsyncMock(
+            side_effect=[
+                RuntimeError("temporary outage"),
+                {"content": "recovered thread", "version": 3},
+            ]
+        )
 
-        async def fake_raise(*_a, **_kw):
-            raise RuntimeError("boom")
+        with patch(
+            "hermes_octo_plugin.adapter.api.get_thread_md", new=get_thread_md
+        ):
+            await a._ensure_thread_md("g1", "t1")
+            assert "g1____t1" not in a._group_md_checked
+            assert "g1____t1" not in a._group_md_cache
 
-        with patch("hermes_octo_plugin.adapter.api.get_group_md", new=fake_raise):
+            await a._ensure_thread_md("g1", "t1")
+
+        assert get_thread_md.await_count == 2
+        assert "g1____t1" in a._group_md_checked
+        assert a._group_md_cache["g1____t1"] == {
+            "content": "recovered thread",
+            "version": 3,
+        }
+
+    async def test_ensure_group_md_transport_failure_remains_retryable(self):
+        a = _make_adapter()
+        get_group_md = AsyncMock(
+            side_effect=[
+                RuntimeError("temporary outage"),
+                {"content": "recovered", "version": 2},
+            ]
+        )
+
+        with patch(
+            "hermes_octo_plugin.adapter.api.get_group_md", new=get_group_md
+        ):
             await a._ensure_group_md("g1")
-        assert "g1" not in a._group_md_cache
-        # _checked is still set so we don't retry on every message
+            assert "g1" not in a._group_md_checked
+            assert "g1" not in a._group_md_cache
+
+            await a._ensure_group_md("g1")
+
+        assert get_group_md.await_count == 2
         assert "g1" in a._group_md_checked
+        assert a._group_md_cache["g1"] == {
+            "content": "recovered",
+            "version": 2,
+        }
+
+    @pytest.mark.parametrize("scope", ["group", "thread"])
+    async def test_inflight_md_fetch_cannot_restore_evicted_group_scope(self, scope):
+        a = _make_adapter()
+        a._write_md_to_disk = MagicMock()
+        a._delete_md_from_disk = MagicMock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_group_md(_session, _url, _token, _group_no):
+            entered.set()
+            await release.wait()
+            return {"content": "stale group", "version": 7}
+
+        async def blocked_thread_md(
+            _session, _url, _token, *, group_no, short_id
+        ):
+            assert (group_no, short_id) == ("g1", "t1")
+            entered.set()
+            await release.wait()
+            return {"content": "stale thread", "version": 8}
+
+        target = "g1" if scope == "group" else "g1____t1"
+        fetch = (
+            a._ensure_group_md("g1")
+            if scope == "group"
+            else a._ensure_thread_md("g1", "t1")
+        )
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_md",
+                new=blocked_group_md,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.get_thread_md",
+                new=blocked_thread_md,
+            ),
+        ):
+            task = asyncio.create_task(fetch)
+            await entered.wait()
+            await a._evict_group_scope("g1")
+            release.set()
+            await task
+
+        assert target not in a._group_md_cache
+        assert target not in a._group_md_checked
+        a._write_md_to_disk.assert_not_called()
+
+    @pytest.mark.parametrize("scope", ["group", "thread"])
+    async def test_md_fetch_scheduled_before_eviction_but_started_afterward_is_ignored(
+        self, scope
+    ):
+        a = _make_adapter()
+        a._known_group_ids.add("g1")
+        a._write_md_to_disk = MagicMock()
+        a._delete_md_from_disk = MagicMock()
+        target = "g1" if scope == "group" else "g1____t1"
+        get_group_md = AsyncMock(
+            return_value={"content": "late group", "version": 14}
+        )
+        get_thread_md = AsyncMock(
+            return_value={"content": "late thread", "version": 15}
+        )
+
+        fetch = (
+            a._ensure_group_md("g1")
+            if scope == "group"
+            else a._ensure_thread_md("g1", "t1")
+        )
+        await a._evict_group_scope("g1")
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_md",
+                get_group_md,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.get_thread_md",
+                get_thread_md,
+            ),
+        ):
+            await fetch
+
+        assert target not in a._group_md_cache
+        assert target not in a._group_md_checked
+        get_group_md.assert_not_awaited()
+        get_thread_md.assert_not_awaited()
+
+    @pytest.mark.parametrize("scope", ["group", "thread"])
+    async def test_md_delete_event_invalidates_an_older_inflight_fetch(self, scope):
+        a = _make_adapter()
+        a._write_md_to_disk = MagicMock()
+        a._delete_md_from_disk = MagicMock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_group_md(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return {"content": "deleted group", "version": 12}
+
+        async def blocked_thread_md(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return {"content": "deleted thread", "version": 13}
+
+        target = "g1" if scope == "group" else "g1____t1"
+        fetch = (
+            a._ensure_group_md("g1")
+            if scope == "group"
+            else a._ensure_thread_md("g1", "t1")
+        )
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_md",
+                new=blocked_group_md,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.get_thread_md",
+                new=blocked_thread_md,
+            ),
+        ):
+            task = asyncio.create_task(fetch)
+            await entered.wait()
+            a._handle_group_md_event(target, "group_md_deleted")
+            release.set()
+            await task
+
+        assert target not in a._group_md_cache
+        assert target not in a._group_md_checked
+        a._write_md_to_disk.assert_not_called()
 
 
 # ─── _handle_group_md_event ──────────────────────────────────────────────────
@@ -172,3 +341,74 @@ class TestRefreshGroupMd:
 
         assert called_group
         assert a._group_md_cache["g1"] == {"content": "fresh group md", "version": 4}
+
+    @pytest.mark.parametrize("scope", ["group", "thread"])
+    async def test_inflight_refresh_cannot_restore_evicted_group_scope(self, scope):
+        a = _make_adapter()
+        a._write_md_to_disk = MagicMock()
+        a._delete_md_from_disk = MagicMock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_group_md(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return {"content": "stale group", "version": 10}
+
+        async def blocked_thread_md(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return {"content": "stale thread", "version": 11}
+
+        target = "g1" if scope == "group" else "g1____t1"
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_md",
+                new=blocked_group_md,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.get_thread_md",
+                new=blocked_thread_md,
+            ),
+        ):
+            task = asyncio.create_task(a._refresh_group_md(target))
+            await entered.wait()
+            await a._evict_group_scope("g1")
+            release.set()
+            await task
+
+        assert target not in a._group_md_cache
+        a._write_md_to_disk.assert_not_called()
+
+    @pytest.mark.parametrize("scope", ["group", "thread"])
+    async def test_refresh_scheduled_by_update_cannot_run_after_delete(self, scope):
+        a = _make_adapter()
+        a._known_group_ids.add("g1")
+        a._write_md_to_disk = MagicMock()
+        a._delete_md_from_disk = MagicMock()
+        target = "g1" if scope == "group" else "g1____t1"
+        get_group_md = AsyncMock(
+            return_value={"content": "deleted group", "version": 16}
+        )
+        get_thread_md = AsyncMock(
+            return_value={"content": "deleted thread", "version": 17}
+        )
+
+        a._handle_group_md_event(target, "group_md_updated")
+        refresh = a._refresh_group_md(target)
+        a._handle_group_md_event(target, "group_md_deleted")
+        with (
+            patch(
+                "hermes_octo_plugin.adapter.api.get_group_md",
+                get_group_md,
+            ),
+            patch(
+                "hermes_octo_plugin.adapter.api.get_thread_md",
+                get_thread_md,
+            ),
+        ):
+            await refresh
+
+        assert target not in a._group_md_cache
+        get_group_md.assert_not_awaited()
+        get_thread_md.assert_not_awaited()

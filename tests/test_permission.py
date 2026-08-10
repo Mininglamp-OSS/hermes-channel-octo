@@ -93,15 +93,16 @@ class TestCheckPermission:
         )
         assert r.allowed
 
-    async def test_owner_full_group_access_skips_member_check(self):
+    async def test_owner_group_access_still_requires_membership(self):
         r = await check_permission(
             requester_uid=OWNER,
-            channel_id=GROUP_BETA,       # bot's owner is not in group_beta
+            channel_id=GROUP_BETA,
             channel_type=ChannelType.Group,
             owner_uid=OWNER,
-            fetch_group_members=_members_alice_only,  # would deny Alice/Bob
+            fetch_group_members=_members_alice_only,
         )
-        assert r.allowed
+        assert not r.allowed
+        assert "not in this group" in (r.reason or "")
 
     async def test_dm_own_allowed(self):
         r = await check_permission(
@@ -143,7 +144,7 @@ class TestCheckPermission:
             fetch_group_members=_members_alice_only,
         )
         assert not r.allowed
-        assert "not in this group" in r.reason
+        assert "not in this group" in (r.reason or "")
 
     async def test_group_fetch_failure_denied(self):
         r = await check_permission(

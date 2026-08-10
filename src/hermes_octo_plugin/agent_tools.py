@@ -24,14 +24,18 @@ Permissions:
   - All operations that hit a specific channel honour
     :meth:`OctoAdapter.check_read_permission` semantics (replicated locally
     so we can use the per-call session).
+  - Requester identity comes only from Hermes' trusted task-local Octo session;
+    the model-facing schema never asks the model to repeat an authenticated UID.
   - Mutating operations (create-group / add-members / group-md-update /
-    voice-context-update) require *requester_uid* to equal the bot owner.
+    voice-context-update) require that trusted requester to equal the bot owner.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
+import uuid
 from datetime import UTC
 from typing import Any
 
@@ -42,6 +46,34 @@ from .permission import check_permission, parse_target
 from .types import ChannelType
 
 logger = logging.getLogger(__name__)
+
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _new_guarded_http_session(api_url: str) -> aiohttp.ClientSession:
+    """Create a per-call session without bypassing the adapter's SSRF policy."""
+    from .adapter import _new_guarded_http_session as _factory
+
+    return _factory(api_url)
+
+
+def _valid_resource_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_RESOURCE_ID_RE.fullmatch(value))
+
+
+def _valid_target_channel_id(channel_id: str, channel_type: ChannelType) -> bool:
+    if channel_type == ChannelType.DM:
+        return True
+    if channel_type == ChannelType.Group:
+        return _valid_resource_id(channel_id)
+    if channel_type == ChannelType.CommunityTopic:
+        group_id, separator, short_id = channel_id.partition("____")
+        return bool(
+            separator
+            and _valid_resource_id(group_id)
+            and _valid_resource_id(short_id)
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +130,7 @@ TOOL_SCHEMA = {
         "an action parameter — pick the action and supply the required "
         "fields. Cross-channel read enforces permissions: only the bot "
         "owner may read another user's DM; group/thread reads require "
-        "the requester to be a member. Pass `requester_uid` (the uid of "
-        "the human currently chatting with the bot) for ALL read / "
-        "search / mutation calls so permission checks have something to "
-        "evaluate; omit it only for owner-only admin calls that you are "
-        "running on the owner's behalf."
+        "the trusted current-session requester to be a member."
     ),
     "parameters": {
         "type": "object",
@@ -202,15 +230,6 @@ TOOL_SCHEMA = {
                     "leave-thread, thread-md-read, thread-md-update."
                 ),
             },
-            "requester_uid": {
-                "type": "string",
-                "description": (
-                    "uid of the human who triggered this call (the sender "
-                    "of the current Octo message). Used for permission "
-                    "checks on read / search / mutation actions. Omit only "
-                    "for owner-initiated admin calls."
-                ),
-            },
         },
         "required": ["action"],
     },
@@ -281,15 +300,31 @@ def _require_owner(adapter, requester_uid: str | None, action: str) -> str | Non
     if requester_uid and owner and requester_uid == owner:
         return None
     if not requester_uid:
-        # Implicit owner attribution is OK only when we have an owner on file.
-        # Otherwise refuse — better than mutating with no accountability.
-        if owner:
-            return None
-        return _err(f"action '{action}' requires requester_uid; owner unknown")
+        return _err(f"action '{action}' requires requester_uid")
     return _err(
         f"action '{action}' requires bot-owner privileges; "
         f"requester {requester_uid!r} is not the owner"
     )
+
+
+def _trusted_requester_uid() -> str | None:
+    """Read caller identity from Hermes' task-local gateway session context.
+
+    Tool arguments are model-controlled and therefore cannot authenticate the
+    requester. Hermes 0.20 propagates these ContextVars into async tool worker
+    threads. Older/incompatible runtimes that cannot provide the context are
+    denied rather than falling back to a claimed uid.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        requester_uid = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    except Exception:
+        return None
+    if platform != "octo" or not requester_uid:
+        return None
+    return requester_uid
 
 
 # ---------------------------------------------------------------------------
@@ -298,11 +333,79 @@ def _require_owner(adapter, requester_uid: str | None, action: str) -> str | Non
 
 
 OWNER_ONLY_ACTIONS = frozenset({
+    # Space-wide enumeration and voice context are not scoped to one group.
+    "list-groups", "search-members", "voice-context-read",
     "create-group", "update-group", "add-members", "remove-members",
     "group-md-update", "create-thread", "delete-thread", "join-thread",
     "leave-thread", "thread-md-update",
     "voice-context-update", "voice-context-delete",
 })
+
+
+# Metadata reads are scoped to the requesting user's membership in the parent
+# group.  A topic (thread) is represented as ``{group_no}____{short_id}``, so
+# its authorization must use the parent group roster rather than treating the
+# thread identifier as a standalone group.
+GROUP_READ_ACTIONS = frozenset({
+    "group-info", "group-members", "group-md-read", "list-threads",
+})
+THREAD_READ_ACTIONS = frozenset({
+    "get-thread", "list-thread-members", "thread-md-read",
+})
+
+
+async def _authorize_group_or_thread_read(
+    *,
+    action: str,
+    args: dict[str, Any],
+    requester_uid: str,
+    adapter: Any,
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+) -> str | None:
+    """Return an error when a scoped metadata read lacks parent membership."""
+    if action not in GROUP_READ_ACTIONS | THREAD_READ_ACTIONS:
+        return None
+
+    group_id = args.get("group_id")
+    if not group_id:
+        return None
+
+    if action in THREAD_READ_ACTIONS:
+        short_id = args.get("short_id")
+        if not short_id:
+            return None
+        channel_id = f"{group_id}____{short_id}"
+        channel_type = ChannelType.CommunityTopic
+    else:
+        channel_id = group_id
+        channel_type = ChannelType.Group
+
+    async def _fetch_members(parent_group_id: str):
+        return await api.get_group_members(
+            session, api_url, bot_token, parent_group_id
+        )
+
+    result = await check_permission(
+        requester_uid=requester_uid,
+        channel_id=channel_id,
+        channel_type=channel_type,
+        owner_uid=adapter._owner_uid,
+        fetch_group_members=_fetch_members,
+    )
+    if result.allowed:
+        return None
+
+    _audit(
+        action=action,
+        requester=requester_uid,
+        target=channel_id,
+        channel_type=int(channel_type),
+        result="denied",
+        reason=result.reason,
+    )
+    return _err(result.reason or "permission denied")
 
 
 async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR0911,PLR0912
@@ -320,7 +423,19 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
     if not api_url or not bot_token:
         return _err("Octo adapter is not configured (missing api_url / bot_token)")
 
-    requester_uid: str | None = args.get("requester_uid")
+    requester_uid = _trusted_requester_uid()
+    if not requester_uid:
+        return _err(
+            f"action '{action}' requires a trusted Octo session requester"
+        )
+
+    # These values become URL path segments in the API layer. Reject malformed
+    # input before opening a session or performing a membership lookup; API
+    # helpers validate again as defense in depth.
+    for field in ("group_id", "short_id"):
+        value = args.get(field)
+        if value is not None and not _valid_resource_id(value):
+            return _err(f"invalid {field}")
 
     if action in OWNER_ONLY_ACTIONS:
         err = _require_owner(adapter, requester_uid, action)
@@ -335,8 +450,19 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
     # session lives in the gateway loop and would explode under _run_async's
     # worker-thread loop with "Timeout context manager should be used inside a
     # task". The session closes on context exit so we don't leak FDs.
-    async with aiohttp.ClientSession() as session:
+    async with _new_guarded_http_session(api_url) as session:
         try:
+            if (err := await _authorize_group_or_thread_read(
+                action=action,
+                args=args,
+                requester_uid=requester_uid,
+                adapter=adapter,
+                session=session,
+                api_url=api_url,
+                bot_token=bot_token,
+            )):
+                return err
+
             if action == "list-groups":
                 groups = await api.fetch_bot_groups(session, api_url, bot_token)
                 return _ok({
@@ -395,6 +521,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 channel_id, channel_type = parse_target(
                     args["target"], known_group_ids=adapter._known_group_ids,
                 )
+                if not _valid_target_channel_id(channel_id, channel_type):
+                    return _err("invalid target channel id")
 
                 async def _fetch_members(group_no: str):
                     return await api.get_group_members(session, api_url, bot_token, group_no)
@@ -436,6 +564,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 channel_id, channel_type = parse_target(
                     args["target"], known_group_ids=adapter._known_group_ids,
                 )
+                if not _valid_target_channel_id(channel_id, channel_type):
+                    return _err("invalid target channel id")
 
                 async def _fetch_members(group_no: str):
                     return await api.get_group_members(session, api_url, bot_token, group_no)
@@ -462,24 +592,11 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     mention_uids = None
                     mention_all = False
 
-                # Threads: the server accepts messages from non-members (HTTP 2xx)
-                # but does not push them to subscribers. Best-effort join before
-                # send so newly-created threads receive M1. Already-joined / race
-                # errors are expected and swallowed.
-                if channel_type == ChannelType.CommunityTopic and "____" in channel_id:
-                    group_no, short_id = channel_id.split("____", 1)
-                    try:
-                        await api.join_thread(
-                            session, api_url, bot_token,
-                            group_no=group_no, short_id=short_id,
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "join_thread best-effort before send-message failed "
-                            "(likely already joined): %s", exc
-                        )
-
-                await api.send_message(
+                # Joining/leaving a thread mutates bot membership and remains
+                # an explicit owner-only action. Sending must not smuggle that
+                # mutation past the permission boundary.
+                client_msg_no = str(uuid.uuid4())
+                send_result = await api.send_message(
                     session, api_url, bot_token,
                     channel_id=channel_id,
                     channel_type=channel_type,
@@ -487,16 +604,23 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     mention_uids=mention_uids,
                     mention_all=mention_all,
                     reply_msg_id=args.get("reply_to_message_id") or None,
+                    client_msg_no=client_msg_no,
+                    on_behalf_of=adapter.on_behalf_of,
                 )
                 _audit(
                     action="send-message", requester=requester_uid,
                     target=args["target"], channel_type=int(channel_type),
                 )
-                return _ok({
+                response: dict[str, Any] = {
                     "sent": True,
                     "channel_id": channel_id,
                     "channel_type": int(channel_type),
-                })
+                }
+                for field in ("message_id", "message_seq", "client_msg_no"):
+                    value = getattr(send_result, field, None)
+                    if value is not None:
+                        response[field] = value
+                return _ok(response)
 
             if action == "group-md-read":
                 if (e := _require(args, "group_id")):
@@ -540,6 +664,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
             if action == "update-group":
                 if (e := _require(args, "group_id")):
                     return e
+                if args.get("name") is None and args.get("notice") is None:
+                    return _err("update-group requires at least one of: name, notice")
                 await api.update_group(
                     session, api_url, bot_token,
                     group_no=group_id,
@@ -691,7 +817,12 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 return _ok({"deleted": True})
 
         except Exception as e:
-            logger.exception("octo_management action %s failed", action)
-            return _err(f"{action} failed: {type(e).__name__}: {e}")
+            # API/backend exception text can contain response diagnostics or
+            # credentials.  Keep the tool boundary deterministic and safe;
+            # the exception type is logged without serializing its message.
+            logger.error(
+                "octo_management action %s failed (%s)", action, type(e).__name__
+            )
+            return _err(f"{action} failed: upstream request failed")
 
     return _err(f"unhandled action: {action}")

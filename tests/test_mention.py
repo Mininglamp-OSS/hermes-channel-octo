@@ -6,12 +6,50 @@ import pytest
 from hermes_octo_plugin.mention import (
     extract_mention_uids,
     convert_content_for_llm,
+    strip_leading_self_mention_for_command,
     build_entities_from_fallback,
     MAX_MENTIONS_PER_MESSAGE,
     MENTION_PATTERN,
     STRUCTURED_MENTION_PATTERN,
 )
 from hermes_octo_plugin.types import MentionEntity, MentionPayload
+from gateway.platforms.base import MessageEvent
+
+
+class TestStripLeadingSelfMentionForCommand:
+    def test_structured_self_mention_exposes_slash_command_to_gateway(self):
+        text = strip_leading_self_mention_for_command(
+            "@[xiaoaitongxue_bot:小爱] /new",
+            bot_uid="xiaoaitongxue_bot",
+            bot_name="小爱",
+        )
+
+        assert text == "/new"
+        assert MessageEvent(text=text).get_command() == "new"
+
+    def test_plain_self_mention_fallback_exposes_slash_command(self):
+        text = strip_leading_self_mention_for_command(
+            "@小爱 /new",
+            bot_uid="xiaoaitongxue_bot",
+            bot_name="小爱",
+        )
+
+        assert text == "/new"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "@[xiaoaitongxue_bot:小爱] 帮我解释 /new",
+            "@[other_bot:小产] /new",
+            "先看看 @[xiaoaitongxue_bot:小爱] /new",
+        ],
+    )
+    def test_non_routing_mentions_remain_unchanged(self, text):
+        assert strip_leading_self_mention_for_command(
+            text,
+            bot_uid="xiaoaitongxue_bot",
+            bot_name="小爱",
+        ) == text
 
 
 class TestExtractMentionUids:

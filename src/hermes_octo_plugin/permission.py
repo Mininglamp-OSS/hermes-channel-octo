@@ -2,8 +2,9 @@
 Cross-channel access control for Octo message queries.
 
 Rules:
-- Owner of the bot → full access (all DMs and groups).
-- DM channels    → requester may only query their own DM with the bot.
+- Bot owner       → may query any DM, but not groups they have not joined.
+- DM channels    → requester may only query their own DM with the bot, unless
+  they are the bot owner.
 - Group channels → requester must currently be a member of the group.
 - Thread (CommunityTopic, channel_type=5) → requester must be a member of
   the parent group (parent group_no is the prefix before "____").
@@ -18,8 +19,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+import logging
 
 from .types import ChannelType, GroupMember
+
+logger = logging.getLogger(__name__)
 
 # Coroutine signature: group_no -> list[GroupMember]
 GroupMembersFetcher = Callable[[str], Awaitable[list[GroupMember]]]
@@ -42,10 +46,9 @@ async def check_permission(
     if not requester_uid:
         return PermissionResult(False, "Unable to identify requester")
 
-    if owner_uid and requester_uid == owner_uid:
-        return PermissionResult(True)
-
     if channel_type == ChannelType.DM:
+        if owner_uid and requester_uid == owner_uid:
+            return PermissionResult(True)
         if channel_id != requester_uid:
             return PermissionResult(False, "Not allowed to query another user's DM with the bot")
         return PermissionResult(True)
@@ -77,7 +80,12 @@ async def _check_group_membership(
     try:
         members = await fetch_group_members(group_no)
     except Exception as e:  # network failure should not silently grant access
-        return PermissionResult(False, f"Group member lookup failed: {e}")
+        # Tool callers receive a stable, secret-free denial. Keep only the
+        # exception class in logs: upstream messages can include credentials.
+        logger.warning(
+            "Group member lookup failed for %s (%s)", group_no, type(e).__name__
+        )
+        return PermissionResult(False, "Group member lookup failed")
 
     member_uids = {m.uid for m in members if m.uid}
     if requester_uid not in member_uids:

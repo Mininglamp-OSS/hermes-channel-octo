@@ -7,20 +7,29 @@ All API calls use aiohttp with Bearer token authentication.
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
+import binascii
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
+import stat
 import struct
 import time
-from typing import Any
-from urllib.parse import quote
+import uuid
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import quote, unquote, unquote_to_bytes, urlencode, urljoin, urlparse
 
 import aiohttp
 
 from .types import (
+    CARD_VERSION,
+    CardProfileManifest,
+    CardTemplateCapability,
+    CardTemplateViewCapability,
+    CardTemplatingCapability,
     BotRegisterResp,
     ChannelType,
     GroupInfo,
@@ -28,13 +37,54 @@ from .types import (
     MentionEntity,
     MessageType,
     RichTextBlock,
+    SendMessageResult,
+    resolve_card_profile,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+MAX_EVENT_WAIT_SECONDS = 30
+EVENT_POLL_WAIT_MARGIN_SECONDS = 10
+_API_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _api_path_segment(value: str, name: str) -> str:
+    """Validate and encode one server resource identifier for a URL path."""
+    if not isinstance(value, str) or not _API_PATH_SEGMENT_RE.fullmatch(value):
+        raise ValueError(f"invalid Octo {name}")
+    return quote(value, safe="")
+
+
+class OctoApiError(RuntimeError):
+    """A safe, structured failure from an authenticated Octo API request.
+
+    Response bodies can contain implementation details and should never be
+    copied into agent-tool output.  Callers that need compatibility handling
+    can inspect ``status`` without parsing a response body.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        status: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.path = path
+        self.status = status
+        suffix = f" (HTTP {status})" if status is not None else ""
+        detail = f": {reason}" if reason else ""
+        super().__init__(f"Octo API request failed{suffix}{detail}")
+
+
+def _response_error(path: str, response: aiohttp.ClientResponse) -> OctoApiError:
+    """Create a secret-free error for a non-success HTTP response."""
+    return OctoApiError(path, status=response.status)
+
 
 # ─── MIME Type Helpers ───────────────────────────────────────────────────────
+MAX_OUTBOUND_MEDIA_BYTES = 100 * 1024 * 1024
 
 _MIME_MAP: dict[str, str] = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -53,12 +103,104 @@ _MIME_MAP: dict[str, str] = {
     ".csv": "text/csv", ".html": "text/html",
     ".json": "application/json",
 }
+_DATA_URI_EXTENSION_MAP = {
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "application/json": ".json",
+    "application/pdf": ".pdf",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "video/mp4": ".mp4",
+}
 
 
 def infer_content_type(filename: str) -> str:
     """Infer MIME type from filename extension."""
     ext = os.path.splitext(filename)[1].lower()
     return _MIME_MAP.get(ext, "application/octet-stream")
+
+def decode_media_data_uri(
+    source: str,
+    *,
+    max_size: int,
+) -> tuple[bytes, str, str]:
+    """Decode one OpenClaw-compatible outbound media data URI."""
+    if not source.startswith("data:") or "," not in source or max_size <= 0:
+        raise ValueError("invalid media data URI")
+    header, encoded = source[5:].split(",", 1)
+    parts = header.split(";")
+    content_type = parts[0].strip().lower() or "application/octet-stream"
+    is_base64 = any(part.strip().lower() == "base64" for part in parts[1:])
+    try:
+        if is_base64:
+            compact = re.sub(r"\s+", "", encoded)
+            padding = 2 if compact.endswith("==") else 1 if compact.endswith("=") else 0
+            estimated_size = (len(compact) * 3 // 4) - padding
+            if estimated_size > max_size:
+                raise ValueError(f"media exceeds the {max_size}-byte limit")
+            data = base64.b64decode(compact, validate=True)
+        else:
+            if len(encoded) > max_size * 3:
+                raise ValueError(f"media exceeds the {max_size}-byte limit")
+            data = unquote_to_bytes(encoded)
+    except (binascii.Error, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("media exceeds"):
+            raise
+        raise ValueError("invalid media data URI") from exc
+    if len(data) > max_size:
+        raise ValueError(f"media exceeds the {max_size}-byte limit")
+    extension = _DATA_URI_EXTENSION_MAP.get(content_type, ".bin")
+    return data, content_type, f"file{extension}"
+
+
+
+def read_local_media(
+    source: str,
+    *,
+    max_size: int,
+) -> tuple[bytes, str]:
+    """Read a regular local file up to Octo's outbound upload limit."""
+    if source.startswith("file://"):
+        parsed = urlparse(source)
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError("local media source is unavailable")
+        source = unquote(parsed.path)
+    if not isinstance(source, str) or not source or max_size <= 0:
+        raise ValueError("local media source is unavailable")
+    try:
+        candidate = Path(source).expanduser().resolve(strict=True)
+        before = candidate.stat()
+    except OSError as exc:
+        raise ValueError("local media source is unavailable") from exc
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as exc:
+        raise ValueError("local media source is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError("local media source is unavailable")
+        if opened.st_size > max_size:
+            raise ValueError(f"media exceeds the {max_size}-byte limit")
+        data = bytearray()
+        while len(data) <= max_size:
+            chunk = os.read(descriptor, min(1 << 20, max_size + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > max_size:
+            raise ValueError(f"media exceeds the {max_size}-byte limit")
+        return bytes(data), candidate.name
+    finally:
+        os.close(descriptor)
 
 
 def parse_image_dimensions(data: bytes, mime: str) -> tuple[int, int] | None:
@@ -108,7 +250,9 @@ async def post_json(
     bot_token: str,
     path: str,
     payload: dict[str, Any],
-) -> dict[str, Any] | None:
+    *,
+    timeout: aiohttp.ClientTimeout | None = None,
+) -> Any | None:
     """
     POST JSON to a Octo API endpoint with Bearer auth.
 
@@ -118,27 +262,27 @@ async def post_json(
         bot_token: Bot authentication token.
         path: API path (e.g. /v1/bot/sendMessage).
         payload: JSON body dict.
+        timeout: Optional request-specific timeout.
 
     Returns:
         Parsed JSON response dict, or None if empty response.
 
     Raises:
-        aiohttp.ClientResponseError: On non-2xx responses.
+        OctoApiError: On non-2xx responses, without exposing response text.
     """
     url = f"{api_url.rstrip('/')}{path}"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {bot_token}",
     }
-    async with session.post(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
+    async with session.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=timeout or DEFAULT_TIMEOUT,
+    ) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise aiohttp.ClientResponseError(
-                resp.request_info,
-                resp.history,
-                status=resp.status,
-                message=f"Octo API {path} failed ({resp.status}): {text or resp.reason}",
-            )
+            raise _response_error(path, resp)
         text = await resp.text()
         if not text:
             return None
@@ -150,28 +294,188 @@ async def get_json(
     api_url: str,
     bot_token: str,
     path: str,
-) -> dict[str, Any] | None:
+) -> Any | None:
     """
     GET JSON from a Octo API endpoint with Bearer auth.
 
     Returns:
-        Parsed JSON response dict, or None on error.
+        Parsed JSON response value, or None for an empty successful response.
     """
     url = f"{api_url.rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {bot_token}"}
     async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise aiohttp.ClientResponseError(
-                resp.request_info,
-                resp.history,
-                status=resp.status,
-                message=f"Octo API {path} failed ({resp.status}): {text or resp.reason}",
-            )
+            raise _response_error(path, resp)
         text = await resp.text()
         if not text:
             return None
         return await resp.json(content_type=None)
+
+
+def _string_items(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _parse_card_templating(value: Any) -> CardTemplatingCapability | None:
+    if not isinstance(value, dict):
+        return None
+    templates: list[CardTemplateCapability] = []
+    raw_templates = value.get("templates")
+    if isinstance(raw_templates, list):
+        for raw_template in raw_templates:
+            if not isinstance(raw_template, dict):
+                continue
+            template_id = raw_template.get("id")
+            version = raw_template.get("version")
+            if not isinstance(template_id, str) or not isinstance(version, str):
+                continue
+            views: list[CardTemplateViewCapability] = []
+            raw_views = raw_template.get("views")
+            if isinstance(raw_views, list):
+                for raw_view in raw_views:
+                    if not isinstance(raw_view, dict):
+                        continue
+                    name = raw_view.get("name")
+                    wire_profile = raw_view.get("wire_profile")
+                    if not isinstance(name, str) or not isinstance(wire_profile, str):
+                        continue
+                    views.append(
+                        CardTemplateViewCapability(
+                            name=name,
+                            wire_profile=wire_profile,
+                            states=_string_items(raw_view.get("states")),
+                            submit_actions=_string_items(
+                                raw_view.get("submit_actions")
+                            ),
+                        )
+                    )
+            templates.append(
+                CardTemplateCapability(
+                    id=template_id,
+                    version=version,
+                    views=tuple(views),
+                )
+            )
+    wire = value.get("wire")
+    return CardTemplatingCapability(
+        supported=value.get("supported") is True,
+        wire=wire if isinstance(wire, str) else "",
+        templates=tuple(templates),
+    )
+
+
+async def get_card_profile(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+) -> CardProfileManifest:
+    """Read and normalize the optional Type-17 capability manifest."""
+    path = "/v1/bot/card/profile"
+    try:
+        raw = await get_json(session, api_url, bot_token, path)
+    except OctoApiError as exc:
+        if exc.status == 404:
+            return CardProfileManifest(available=False, enabled=False)
+        raise
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        raise OctoApiError(path, reason="transport failure") from exc
+    except (TypeError, ValueError):
+        raw = None
+
+    if not isinstance(raw, dict):
+        return CardProfileManifest(available=True, enabled=False)
+
+    def string_tuple(name: str) -> tuple[str, ...] | None:
+        value = raw.get(name)
+        if not isinstance(value, list):
+            return None
+        return tuple(item for item in value if isinstance(item, str))
+
+    card_version = raw.get("card_version")
+    limits = raw.get("limits")
+    return CardProfileManifest(
+        available=True,
+        enabled=raw.get("enabled") is True or raw.get("enabled") == 1,
+        profiles=string_tuple("profiles"),
+        card_version=card_version if isinstance(card_version, str) else None,
+        elements=string_tuple("elements"),
+        inputs=string_tuple("inputs"),
+        actions=string_tuple("actions"),
+        limits=limits if isinstance(limits, dict) else {},
+        templating=_parse_card_templating(raw.get("templating")),
+    )
+
+
+async def fetch_bot_events(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    since_event_id: int = 0,
+    limit: int = 20,
+    wait_seconds: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch bot events strictly after the supplied server cursor."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("event limit must be an integer")
+    if wait_seconds is not None and (
+        isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int)
+    ):
+        raise ValueError("event wait_seconds must be an integer")
+
+    bounded_limit = max(1, min(100, limit))
+    bounded_wait = (
+        min(MAX_EVENT_WAIT_SECONDS, wait_seconds)
+        if wait_seconds is not None and wait_seconds > 0
+        else 0
+    )
+    body: dict[str, Any] = {
+        "event_id": since_event_id,
+        "limit": bounded_limit,
+    }
+    if bounded_wait > 0:
+        body["wait"] = bounded_wait
+    request_timeout = aiohttp.ClientTimeout(
+        total=max(
+            DEFAULT_TIMEOUT.total or 0,
+            bounded_wait + EVENT_POLL_WAIT_MARGIN_SECONDS,
+        )
+    )
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/events",
+        body,
+        timeout=request_timeout,
+    )
+    if not isinstance(result, dict):
+        return []
+    events = result.get("results")
+    if not isinstance(events, list):
+        return []
+    return [event for event in events if isinstance(event, dict)]
+
+
+async def ack_bot_event(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    event_id: int,
+) -> None:
+    """Acknowledge a bot event after the caller has accepted it locally."""
+    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0:
+        raise ValueError("event_id must be a non-negative integer")
+    await post_json(
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/events/{event_id}/ack",
+        {},
+    )
 
 
 # ─── Bot Registration ────────────────────────────────────────────────────────
@@ -216,6 +520,48 @@ async def register_bot(
 # ─── Message Sending ─────────────────────────────────────────────────────────
 
 
+def _parse_send_message_result(
+    result: object,
+    *,
+    requested_client_msg_no: str,
+) -> SendMessageResult:
+    data = result if isinstance(result, dict) else {}
+    raw_message_id = data.get("message_id")
+    message_id = (
+        str(raw_message_id)
+        if isinstance(raw_message_id, (str, int))
+        and not isinstance(raw_message_id, bool)
+        else None
+    )
+    if not message_id:
+        raise OctoApiError(
+            "/v1/bot/sendMessage",
+            reason="missing message_id in success response",
+        )
+    raw_message_seq = data.get("message_seq")
+    try:
+        message_seq = (
+            int(raw_message_seq)
+            if isinstance(raw_message_seq, (str, int))
+            and not isinstance(raw_message_seq, bool)
+            else None
+        )
+    except (TypeError, ValueError):
+        message_seq = None
+    raw_client_msg_no = data.get("client_msg_no")
+    response_client_msg_no = (
+        str(raw_client_msg_no)
+        if isinstance(raw_client_msg_no, (str, int))
+        and not isinstance(raw_client_msg_no, bool)
+        else requested_client_msg_no
+    )
+    return SendMessageResult(
+        message_id=message_id,
+        message_seq=message_seq,
+        client_msg_no=response_client_msg_no,
+    )
+
+
 async def send_message(
     session: aiohttp.ClientSession,
     api_url: str,
@@ -228,7 +574,9 @@ async def send_message(
     mention_all: bool = False,
     stream_no: str | None = None,
     reply_msg_id: str | None = None,
-) -> None:
+    client_msg_no: str | None = None,
+    on_behalf_of: str | None = None,
+) -> SendMessageResult:
     """
     Send a text message to a channel.
 
@@ -272,11 +620,167 @@ async def send_message(
         "channel_id": channel_id,
         "channel_type": channel_type,
         "payload": payload,
+        "client_msg_no": client_msg_no or str(uuid.uuid4()),
     }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
     if stream_no:
         body["stream_no"] = stream_no
 
-    await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", body)
+    result = await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", body)
+    return _parse_send_message_result(
+        result,
+        requested_client_msg_no=body["client_msg_no"],
+    )
+
+
+async def send_card_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    channel_id: str,
+    channel_type: ChannelType,
+    card: dict[str, Any],
+    plain: str | None = None,
+    client_msg_no: str | None = None,
+    profile: str | None = None,
+    on_behalf_of: str | None = None,
+) -> SendMessageResult:
+    """Send an Adaptive Card using Octo's Type-17 envelope."""
+    from . import cards as card_renderer
+
+    resolved_profile = resolve_card_profile(card, profile)
+    card_renderer.validate_card_limits(
+        card,
+        plain,
+        None,
+        profile=resolved_profile,
+    )
+    payload: dict[str, Any] = {
+        "type": MessageType.InteractiveCard,
+        "card": card,
+        "profile": resolved_profile,
+        "card_version": CARD_VERSION,
+    }
+    if plain is not None:
+        payload["plain"] = plain
+
+    requested_client_msg_no = client_msg_no or str(uuid.uuid4())
+    body: dict[str, Any] = {
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "client_msg_no": requested_client_msg_no,
+        "payload": payload,
+    }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/sendMessage",
+        body,
+    )
+    return _parse_send_message_result(
+        result,
+        requested_client_msg_no=requested_client_msg_no,
+    )
+
+
+async def edit_card_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    channel_id: str,
+    channel_type: ChannelType,
+    message_id: str,
+    card: dict[str, Any],
+    card_seq: int,
+    plain: str | None = None,
+    transient: bool | None = None,
+    profile: str | None = None,
+    on_behalf_of: str | None = None,
+) -> Any | None:
+    """Replace a Type-17 card frame using a positive card sequence."""
+    if isinstance(card_seq, bool) or not isinstance(card_seq, int) or card_seq <= 0:
+        raise ValueError("card_seq must be a positive integer")
+    from . import cards as card_renderer
+
+    resolved_profile = resolve_card_profile(card, profile)
+    card_renderer.validate_card_limits(
+        card,
+        plain,
+        None,
+        profile=resolved_profile,
+        card_seq=card_seq,
+        transient=transient,
+    )
+    frame: dict[str, Any] = {
+        "type": MessageType.InteractiveCard,
+        "card": card,
+        "profile": resolved_profile,
+        "card_version": CARD_VERSION,
+    }
+    if plain is not None:
+        frame["plain"] = plain
+    frame["card_seq"] = card_seq
+    if transient is not None:
+        frame["transient"] = transient
+
+    body: dict[str, Any] = {
+        "message_id": str(message_id),
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "content_edit": json.dumps(frame),
+    }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+    return await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/message/edit",
+        body,
+    )
+
+
+async def edit_message(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    *,
+    channel_id: str,
+    channel_type: ChannelType,
+    message_id: str,
+    content: str,
+    finalize: bool = False,
+    on_behalf_of: str | None = None,
+) -> Any | None:
+    """Edit a text message using Octo's native edit envelope.
+
+    ``finalize`` is a Hermes lifecycle argument.  The current Octo contract
+    has no corresponding wire field, so it is deliberately accepted but not
+    serialized.
+    """
+    del finalize
+    body: dict[str, Any] = {
+        "message_id": str(message_id),
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "content_edit": json.dumps({"type": MessageType.Text, "content": content}),
+    }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+    return await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/message/edit",
+        body,
+    )
 
 
 async def send_typing(
@@ -285,12 +789,25 @@ async def send_typing(
     bot_token: str,
     channel_id: str,
     channel_type: ChannelType,
+    on_behalf_of: str | None = None,
 ) -> None:
     """Send typing indicator to a channel."""
-    await post_json(session, api_url, bot_token, "/v1/bot/typing", {
+    body: dict[str, Any] = {
         "channel_id": channel_id,
         "channel_type": channel_type,
-    })
+    }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+    await post_json(session, api_url, bot_token, "/v1/bot/typing", body)
+
+
+async def send_heartbeat(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+) -> Any | None:
+    """Record an authenticated Bot API heartbeat (empty envelope by contract)."""
+    return await post_json(session, api_url, bot_token, "/v1/bot/heartbeat", {})
 
 
 async def send_media_message(
@@ -305,7 +822,11 @@ async def send_media_message(
     size: int | None = None,
     width: int | None = None,
     height: int | None = None,
-) -> None:
+    duration: int | None = None,
+    reply_msg_id: str | None = None,
+    client_msg_no: str | None = None,
+    on_behalf_of: str | None = None,
+) -> SendMessageResult:
     """
     Send a media message (image, file, etc.) to a channel.
 
@@ -314,29 +835,55 @@ async def send_media_message(
         url: Media file URL.
         name: Filename (for File type).
         size: File size in bytes (for File type).
-        width: Image width (for Image type).
-        height: Image height (for Image type).
+        width: Image/GIF/Video width.
+        height: Image/GIF/Video height.
+        duration: Voice/Video duration, when the caller has it.
+        reply_msg_id: Optional message ID to reply to.
     """
+    dimension_types = {MessageType.Image, MessageType.GIF, MessageType.Video}
+    duration_types = {MessageType.Voice, MessageType.Video}
+    if (width is not None or height is not None) and msg_type not in dimension_types:
+        raise ValueError(f"width/height are not supported for media type {msg_type}")
+    if duration is not None and msg_type not in duration_types:
+        raise ValueError(f"duration is not supported for media type {msg_type}")
+
     payload: dict[str, Any] = {
         "type": msg_type,
         "url": url,
     }
-    if msg_type == MessageType.Image:
-        if width:
-            payload["width"] = width
-        if height:
-            payload["height"] = height
-    else:
-        if name:
-            payload["name"] = name
-        if size is not None:
-            payload["size"] = size
+    if name:
+        payload["name"] = name
+    if size is not None:
+        payload["size"] = size
+    if width is not None:
+        payload["width"] = width
+    if height is not None:
+        payload["height"] = height
+    if duration is not None:
+        payload["duration"] = duration
+    if reply_msg_id:
+        payload["reply"] = {"message_id": reply_msg_id}
 
-    await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", {
+    requested_client_msg_no = client_msg_no or str(uuid.uuid4())
+    body: dict[str, Any] = {
         "channel_id": channel_id,
         "channel_type": channel_type,
+        "client_msg_no": requested_client_msg_no,
         "payload": payload,
-    })
+    }
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+    result = await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/sendMessage",
+        body,
+    )
+    return _parse_send_message_result(
+        result,
+        requested_client_msg_no=requested_client_msg_no,
+    )
 
 
 async def send_rich_text_message(
@@ -351,7 +898,9 @@ async def send_rich_text_message(
     mention_entities: list[MentionEntity] | None = None,
     mention_all: bool = False,
     reply_msg_id: str | None = None,
-) -> None:
+    client_msg_no: str | None = None,
+    on_behalf_of: str | None = None,
+) -> SendMessageResult:
     """
     Send a RichText(=14) 图文混排 message.
 
@@ -400,8 +949,17 @@ async def send_rich_text_message(
         "channel_id": channel_id,
         "channel_type": channel_type,
         "payload": payload,
+        "client_msg_no": client_msg_no or str(uuid.uuid4()),
     }
-    await post_json(session, api_url, bot_token, "/v1/bot/sendMessage", body)
+    if on_behalf_of:
+        body["on_behalf_of"] = on_behalf_of
+    result = await post_json(
+        session, api_url, bot_token, "/v1/bot/sendMessage", body
+    )
+    return _parse_send_message_result(
+        result,
+        requested_client_msg_no=body["client_msg_no"],
+    )
 
 
 async def send_read_receipt(
@@ -489,170 +1047,127 @@ async def stream_end(
     })
 
 
-# ─── COS Upload ──────────────────────────────────────────────────────────────
+# ─── Backend-agnostic presigned upload ───────────────────────────────────────
 
 
-async def get_upload_credentials(
+async def get_upload_presign(
     session: aiohttp.ClientSession,
     api_url: str,
     bot_token: str,
+    *,
     filename: str,
+    file_size: int,
+    content_type: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Get STS temporary credentials for COS upload.
-
-    Returns:
-        Dict with bucket, region, key, credentials, startTime, expiredTime, cdnBaseUrl.
-
-    Raises:
-        RuntimeError: If the API returns incomplete data.
-    """
-    encoded_filename = quote(filename)
-    url = f"{api_url.rstrip('/')}/v1/bot/upload/credentials?filename={encoded_filename}"
+    """Fetch a server-issued presigned PUT target for the exact file body."""
+    if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size <= 0:
+        raise ValueError("file_size must be a positive integer")
+    query = urlencode(
+        {
+            "filename": filename,
+            "fileSize": str(file_size),
+            **({"contentType": content_type} if content_type else {}),
+        }
+    )
+    path = "/v1/bot/upload/presigned"
+    url = f"{api_url.rstrip('/')}{path}?{query}"
     headers = {"Authorization": f"Bearer {bot_token}"}
 
     async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise RuntimeError(
-                f"Octo API /v1/bot/upload/credentials failed ({resp.status}): {text or resp.reason}"
-            )
+            raise _response_error(path, resp)
         data = await resp.json()
 
-    # Validate required fields
-    for field in ("bucket", "region", "key", "credentials"):
-        if not data.get(field):
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Octo API {path} returned an invalid response")
+    raw_headers = data.get("headers", {})
+    if raw_headers is None:
+        raw_headers = {}
+    if not isinstance(raw_headers, dict) or any(
+        not isinstance(key, str)
+        or not key
+        or "\r" in key
+        or "\n" in key
+        or not isinstance(value, str)
+        or "\r" in value
+        or "\n" in value
+        for key, value in raw_headers.items()
+    ):
+        raise RuntimeError(f"Octo API {path} returned invalid signed headers")
+    signed_headers = dict(raw_headers)
+    for field in ("uploadUrl", "downloadUrl"):
+        if not isinstance(data.get(field), str) or not data[field]:
             raise RuntimeError(
-                f"Octo API /v1/bot/upload/credentials returned incomplete response: missing {field}"
+                f"Octo API {path} returned incomplete response: missing {field}"
             )
-    creds = data["credentials"]
-    for field in ("tmpSecretId", "tmpSecretKey", "sessionToken"):
-        if not creds.get(field):
-            raise RuntimeError(
-                "Octo API /v1/bot/upload/credentials returned incomplete credentials: "
-                f"missing {field}"
-            )
-    return data
+
+    header_lookup = {key.lower(): value for key, value in signed_headers.items()}
+    content_type = data.get("contentType")
+    if not isinstance(content_type, str) or not content_type:
+        content_type = header_lookup.get("content-type") or "application/octet-stream"
+    result: dict[str, Any] = {
+        "uploadUrl": data["uploadUrl"],
+        "downloadUrl": data["downloadUrl"],
+        "contentType": content_type,
+    }
+    content_disposition = data.get("contentDisposition")
+    if not isinstance(content_disposition, str):
+        content_disposition = header_lookup.get("content-disposition")
+    if content_disposition:
+        result["contentDisposition"] = content_disposition
+    if signed_headers:
+        result["headers"] = signed_headers
+    return result
 
 
-_CD_UNSAFE_RE = re.compile(r'["\\\x00-\x1f\x7f;]')
-
-
-def _build_content_disposition(
-    filename: str,
-    disposition_type: str = "attachment",
-) -> str:
-    """Build RFC 5987 Content-Disposition header value with safe ASCII fallback."""
-    is_ascii_safe = (
-        bool(re.match(r'^[\x20-\x7e]+$', filename))
-        and not _CD_UNSAFE_RE.search(filename)
-    )
-    encoded = quote(filename, safe='')
-
-    if is_ascii_safe:
-        return f'{disposition_type}; filename="{filename}"'
-
-    ext = '.' + filename.rsplit('.', 1)[1] if '.' in filename else ''
-    return f"{disposition_type}; filename=\"download{ext}\"; filename*=UTF-8''{encoded}"
-
-
-async def upload_file_to_cos(
+async def upload_file_to_presigned_url(
     session: aiohttp.ClientSession,
-    credentials: dict[str, str],
-    bucket: str,
-    region: str,
-    key: str,
+    *,
+    upload_url: str,
+    download_url: str,
     file_data: bytes,
     content_type: str,
-    cdn_base_url: str | None = None,
-    filename: str | None = None,
+    content_disposition: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> str:
-    """
-    Upload a file to COS using STS temporary credentials via HTTP PUT.
+    """PUT one exact body while replaying the server-signed request headers."""
+    put_headers = dict(headers or ())
+    if any(
+        not isinstance(key, str)
+        or not key
+        or "\r" in key
+        or "\n" in key
+        or not isinstance(value, str)
+        or "\r" in value
+        or "\n" in value
+        for key, value in put_headers.items()
+    ):
+        raise ValueError("presigned headers must be safe strings")
+    header_names = {key.lower(): key for key in put_headers}
+    expected_length = str(len(file_data))
+    signed_length_key = header_names.get("content-length")
+    if (
+        signed_length_key is not None
+        and put_headers[signed_length_key] != expected_length
+    ):
+        raise ValueError("presigned Content-Length does not match file body")
+    if signed_length_key is None:
+        put_headers["Content-Length"] = expected_length
+    if "content-type" not in header_names:
+        put_headers["Content-Type"] = content_type
+    if content_disposition is not None and "content-disposition" not in header_names:
+        put_headers["Content-Disposition"] = content_disposition
 
-    Uses direct HTTP PUT with authorization header instead of the COS SDK,
-    keeping dependencies minimal.
-
-    Args:
-        session: aiohttp client session.
-        credentials: Dict with tmpSecretId, tmpSecretKey, sessionToken.
-        bucket: COS bucket name.
-        region: COS region.
-        key: Object key (path in bucket).
-        file_data: File content bytes.
-        content_type: MIME type of the file.
-        cdn_base_url: Optional CDN base URL for the result URL.
-
-    Returns:
-        Public URL of the uploaded file.
-    """
-    secret_id = credentials["tmpSecretId"]
-    secret_key = credentials["tmpSecretKey"]
-    session_token = credentials["sessionToken"]
-
-    # Build COS endpoint
-    host = f"{bucket}.cos.{region}.myqcloud.com"
-    url = f"https://{host}/{key}"
-
-    # Generate authorization signature
-    # COS uses a simplified HMAC-SHA1 signature for PUT requests
-    now = int(time.time())
-    sign_time = f"{now - 60};{now + 3600}"  # valid for 1 hour
-
-    # Build string to sign (simplified COS auth)
-    http_string = f"put\n/{key}\n\nhost={host.lower()}\n"
-    sha1_content = hashlib.sha1(http_string.encode("utf-8")).hexdigest()
-    string_to_sign = f"sha1\n{sign_time}\n{sha1_content}\n"
-
-    # Sign
-    sign_key = hmac.new(
-        secret_key.encode("utf-8"),
-        sign_time.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-    signature = hmac.new(
-        sign_key.encode("utf-8"),
-        string_to_sign.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-
-    authorization = (
-        f"q-sign-algorithm=sha1"
-        f"&q-ak={secret_id}"
-        f"&q-sign-time={sign_time}"
-        f"&q-key-time={sign_time}"
-        f"&q-header-list=host"
-        f"&q-url-param-list="
-        f"&q-signature={signature}"
-    )
-
-    headers = {
-        "Host": host,
-        "Content-Type": content_type,
-        "Content-Length": str(len(file_data)),
-        "Authorization": authorization,
-        "x-cos-security-token": session_token,
-    }
-    if filename:
-        if content_type.startswith("video/") or content_type.startswith("audio/"):
-            headers["Content-Disposition"] = _build_content_disposition(filename, "inline")
-        elif not content_type.startswith("image/"):
-            headers["Content-Disposition"] = _build_content_disposition(filename, "attachment")
-
-    upload_timeout = aiohttp.ClientTimeout(total=300)  # 5 min for large files
-    async with session.put(url, data=file_data, headers=headers, timeout=upload_timeout) as resp:
+    upload_timeout = aiohttp.ClientTimeout(total=300)
+    async with session.put(
+        upload_url,
+        data=file_data,
+        headers=put_headers,
+        timeout=upload_timeout,
+    ) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise RuntimeError(f"COS upload failed ({resp.status}): {text[:500]}")
-
-    # Build result URL
-    if cdn_base_url:
-        base = cdn_base_url.rstrip("/")
-        # Re-encode path segments for CDN URL
-        re_encoded_key = "/".join(quote(seg) for seg in key.split("/"))
-        return f"{base}/{re_encoded_key}"
-    else:
-        return f"https://{host}/{key}"
+            raise RuntimeError(f"Presigned PUT upload failed (HTTP {resp.status})")
+    return download_url
 
 
 async def upload_and_get_url(
@@ -663,30 +1178,93 @@ async def upload_and_get_url(
     file_data: bytes,
     content_type: str,
 ) -> str:
-    """
-    High-level: get credentials, upload to COS, return URL.
-
-    Args:
-        filename: Original filename.
-        file_data: File content bytes.
-        content_type: MIME type.
-
-    Returns:
-        Public URL of the uploaded file.
-    """
-    creds_data = await get_upload_credentials(session, api_url, bot_token, filename)
-
-    return await upload_file_to_cos(
+    """Presign and upload a file through the server-selected storage backend."""
+    presign = await get_upload_presign(
         session,
-        credentials=creds_data["credentials"],
-        bucket=creds_data["bucket"],
-        region=creds_data["region"],
-        key=creds_data["key"],
-        file_data=file_data,
-        content_type=content_type,
-        cdn_base_url=creds_data.get("cdnBaseUrl"),
+        api_url,
+        bot_token,
         filename=filename,
+        file_size=len(file_data),
+        content_type=content_type,
     )
+    return await upload_file_to_presigned_url(
+        session,
+        upload_url=presign["uploadUrl"],
+        download_url=presign["downloadUrl"],
+        file_data=file_data,
+        content_type=presign["contentType"],
+        content_disposition=presign.get("contentDisposition"),
+        headers=presign.get("headers"),
+    )
+
+
+_DOWNLOAD_METADATA_HOSTS = {
+    "169.254.169.254",
+    "metadata.google.internal",
+    "metadata.goog",
+    "100.100.100.200",
+    "fd00:ec2::254",
+}
+_DOWNLOAD_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_DOWNLOAD_REDIRECTS = 5
+
+
+def _canonical_download_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    normalized = host.lower().strip("[]").rstrip(".")
+    try:
+        return ipaddress.ip_address(normalized)
+    except ValueError:
+        try:
+            return ipaddress.ip_address(socket.inet_aton(normalized))
+        except OSError:
+            return None
+
+
+def _validate_download_url(
+    url: str,
+    *,
+    trusted_private_hosts: frozenset[str] = frozenset(),
+    enforce_host_safety: bool = True,
+) -> str:
+    """Validate one download hop before any network I/O."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("unsafe download URL") from exc
+    if parsed.scheme not in {"http", "https"} or not host:
+        raise RuntimeError("unsafe download URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("unsafe download URL")
+    if not enforce_host_safety:
+        return url
+    if host in _DOWNLOAD_METADATA_HOSTS:
+        raise RuntimeError("unsafe download URL")
+
+    literal = _canonical_download_ip(host)
+    if literal is not None and (
+        literal.is_link_local
+        or literal.is_multicast
+        or literal.is_reserved
+        or literal.is_unspecified
+    ):
+        raise RuntimeError("unsafe download URL")
+    if (
+        literal is not None
+        and (literal.is_loopback or literal.is_private)
+        and host not in trusted_private_hosts
+    ):
+        raise RuntimeError("unsafe download URL")
+    return url
+
+
+def _download_trusted_private_hosts(session: aiohttp.ClientSession) -> frozenset[str]:
+    connector = getattr(session, "connector", None)
+    resolver = getattr(connector, "_ssrf_resolver", None)
+    hosts = getattr(resolver, "_trusted_hosts", None)
+    if not isinstance(hosts, set):
+        return frozenset()
+    return frozenset(str(host).lower().rstrip(".") for host in hosts)
 
 
 async def download_file(
@@ -694,6 +1272,8 @@ async def download_file(
     url: str,
     max_size: int = 500 * 1024 * 1024,
     timeout_seconds: int = 300,
+    *,
+    enforce_host_safety: bool = True,
 ) -> tuple[bytes, str, str]:
     """
     Download a file from a URL.
@@ -702,6 +1282,7 @@ async def download_file(
         url: URL to download.
         max_size: Maximum file size in bytes.
         timeout_seconds: Download timeout.
+        enforce_host_safety: Apply the plugin's private-host policy to each hop.
 
     Returns:
         (file_data, content_type, filename)
@@ -710,37 +1291,61 @@ async def download_file(
         RuntimeError: If file is too large or download fails.
     """
     dl_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with session.get(url, timeout=dl_timeout) as resp:
-        if not resp.ok:
-            raise RuntimeError(f"Download failed ({resp.status}): {url}")
+    current_url = url
+    trusted_private_hosts = _download_trusted_private_hosts(session)
+    for redirect_count in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+        _validate_download_url(
+            current_url,
+            trusted_private_hosts=trusted_private_hosts,
+            enforce_host_safety=enforce_host_safety,
+        )
+        async with session.get(
+            current_url,
+            timeout=dl_timeout,
+            allow_redirects=False,
+        ) as resp:
+            if resp.status in _DOWNLOAD_REDIRECT_STATUSES:
+                location = resp.headers.get("Location")
+                if not location or redirect_count >= _MAX_DOWNLOAD_REDIRECTS:
+                    raise RuntimeError("Download failed (invalid redirect)")
+                current_url = urljoin(current_url, location)
+                _validate_download_url(
+                    current_url,
+                    trusted_private_hosts=trusted_private_hosts,
+                    enforce_host_safety=enforce_host_safety,
+                )
+                continue
+            if not resp.ok:
+                # Source URLs are frequently pre-signed and must not be copied into
+                # exceptions that can reach logs or SendResult.error.
+                raise RuntimeError(f"Download failed (HTTP {resp.status})")
 
-        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            content_type = resp.headers.get(
+                "Content-Type", "application/octet-stream"
+            )
 
-        # Extract filename from URL or Content-Disposition
-        filename = "file"
-        cd = resp.headers.get("Content-Disposition", "")
-        if "filename=" in cd:
-            filename = cd.split("filename=")[-1].strip('"').strip("'")
-        else:
-            try:
-                from urllib.parse import unquote, urlparse
-                path = urlparse(url).path
+            # Extract filename from URL or Content-Disposition.
+            filename = "file"
+            cd = resp.headers.get("Content-Disposition", "")
+            if "filename=" in cd:
+                filename = cd.split("filename=")[-1].strip('"').strip("'")
+            else:
+                path = urlparse(current_url).path
                 filename = unquote(path.split("/")[-1]) or "file"
-            except Exception:
-                pass
 
-        # Check size
-        cl = resp.headers.get("Content-Length")
-        if cl and int(cl) > max_size:
-            raise RuntimeError(f"File too large ({cl} bytes, max {max_size})")
+            cl = resp.headers.get("Content-Length")
+            if cl and int(cl) > max_size:
+                raise RuntimeError(f"File too large ({cl} bytes, max {max_size})")
 
-        data = bytearray()
-        async for chunk in resp.content.iter_any():
-            data.extend(chunk)
-            if len(data) > max_size:
-                raise RuntimeError(f"File too large (>{max_size} bytes)")
+            data = bytearray()
+            async for chunk in resp.content.iter_any():
+                data.extend(chunk)
+                if len(data) > max_size:
+                    raise RuntimeError(f"File too large (>{max_size} bytes)")
 
-        return bytes(data), content_type, filename
+            return bytes(data), content_type, filename
+
+    raise RuntimeError("Download failed (too many redirects)")
 
 
 # ─── Channel History ─────────────────────────────────────────────────────────
@@ -771,47 +1376,43 @@ async def get_channel_messages(
     Returns:
         List of dicts with from_uid, content, timestamp, type, url, name, payload.
     """
-    try:
-        result = await post_json(session, api_url, bot_token, "/v1/bot/messages/sync", {
-            "channel_id": channel_id,
-            "channel_type": channel_type,
-            "limit": limit,
-            "start_message_seq": start_message_seq,
-            "end_message_seq": end_message_seq,
-            "pull_mode": 1,  # 1 = pull up (newer messages)
-        })
+    result = await post_json(session, api_url, bot_token, "/v1/bot/messages/sync", {
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "limit": limit,
+        "start_message_seq": start_message_seq,
+        "end_message_seq": end_message_seq,
+        "pull_mode": 1,  # 1 = pull up (newer messages)
+    })
 
-        if not result:
-            return []
-
-        messages = result.get("messages", [])
-        parsed = []
-        for m in messages:
-            payload: dict[str, Any] = {}
-            raw_payload = m.get("payload")
-            if raw_payload:
-                try:
-                    decoded = base64.b64decode(raw_payload).decode("utf-8")
-                    import json
-                    payload = json.loads(decoded)
-                except Exception:
-                    if isinstance(raw_payload, dict):
-                        payload = raw_payload
-
-            parsed.append({
-                "from_uid": m.get("from_uid", "unknown"),
-                "type": payload.get("type"),
-                "url": payload.get("url"),
-                "name": payload.get("name"),
-                "content": payload.get("content", ""),
-                "payload": payload,
-                # API returns seconds, convert to ms
-                "timestamp": (m.get("timestamp", int(time.time()))) * 1000,
-            })
-        return parsed
-    except Exception as e:
-        logger.error("octo: getChannelMessages error: %s", e)
+    if not result:
         return []
+
+    messages = result.get("messages", [])
+    parsed = []
+    for m in messages:
+        payload: dict[str, Any] = {}
+        raw_payload = m.get("payload")
+        if raw_payload:
+            try:
+                decoded = base64.b64decode(raw_payload).decode("utf-8")
+                import json
+                payload = json.loads(decoded)
+            except Exception:
+                if isinstance(raw_payload, dict):
+                    payload = raw_payload
+
+        parsed.append({
+            "from_uid": m.get("from_uid", "unknown"),
+            "type": payload.get("type"),
+            "url": payload.get("url"),
+            "name": payload.get("name"),
+            "content": payload.get("content", ""),
+            "payload": payload,
+            # API returns seconds, convert to ms
+            "timestamp": (m.get("timestamp", int(time.time()))) * 1000,
+        })
+    return parsed
 
 
 # ─── Group API ────────────────────────────────────────────────────────────────
@@ -828,18 +1429,8 @@ async def fetch_bot_groups(
     Returns:
         List of dicts with 'group_no' and 'name' keys.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/groups"
-    headers = {"Authorization": f"Bearer {bot_token}"}
-    try:
-        async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-            if not resp.ok:
-                logger.error("octo: fetchBotGroups failed: %d", resp.status)
-                return []
-            data = await resp.json()
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        logger.error("octo: fetchBotGroups error: %s", e)
-        return []
+    data = await get_json(session, api_url, bot_token, "/v1/bot/groups")
+    return data if isinstance(data, list) else []
 
 
 async def get_group_members(
@@ -857,30 +1448,23 @@ async def get_group_members(
     Returns:
         List of GroupMember objects.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/groups/{group_no}/members"
-    headers = {"Authorization": f"Bearer {bot_token}"}
-    try:
-        async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-            if not resp.ok:
-                logger.error("octo: getGroupMembers failed: %d", resp.status)
-                return []
-            data = await resp.json()
-            # Normalize: API may return {members: [...]} or bare [...]
-            members_raw = data.get("members", data) if isinstance(data, dict) else data
-            if not isinstance(members_raw, list):
-                return []
-            return [
-                GroupMember(
-                    uid=m.get("uid", ""),
-                    name=m.get("name", ""),
-                    role=m.get("role"),
-                    robot=m.get("robot"),
-                )
-                for m in members_raw
-            ]
-    except Exception as e:
-        logger.error("octo: getGroupMembers error: %s", e)
+    data = await get_json(
+        session, api_url, bot_token, f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members"
+    )
+    # Normalize: API may return {members: [...]} or bare [...].  A successful
+    # but structurally empty response remains a legitimate empty roster.
+    members_raw = data.get("members", data) if isinstance(data, dict) else data
+    if not isinstance(members_raw, list):
         return []
+    return [
+        GroupMember(
+            uid=m.get("uid", ""),
+            name=m.get("name", ""),
+            role=m.get("role"),
+            robot=m.get("robot"),
+        )
+        for m in members_raw
+    ]
 
 
 async def get_group_info(
@@ -901,19 +1485,17 @@ async def get_group_info(
     Raises:
         RuntimeError: If the API call fails.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/groups/{group_no}"
-    headers = {"Authorization": f"Bearer {bot_token}"}
-    async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-        if not resp.ok:
-            text = await resp.text()
-            raise RuntimeError(f"getGroupInfo failed ({resp.status}): {text}")
-        data = await resp.json()
-        known_keys = {"group_no", "name"}
-        return GroupInfo(
-            group_no=data.get("group_no", group_no),
-            name=data.get("name", ""),
-            extra={k: v for k, v in data.items() if k not in known_keys},
-        )
+    data = await get_json(
+        session, api_url, bot_token, f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}"
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Octo group info returned an invalid response")
+    known_keys = {"group_no", "name"}
+    return GroupInfo(
+        group_no=data.get("group_no", group_no),
+        name=data.get("name", ""),
+        extra={k: v for k, v in data.items() if k not in known_keys},
+    )
 
 
 async def fetch_user_info(
@@ -928,11 +1510,14 @@ async def fetch_user_info(
     Returns:
         Dict with uid, name, avatar keys, or None if unavailable.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/user/info?uid={uid}"
+    url = f"{api_url.rstrip('/')}/v1/bot/user/info"
     headers = {"Authorization": f"Bearer {bot_token}"}
     try:
         async with session.get(
-            url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+            url,
+            headers=headers,
+            params={"uid": uid},
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status == 404:
                 return None
@@ -967,22 +1552,15 @@ async def get_group_md(
     Returns:
         Dict with content, version, updated_at, updated_by, or None on 404.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/groups/{group_no}/md"
+    path = f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/md"
+    url = f"{api_url.rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {bot_token}"}
-    try:
-        async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-            if resp.status == 404:
-                return None
-            if not resp.ok:
-                text = await resp.text()
-                logger.error(
-                    "octo: getGroupMd(%s) failed: %d %s", group_no, resp.status, text[:200]
-                )
-                return None
-            return await resp.json()
-    except Exception as e:
-        logger.error("octo: getGroupMd(%s) error: %s", group_no, e)
-        return None
+    async with session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
+        if resp.status == 404:
+            return None
+        if not resp.ok:
+            raise _response_error(path, resp)
+        return await resp.json()
 
 
 async def update_group_md(
@@ -996,25 +1574,18 @@ async def update_group_md(
     Update GROUP.md content for a group.
 
     Returns:
-        Dict with version on success, or None on error.
+        Parsed response dict, or None for a successful empty response.
+
+    Raises:
+        OctoApiError: The server returned a non-2xx response.
     """
-    url = f"{api_url.rstrip('/')}/v1/bot/groups/{group_no}/md"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {bot_token}",
-    }
-    import json
-    async with session.put(
-        url,
-        data=json.dumps({"content": content}),
-        headers=headers,
-        timeout=DEFAULT_TIMEOUT,
-    ) as resp:
-        if not resp.ok:
-            text = await resp.text()
-            logger.error("octo: updateGroupMd(%s) failed: %d %s", group_no, resp.status, text[:200])
-            return None
-        return await resp.json()
+    return await put_json(
+        session,
+        api_url,
+        bot_token,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/md",
+        {"content": content},
+    )
 
 
 # ─── Bot DELETE / generic helpers ────────────────────────────────────────────
@@ -1038,13 +1609,7 @@ async def delete_json(
         kwargs["data"] = json.dumps(payload)
     async with session.delete(url, **kwargs) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise aiohttp.ClientResponseError(
-                resp.request_info,
-                resp.history,
-                status=resp.status,
-                message=f"Octo API {path} failed ({resp.status}): {text or resp.reason}",
-            )
+            raise _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None
 
@@ -1066,13 +1631,7 @@ async def put_json(
         url, data=json.dumps(payload), headers=headers, timeout=DEFAULT_TIMEOUT
     ) as resp:
         if not resp.ok:
-            text = await resp.text()
-            raise aiohttp.ClientResponseError(
-                resp.request_info,
-                resp.history,
-                status=resp.status,
-                message=f"Octo API {path} failed ({resp.status}): {text or resp.reason}",
-            )
+            raise _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None
 
@@ -1143,17 +1702,21 @@ async def update_group(
     name: str | None = None,
     notice: str | None = None,
 ) -> None:
-    """Update a group's metadata (name/notice). No-op when both args are None."""
+    """Update a group's metadata (name/notice).
+
+    Raises ``ValueError`` rather than reporting a successful no-op when the
+    caller supplies no mutable fields.
+    """
     payload: dict[str, Any] = {}
     if name is not None:
         payload["name"] = name
     if notice is not None:
         payload["notice"] = notice
     if not payload:
-        return
-    await post_json(
+        raise ValueError("update_group requires at least one of: name, notice")
+    await put_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/update", payload,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/info", payload,
     )
 
 
@@ -1167,7 +1730,7 @@ async def add_group_members(
 ) -> dict[str, Any]:
     result = await post_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/members/add", {"members": members},
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/add", {"members": members},
     )
     return result or {}
 
@@ -1182,7 +1745,7 @@ async def remove_group_members(
 ) -> dict[str, Any]:
     result = await post_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/members/remove", {"members": members},
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/members/remove", {"members": members},
     )
     return result or {}
 
@@ -1204,7 +1767,7 @@ async def create_thread(
         payload["source_message_id"] = source_message_id
     result = await post_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads", payload,
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads", payload,
     )
     return result or {}
 
@@ -1218,9 +1781,13 @@ async def list_threads(
 ) -> list[dict[str, Any]]:
     result = await get_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads",
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads",
     )
     if not result:
+        return []
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
         return []
     threads = result.get("threads")
     return threads if isinstance(threads, list) else []
@@ -1236,7 +1803,7 @@ async def get_thread(
 ) -> dict[str, Any]:
     result = await get_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}",
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}",
     )
     return result or {}
 
@@ -1251,7 +1818,7 @@ async def delete_thread(
 ) -> None:
     await delete_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}",
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}",
     )
 
 
@@ -1265,9 +1832,13 @@ async def list_thread_members(
 ) -> list[dict[str, Any]]:
     result = await get_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}/members",
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/members",
     )
     if not result:
+        return []
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
         return []
     members = result.get("members")
     return members if isinstance(members, list) else []
@@ -1283,7 +1854,7 @@ async def join_thread(
 ) -> None:
     await post_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}/join", {},
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/join", {},
     )
 
 
@@ -1297,7 +1868,7 @@ async def leave_thread(
 ) -> None:
     await post_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}/leave", {},
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/leave", {},
     )
 
 
@@ -1313,9 +1884,9 @@ async def get_thread_md(
     try:
         result = await get_json(
             session, api_url, bot_token,
-            f"/v1/bot/groups/{group_no}/threads/{short_id}/md",
+            f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/md",
         )
-    except aiohttp.ClientResponseError as e:
+    except OctoApiError as e:
         if e.status == 404:
             return {"content": "", "version": 0, "updated_at": None, "updated_by": ""}
         raise
@@ -1333,7 +1904,7 @@ async def update_thread_md(
 ) -> dict[str, Any]:
     result = await put_json(
         session, api_url, bot_token,
-        f"/v1/bot/groups/{group_no}/threads/{short_id}/md", {"content": content},
+        f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/md", {"content": content},
     )
     return result or {}
 
@@ -1352,7 +1923,7 @@ async def get_voice_context(
     """
     try:
         result = await get_json(session, api_url, bot_token, "/v1/bot/voice/context")
-    except aiohttp.ClientResponseError as e:
+    except OctoApiError as e:
         if e.status == 404:
             return {"has_context": False, "context": "", "updated_at": None}
         raise

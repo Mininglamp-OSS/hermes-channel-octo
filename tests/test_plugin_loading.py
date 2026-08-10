@@ -33,6 +33,7 @@ class FakeCtx:
         self.tools: list[dict] = []
         self.skills: list[dict] = []
         self.commands: list[dict] = []
+        self.hooks: list[tuple[str, object]] = []
 
     def register_platform(self, **kwargs) -> None:
         self.platforms.append(kwargs)
@@ -45,6 +46,9 @@ class FakeCtx:
 
     def register_command(self, name, **kwargs) -> None:
         self.commands.append({"name": name, **kwargs})
+
+    def register_hook(self, name, callback) -> None:
+        self.hooks.append((name, callback))
 
 
 # ---------- entry-point metadata ----------
@@ -89,12 +93,11 @@ def test_register_without_env_only_registers_platform(monkeypatch):
     assert ctx.tools == []
     assert ctx.skills == []
     assert ctx.commands == []
+    assert ctx.hooks == []
 
 
 def test_register_with_env_wires_full_surface(monkeypatch):
-    """With both env vars set, register() must wire the LLM-callable surface:
-    octo_management tool, octo-bot-api skill, and the /octo-* slash commands,
-    in addition to the platform entry."""
+    """Configured plugins expose management and current-conversation card tools."""
     monkeypatch.setenv("OCTO_API_URL", "http://localhost:1")
     monkeypatch.setenv("OCTO_BOT_TOKEN", "test-token")
 
@@ -104,13 +107,31 @@ def test_register_with_env_wires_full_surface(monkeypatch):
     # Platform always
     assert [p["name"] for p in ctx.platforms] == ["octo"]
 
-    # Exactly one tool, named octo_management, with an async handler
-    assert len(ctx.tools) == 1
-    tool = ctx.tools[0]
-    assert tool["name"] == "octo_management"
-    assert tool["toolset"] == "octo"
-    assert tool["is_async"] is True
-    assert callable(tool["handler"])
+    tool_names = {tool["name"] for tool in ctx.tools}
+    assert tool_names == {
+        "octo_management",
+        "octo_send_display_card",
+        "octo_send_interactive_card",
+        "octo_send_rich_text",
+        "octo_send_image",
+        "octo_send_file",
+        "octo_send_voice",
+        "octo_send_video",
+        "octo_card_profile",
+        "octo_edit_card",
+    }
+    for tool in ctx.tools:
+        assert tool["toolset"] == "octo"
+        assert tool["is_async"] is True
+        assert callable(tool["handler"])
+    assert {name for name, _ in ctx.hooks} == {
+        "pre_llm_call",
+        "post_llm_call",
+        "pre_tool_call",
+        "post_tool_call",
+        "on_session_end",
+    }
+    assert all(callable(callback) for _, callback in ctx.hooks)
 
     # Bundled skill registered with a real path that exists on disk
     assert len(ctx.skills) == 1
@@ -130,6 +151,40 @@ def test_register_with_env_wires_full_surface(monkeypatch):
     }
     missing = expected - cmd_names
     assert not missing, f"missing slash command registrations: {missing}"
+
+
+def test_progress_hook_registration_failure_is_isolated(monkeypatch):
+    monkeypatch.setenv("OCTO_API_URL", "http://localhost:1")
+    monkeypatch.setenv("OCTO_BOT_TOKEN", "test-token")
+
+    class HookFailureCtx(FakeCtx):
+        def register_hook(self, name, callback) -> None:
+            if name == "pre_tool_call":
+                raise RuntimeError("unsupported hook")
+            super().register_hook(name, callback)
+
+    ctx = HookFailureCtx()
+    hermes_octo_plugin.register(ctx)
+
+    assert [platform["name"] for platform in ctx.platforms] == ["octo"]
+    assert {tool["name"] for tool in ctx.tools} == {
+        "octo_management",
+        "octo_send_display_card",
+        "octo_send_interactive_card",
+        "octo_send_rich_text",
+        "octo_send_image",
+        "octo_send_file",
+        "octo_send_voice",
+        "octo_send_video",
+        "octo_card_profile",
+        "octo_edit_card",
+    }
+    assert {name for name, _ in ctx.hooks} == {
+        "pre_llm_call",
+        "post_llm_call",
+        "post_tool_call",
+        "on_session_end",
+    }
 
 
 def test_register_platform_install_hint_points_to_github():
@@ -259,4 +314,6 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
     finally:
         # Clean up so we don't leak global registry state into other tests.
         registry._tools.pop("octo_management", None)
+        registry._tools.pop("octo_send_display_card", None)
+        registry._tools.pop("octo_send_interactive_card", None)
         platform_registry._entries.pop("octo", None)

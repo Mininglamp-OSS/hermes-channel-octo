@@ -40,6 +40,45 @@ MENTION_PATTERN = re.compile(
 STRUCTURED_MENTION_PATTERN = re.compile(r"@\[([\w.\-]+):([^\]\n]+)\]")
 
 
+def strip_leading_self_mention_for_command(
+    text: str,
+    *,
+    bot_uid: str,
+    bot_name: str = "",
+) -> str:
+    """Expose a slash command that follows a leading mention of this bot.
+
+    Octo groups require an explicit bot mention, while Hermes only recognizes
+    commands whose first non-whitespace character is ``/``.  Inbound mention
+    conversion turns ``@小爱 /new`` into ``@[bot_uid:小爱] /new``; strip that
+    one routing mention only when the remaining text starts with ``/``.
+
+    ``bot_name`` covers legacy clients that omit the structured mention
+    sidecar and therefore leave the routing mention as plain ``@name`` text.
+    """
+    if not isinstance(text, str) or not bot_uid:
+        return text
+
+    match = re.match(
+        rf"^\s*@\[{re.escape(bot_uid)}:[^\]\n]+\]\s*(/.*)$",
+        text,
+        flags=re.DOTALL,
+    )
+    if match:
+        return match.group(1)
+
+    if bot_name:
+        match = re.match(
+            rf"^\s*@{re.escape(bot_name)}\s+(/.*)$",
+            text,
+            flags=re.DOTALL,
+        )
+        if match:
+            return match.group(1)
+
+    return text
+
+
 # ─── Structured mention parse + convert (outbound: LLM reply → wire format) ──
 
 
