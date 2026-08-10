@@ -1683,7 +1683,11 @@ class OctoAdapter(BasePlatformAdapter):
                 )
                 return True
             else:
-                self._cache_group_members(parent_group_no, [])
+                # An empty response is not authoritative enough to erase a
+                # previously verified display roster.  Keep that scoped data
+                # for mention rendering, but invalidate sender classification
+                # so stale robot flags cannot relax inbound mention gating.
+                self._group_robot_map.pop(parent_group_no, None)
                 self._group_cache_timestamps[parent_group_no] = (
                     now - GROUP_CACHE_EXPIRY_MS + 30000
                 )

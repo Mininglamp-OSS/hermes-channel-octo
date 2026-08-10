@@ -15,6 +15,7 @@ from hermes_octo_plugin.adapter import OctoAdapter
 from hermes_octo_plugin.transport import (
     SSRFGuardConnector as _SSRFGuardConnector,
     SSRFGuardResolver as _SSRFGuardResolver,
+    TransportPolicy,
 )
 from hermes_octo_plugin.types import ChannelType, MessagePayload, MessageType
 from tests.conftest import make_bare_adapter
@@ -256,6 +257,61 @@ async def test_guarded_connector_allows_opted_in_private_literal_origin():
 
     assert records[0]["host"] == "127.0.0.1"
     assert records[0]["family"] in {socket.AF_UNSPEC, socket.AF_INET}
+
+
+@pytest.mark.asyncio
+async def test_private_host_policy_allows_explicitly_trusted_ipv4_mapped_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
+    policy = TransportPolicy()
+    policy.trust_validated_private_host(
+        "http://[::ffff:127.0.0.1]:8080/upload"
+    )
+    resolver = _SSRFGuardResolver(policy=policy)
+    resolver._delegate.resolve = AsyncMock(
+        return_value=[
+            {
+                "hostname": "::ffff:7f00:1",
+                "host": "::ffff:7f00:1",
+                "port": 8080,
+                "family": socket.AF_INET6,
+                "proto": 6,
+                "flags": 0,
+            }
+        ]
+    )
+
+    try:
+        records = await resolver.resolve("::ffff:7f00:1", 8080)
+    finally:
+        await resolver.close()
+
+    assert records[0]["host"] == "::ffff:7f00:1"
+
+
+def test_private_host_policy_still_rejects_ipv4_mapped_link_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
+    policy = TransportPolicy()
+
+    with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+        policy.trust_validated_private_host(
+            "http://[::ffff:169.254.169.254]/latest/meta-data/"
+        )
+
+
+def test_private_host_policy_rejects_ipv4_mapped_metadata_literal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
+    policy = TransportPolicy()
+
+    with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+        policy.trust_validated_private_host(
+            "http://[::ffff:6464:64c8]/latest/meta-data/"
+        )
 
 
 @pytest.mark.asyncio

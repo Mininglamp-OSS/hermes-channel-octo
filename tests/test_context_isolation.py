@@ -36,6 +36,27 @@ async def test_thread_member_refresh_uses_parent_roster_and_keeps_it_scoped():
     assert adapter._group_member_rosters == {"group-1": {"u1": "Alice"}}
 
 
+
+@pytest.mark.asyncio
+async def test_empty_member_refresh_preserves_last_good_display_roster() -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    adapter._group_member_rosters = {"group-1": {"u1": "Alice"}}
+    adapter._group_robot_map = {"group-1": {"u1": False}}
+    adapter._user_group_index = {"u1": {"group-1"}}
+
+    with patch.object(api, "get_group_members", AsyncMock(return_value=[])):
+        refreshed = await adapter._refresh_group_member_cache(
+            "group-1", force=True
+        )
+
+    assert refreshed is False
+    assert adapter._group_member_rosters == {"group-1": {"u1": "Alice"}}
+    assert "group-1" not in adapter._group_robot_map
+    assert adapter._user_group_index == {"u1": {"group-1"}}
+
 @pytest.mark.asyncio
 async def test_inflight_member_refresh_cannot_restore_evicted_group_scope():
     adapter = make_bare_adapter()

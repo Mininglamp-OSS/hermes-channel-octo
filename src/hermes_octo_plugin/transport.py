@@ -54,6 +54,10 @@ def _unconditionally_unsafe_address(address: str) -> bool:
         ip = ipaddress.ip_address(normalized)
     except ValueError:
         return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if str(ip) in _METADATA_HOSTS:
+        return True
     return ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
 
 
@@ -68,19 +72,26 @@ def _canonical_literal_ip(host: str) -> str | None:
             return None
 
 
+def _canonical_trust_host(host: str) -> str:
+    normalized = host.lower().strip("[]").rstrip(".")
+    return _canonical_literal_ip(normalized) or normalized
+
+
 class TransportPolicy:
     """Thread-safe hostname trust authority shared by validation and DNS."""
 
     def __init__(self, trusted_hosts: set[str] | None = None) -> None:
         self._lock = threading.Lock()
         self._trusted_hosts = {
-            host.lower().rstrip(".") for host in (trusted_hosts or set()) if host
+            _canonical_trust_host(host)
+            for host in (trusted_hosts or set())
+            if host
         }
 
     def is_trusted(self, host: str) -> bool:
-        normalized = host.lower().strip("[]").rstrip(".")
+        canonical = _canonical_trust_host(host)
         with self._lock:
-            return normalized in self._trusted_hosts
+            return canonical in self._trusted_hosts
 
     def trusted_hosts(self) -> frozenset[str]:
         with self._lock:
@@ -108,10 +119,10 @@ class TransportPolicy:
         self.trust_host(host)
 
     def trust_host(self, host: str) -> None:
-        normalized = host.lower().strip("[]").rstrip(".")
-        if normalized:
+        canonical = _canonical_trust_host(host)
+        if canonical:
             with self._lock:
-                self._trusted_hosts.add(normalized)
+                self._trusted_hosts.add(canonical)
 
 
 class _TrustedHostView(set[str]):
