@@ -311,9 +311,9 @@ def _trusted_requester_uid() -> str | None:
     """Read caller identity from Hermes' task-local gateway session context.
 
     Tool arguments are model-controlled and therefore cannot authenticate the
-    requester. Hermes 0.20 propagates these ContextVars into async tool worker
-    threads. Older/incompatible runtimes that cannot provide the context are
-    denied rather than falling back to a claimed uid.
+    requester. Hermes 0.14+ binds these ContextVars around gateway message
+    handling. Incompatible runtimes that cannot provide the context are denied
+    rather than falling back to a claimed uid.
     """
     try:
         from gateway.session_context import get_session_env

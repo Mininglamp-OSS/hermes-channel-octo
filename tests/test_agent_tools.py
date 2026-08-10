@@ -200,6 +200,42 @@ def test_trusted_requester_comes_only_from_an_octo_session_context(
 
 
 @pytest.mark.asyncio
+async def test_management_handler_uses_real_gateway_session_context() -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    fetch_groups = AsyncMock(return_value=[])
+    tokens = set_session_vars(platform="octo", user_id="owner-uid")
+    try:
+        with (
+            patch.object(
+                agent_tools,
+                "_resolve_adapter",
+                return_value=_configured_adapter(),
+            ),
+            patch.object(
+                agent_tools,
+                "_new_guarded_http_session",
+                return_value=_NoIoSession(),
+            ),
+            patch.object(
+                agent_tools.api,
+                "fetch_bot_groups",
+                fetch_groups,
+            ),
+        ):
+            result = json.loads(
+                await agent_tools.octo_management_handler(
+                    {"action": "list-groups"}
+                )
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result == {"ok": True, "data": {"groups": []}}
+    fetch_groups.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", agent_tools.ACTIONS)
 async def test_management_actions_fail_closed_without_trusted_session(action: str):
     """Every management action requires a trusted Octo session requester."""

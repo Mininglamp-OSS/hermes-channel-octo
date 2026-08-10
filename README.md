@@ -105,8 +105,9 @@ exposed to the model. These tools derive the destination and requester from
 Hermes' task-local Octo session, and their schemas accept no channel or identity
 overrides. Outbound local media must first pass the installed Hermes runtime's
 native media-delivery authorization, then uses inode/no-symlink and 100 MiB
-checks before upload. HTTP(S) media retains the guarded download flow. Native
-Hermes media delivery also accepts `data:` URLs.
+checks before upload. HTTP(S) media retains the guarded download flow. Adapter-
+native Hermes media delivery also accepts `data:` URLs; the model-facing tools
+accept HTTP(S), `file://`, and authorized local paths.
 
 Interactive card actions are accepted only while the originating in-process
 card session remains registered and only when message, channel, operator,
