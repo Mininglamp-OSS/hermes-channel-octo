@@ -345,7 +345,7 @@ class CardProgressController:
                 return
             assert key is not None
             state.final = True
-            state.final_phase = terminal_phase or ("stopped" if failed else "completed")
+            state.final_phase = terminal_phase or ("failed" if failed else "completed")
             state.phase = state.final_phase
             now = time.monotonic()
             for tool in state.tools.values():
@@ -659,7 +659,7 @@ class CardProgressController:
                             )
                             delivered = True
                             break
-                        except api.OctoApiError:
+                        except Exception:
                             if attempt < 2:
                                 await asyncio.sleep(0.1 * (2**attempt))
                     if not delivered:
@@ -680,19 +680,36 @@ class CardProgressController:
                         reasoning_visible=True,
                         capabilities=capabilities,
                     )
-                    await api.edit_card_message(
-                        adapter._http_session,
-                        adapter._api_url,
-                        adapter._bot_token,
-                        channel_id=state.route.channel_id,
-                        channel_type=state.route.channel_type,
-                        message_id=message_id,
-                        card=rendered.card,
-                        card_seq=next_seq,
-                        plain=rendered.plain,
-                        transient=not final,
-                        profile=CARD_PROFILE_V1,
-                    )
+                    delivered = False
+                    for attempt in range(3):
+                        try:
+                            await api.edit_card_message(
+                                adapter._http_session,
+                                adapter._api_url,
+                                adapter._bot_token,
+                                channel_id=state.route.channel_id,
+                                channel_type=state.route.channel_type,
+                                message_id=message_id,
+                                card=rendered.card,
+                                card_seq=next_seq,
+                                plain=rendered.plain,
+                                transient=not final,
+                                profile=CARD_PROFILE_V1,
+                            )
+                            delivered = True
+                            break
+                        except Exception:
+                            if attempt < 2:
+                                await asyncio.sleep(0.1 * (2**attempt))
+                    if not delivered:
+                        logger.warning(
+                            "[Octo] progress card edit retries exhausted"
+                        )
+                        with self._lock:
+                            current = self._states.get(key)
+                            if current is not None and current is state:
+                                current.scheduled = False
+                        return
             except Exception:
                 logger.warning("[Octo] progress card update failed", exc_info=True)
                 with self._lock:

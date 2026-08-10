@@ -74,6 +74,25 @@ def _configured_adapter() -> SimpleNamespace:
     )
 
 
+@pytest.mark.asyncio
+async def test_guarded_session_factory_accepts_api_and_cdn_origins() -> None:
+    with patch.dict(
+        "os.environ",
+        {"OCTO_ALLOW_PRIVATE_HOSTS": "true"},
+    ):
+        session = agent_tools._new_guarded_http_session(
+            "https://api.octo.invalid",
+            "https://cdn.octo.invalid/assets",
+        )
+    try:
+        assert session.transport_policy.trusted_hosts() == frozenset({
+            "api.octo.invalid",
+            "cdn.octo.invalid",
+        })
+    finally:
+        await session.close()
+
+
 _TRUST_CLAIM = object()
 
 

@@ -43,7 +43,7 @@ _ADAPTER = SimpleNamespace(
     _card_profile_cache=message_tools.cards.CardProfileCache(),
 )
 _CARD_SESSIONS = MagicMock()
-_CARD_SESSIONS.claim_edit.return_value = True
+_CARD_SESSIONS.claim_edit.return_value = 1
 _CARD_SESSIONS.release_edit.return_value = None
 _CARD_SESSIONS.complete.return_value = None
 _ADAPTER._card_sessions = _CARD_SESSIONS
@@ -407,7 +407,7 @@ async def test_image_tool_routes_verified_remote_media_to_current_conversation()
 async def test_edit_card_tool_updates_registered_current_session_card():
     edit = AsyncMock()
     _CARD_SESSIONS.reset_mock()
-    _CARD_SESSIONS.claim_edit.return_value = True
+    _CARD_SESSIONS.claim_edit.return_value = 7
     with (
         _tool_context(),
         patch.object(message_tools.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
@@ -417,7 +417,6 @@ async def test_edit_card_tool_updates_registered_current_session_card():
             await message_tools.octo_edit_card_handler(
                 {
                     "message_id": "card-1",
-                    "card_seq": 2,
                     "title": "Updated",
                     "blocks": [{"type": "text", "text": "Done"}],
                     "final": True,
@@ -427,30 +426,29 @@ async def test_edit_card_tool_updates_registered_current_session_card():
 
     assert result == {
         "ok": True,
-        "data": {"edited": True, "message_id": "card-1", "card_seq": 2},
+        "data": {"edited": True, "message_id": "card-1", "card_seq": 7},
     }
     kwargs = edit.await_args.kwargs
     assert kwargs["channel_id"] == "group-1"
     assert kwargs["channel_type"] == ChannelType.Group
     assert kwargs["message_id"] == "card-1"
-    assert kwargs["card_seq"] == 2
+    assert kwargs["card_seq"] == 7
     assert kwargs["transient"] is False
     assert kwargs["plain"] == "Updated\nDone"
     _CARD_SESSIONS.claim_edit.assert_called_once_with(
         message_id="card-1",
-        card_seq=2,
         session_key="octo:group-1:user-1",
         channel_id="group-1",
         channel_type=ChannelType.Group,
         requester_uid="user-1",
     )
-    _CARD_SESSIONS.complete.assert_called_once_with("card-1", -2)
+    _CARD_SESSIONS.complete.assert_called_once_with("card-1", -7)
 
 
 @pytest.mark.asyncio
 async def test_edit_card_tool_fails_closed_without_a_matching_registered_session():
     sessions = MagicMock()
-    sessions.claim_edit.return_value = False
+    sessions.claim_edit.return_value = None
     adapter = SimpleNamespace(
         _api_url="https://octo.invalid",
         _bot_token="test-token",
@@ -471,7 +469,6 @@ async def test_edit_card_tool_fails_closed_without_a_matching_registered_session
             await message_tools.octo_edit_card_handler(
                 {
                     "message_id": "unregistered",
-                    "card_seq": 1,
                     "blocks": [{"type": "text", "text": "forged"}],
                 }
             )

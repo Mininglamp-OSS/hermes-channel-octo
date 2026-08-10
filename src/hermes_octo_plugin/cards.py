@@ -1274,17 +1274,17 @@ _REASONING_STATUS_MAP = {
 }
 _REASONING_REQUIRED_VIEWS = {
     "active": (
-        "octo/v2",
+        frozenset({"octo/v1", "octo/v2"}),
         frozenset({"reasoning", "answering"}),
         frozenset({"reasoning_stop"}),
     ),
     "error": (
-        "octo/v2",
+        frozenset({"octo/v1", "octo/v2"}),
         frozenset({"error"}),
         frozenset({"reasoning_retry"}),
     ),
     "result": (
-        "octo/v1",
+        frozenset({"octo/v1"}),
         frozenset({"completed", "stopped"}),
         frozenset(),
     ),
@@ -1312,7 +1312,7 @@ def select_reasoning_process_template(
             continue
         valid = True
         for view_name, (
-            wire_profile,
+            wire_profiles,
             required_states,
             _allowed_actions,
         ) in _REASONING_REQUIRED_VIEWS.items():
@@ -1322,7 +1322,7 @@ def select_reasoning_process_template(
                 break
             view = views[0]
             if (
-                view.wire_profile != wire_profile
+                view.wire_profile not in wire_profiles
                 or not required_states.issubset(view.states)
                 or view.submit_actions
             ):

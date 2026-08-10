@@ -132,7 +132,6 @@ EDIT_CARD_TOOL_SCHEMA = {
         "additionalProperties": False,
         "properties": {
             "message_id": {"type": "string", "minLength": 1, "maxLength": 64},
-            "card_seq": {"type": "integer", "minimum": 1},
             "title": {"type": "string", "maxLength": 2_000},
             "blocks": {
                 "type": "array",
@@ -141,7 +140,7 @@ EDIT_CARD_TOOL_SCHEMA = {
             },
             "final": {"type": "boolean"},
         },
-        "required": ["message_id", "card_seq", "blocks"],
+        "required": ["message_id", "blocks"],
     },
 }
 
@@ -474,23 +473,20 @@ async def octo_edit_card_handler(args: dict[str, Any], **_kwargs: Any) -> str:
         return context
     adapter, route = context
     message_id = args.get("message_id")
-    card_seq = args.get("card_seq")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         return _error("message_id must be a bounded identifier")
-    if isinstance(card_seq, bool) or not isinstance(card_seq, int) or card_seq <= 0:
-        return _error("card_seq must be a positive integer")
     raw_blocks = args.get("blocks")
     if not isinstance(raw_blocks, list):
         return _error("blocks must be a controlled display block array")
     registry = adapter._card_sessions
-    if not registry.claim_edit(
+    card_seq = registry.claim_edit(
         message_id=message_id,
-        card_seq=card_seq,
         session_key=route.session_key,
         channel_id=route.channel_id,
         channel_type=route.channel_type,
         requester_uid=route.requester_uid,
-    ):
+    )
+    if card_seq is None:
         return _error("card edit does not match a live trusted card session")
     claim_id = -card_seq
     try:

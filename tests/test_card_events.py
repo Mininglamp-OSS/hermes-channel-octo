@@ -33,15 +33,27 @@ def _event(event_id: int = 11, **overrides):
 class _MemoryCursor:
     def __init__(self, initial: int = 0, operations: list[str] | None = None) -> None:
         self.value = initial
+        self.pending_ack_event_id: int | None = None
         self.saved: list[int] = []
+        self.pending_saved: list[int | None] = []
         self.operations = operations
 
     async def load(self) -> int:
         return self.value
 
-    async def save(self, event_id: int) -> None:
+    async def load_pending_ack(self) -> int | None:
+        return self.pending_ack_event_id
+
+    async def save(
+        self,
+        event_id: int,
+        *,
+        pending_ack_event_id: int | None = None,
+    ) -> None:
         self.value = event_id
+        self.pending_ack_event_id = pending_ack_event_id
         self.saved.append(event_id)
+        self.pending_saved.append(pending_ack_event_id)
         if self.operations is not None:
             self.operations.append(f"save:{event_id}")
 
@@ -75,6 +87,21 @@ async def test_file_cursor_store_is_atomic_durable_and_monotonic(tmp_path) -> No
     assert await store.load() == 12
     assert store.path.read_text(encoding="utf-8") == '{"event_id":12}\n'
     assert not list(store.path.parent.glob("*.tmp"))
+
+    await store.save(13, pending_ack_event_id=13)
+    reopened = card_events.FileEventCursorStore(owner_id="bot-1", base_dir=tmp_path)
+    assert await reopened.load() == 13
+    assert await reopened.load_pending_ack() == 13
+    assert (
+        store.path.read_text(encoding="utf-8")
+        == '{"event_id":13,"pending_ack_event_id":13}\n'
+    )
+    await reopened.save(13)
+    assert await reopened.load_pending_ack() is None
+    assert store.path.read_text(encoding="utf-8") == '{"event_id":13}\n'
+
+    with pytest.raises(ValueError, match="invalid pending ack"):
+        await store.save(13, pending_ack_event_id=14)
 
     with pytest.raises(ValueError, match="invalid event cursor"):
         await store.save(-1)
@@ -145,7 +172,6 @@ def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
     registry.register(_session())
     exact = {
         "message_id": "message-1",
-        "card_seq": 2,
         "session_key": "session-1",
         "channel_id": "group-1",
         "channel_type": ChannelType.Group,
@@ -158,12 +184,12 @@ def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
         ("channel_type", ChannelType.DM),
         ("requester_uid", "other-user"),
     ):
-        assert registry.claim_edit(**{**exact, field: forged}) is False
+        assert registry.claim_edit(**{**exact, field: forged}) is None
 
-    assert registry.claim_edit(**exact) is True
+    assert registry.claim_edit(**exact) == 1
     assert registry.claim("message-1", 99).status == "duplicate"
-    registry.complete("message-1", -2)
-    assert registry.claim_edit(**exact) is False
+    registry.complete("message-1", -1)
+    assert registry.claim_edit(**exact) is None
 
 
 @pytest.mark.asyncio
@@ -190,7 +216,8 @@ async def test_poller_does_not_ack_unowned_card_actions() -> None:
         await poller.initialize()
         await poller.poll_once()
 
-    assert cursor.saved == [11, 12, 13, 14]
+    assert cursor.saved == [11, 12, 13, 13, 14, 14]
+    assert cursor.pending_saved == [None, None, 13, None, 14, None]
     assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14]
 
 
@@ -247,9 +274,11 @@ async def test_poller_orders_dispatch_save_ack_and_preserves_cursor_on_failure()
         "dispatch:11",
         "save:11",
         "ack:11",
+        "save:11",
         "dispatch:12",
         "save:12",
         "ack:12",
+        "save:12",
     ]
     assert poller.cursor == 12
     assert delay == 2
@@ -359,8 +388,58 @@ async def test_ack_is_retried_after_durable_cursor_save() -> None:
         await poller.initialize()
         await poller.poll_once()
 
-    assert operations == ["dispatch", "save:11", "ack", "ack"]
+    assert operations == ["dispatch", "save:11", "ack", "ack", "save:11"]
     assert poller.cursor == 11
+
+
+@pytest.mark.asyncio
+async def test_failed_ack_is_persisted_and_retried_without_redispatch() -> None:
+    cursor = _MemoryCursor(10)
+    dispatch = AsyncMock(return_value="completed")
+    ack = AsyncMock(side_effect=RuntimeError("ack unavailable"))
+    fetch = AsyncMock(return_value=[_event(11)])
+
+    with (
+        patch.object(card_events.api, "fetch_bot_events", fetch),
+        patch.object(card_events.api, "ack_bot_event", ack),
+        patch.object(card_events.asyncio, "sleep", AsyncMock()),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=dispatch,
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+        await poller.poll_once()
+
+    assert dispatch.await_count == 1
+    assert fetch.await_count == 1
+    assert cursor.value == 11
+    assert cursor.pending_ack_event_id == 11
+    assert ack.await_count == 6
+
+    with (
+        patch.object(card_events.api, "fetch_bot_events", AsyncMock(return_value=[])),
+        patch.object(card_events.api, "ack_bot_event", AsyncMock()) as recovered_ack,
+    ):
+        restarted = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=dispatch,
+            wait_seconds=0,
+        )
+        await restarted.initialize()
+        await restarted.poll_once()
+
+    recovered_ack.assert_awaited_once()
+    assert cursor.pending_ack_event_id is None
+    assert dispatch.await_count == 1
 
 @pytest.mark.asyncio
 async def test_registry_blocks_replay_binding_channel_operator_and_input_mismatch() -> None:
@@ -450,6 +529,60 @@ async def test_action_status_edits_are_processing_then_terminal() -> None:
     ]
     assert update.await_args_list[0].kwargs == {"transient": True}
     assert update.await_args_list[1].kwargs == {"transient": False}
+
+
+@pytest.mark.asyncio
+async def test_ignored_dispatch_restores_a_terminal_retryable_card_state() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+    action = card_events.parse_card_action(_event())
+    assert action is not None
+    update = AsyncMock()
+
+    assert await card_events.handle_card_action(
+        registry,
+        action,
+        AsyncMock(return_value="ignored"),
+        update_status=update,
+    ) == "ignored"
+
+    assert [call.args[2] for call in update.await_args_list] == [
+        "processing",
+        "failed",
+    ]
+    assert update.await_args_list[-1].kwargs == {"transient": False}
+    assert registry.claim("message-1", action.event_id).status == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_exhausted_ack_persists_cursor_and_pending_ack() -> None:
+    cursor = _MemoryCursor(10)
+    ack = AsyncMock(side_effect=RuntimeError("ack down"))
+    with (
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(return_value=[_event(11)]),
+        ),
+        patch.object(card_events.api, "ack_bot_event", ack),
+        patch.object(card_events.asyncio, "sleep", AsyncMock()),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=AsyncMock(return_value="completed"),
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    assert ack.await_count == 3
+    assert cursor.saved == [11]
+    assert cursor.pending_saved == [11]
+    assert cursor.pending_ack_event_id == 11
+    assert poller.cursor == 11
 
 
 def test_action_status_renderer_freezes_inputs_and_removes_actions() -> None:

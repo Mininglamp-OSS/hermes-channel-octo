@@ -68,6 +68,30 @@ async def test_legacy_all_activation_honors_ignore_setting(
 
 
 @pytest.mark.asyncio
+async def test_ignore_mention_all_disables_ai_broadcast_but_not_direct_uid():
+    adapter = _inbound_adapter()
+    adapter._ignore_mention_all = True
+    ai_broadcast = (
+        b'{"type": 1, "content": "notice", '
+        b'"mention": {"all": true, "ais": true}}'
+    )
+    direct = (
+        b'{"type": 1, "content": "direct", '
+        b'"mention": {"all": true, "ais": true, "uids": ["bot-1"]}}'
+    )
+
+    with patch(
+        "hermes_octo_plugin.adapter.aes_decrypt",
+        side_effect=[ai_broadcast, direct],
+    ):
+        await adapter._handle_recv(_group_recv(ai_broadcast))
+        await adapter._handle_recv(_group_recv(direct))
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "direct"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mention",
     [

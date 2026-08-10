@@ -102,6 +102,13 @@ class _SuccessfulDownloadResponse:
         return None
 
 
+
+class _ExtendedFilenameDownloadResponse(_SuccessfulDownloadResponse):
+    headers = {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": "attachment; filename*=UTF-8''quarterly%20report.pdf",
+    }
+
 class _UserInfoResponse:
     ok = True
     status = 200
@@ -248,6 +255,20 @@ class TestApiFailureTruth:
         assert data == b""
         assert content_type == "application/octet-stream"
         assert filename == "report.bin"
+
+    @pytest.mark.asyncio
+    async def test_download_decodes_rfc5987_content_disposition_filename(self):
+        session = MagicMock()
+        session.get = MagicMock(
+            return_value=_ExtendedFilenameDownloadResponse()
+        )
+
+        _, _, filename = await download_file(
+            session,
+            "https://files.example.invalid/opaque",
+        )
+
+        assert filename == "quarterly report.pdf"
         session.get.assert_called_once()
 
     @pytest.mark.asyncio

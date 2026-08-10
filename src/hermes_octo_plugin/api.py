@@ -1473,6 +1473,27 @@ def _validate_download_url(
     return url
 
 
+def _content_disposition_filename(value: str) -> str | None:
+    """Extract RFC 5987 ``filename*`` or legacy ``filename``."""
+    fallback: str | None = None
+    for raw_part in value.split(";")[1:]:
+        key, separator, raw_value = raw_part.strip().partition("=")
+        if not separator:
+            continue
+        candidate = raw_value.strip().strip('"').strip("'")
+        if not candidate or "\r" in candidate or "\n" in candidate:
+            continue
+        if key.lower() == "filename*":
+            charset, marker, encoded = candidate.partition("''")
+            if marker and charset.lower() == "utf-8":
+                decoded = unquote(encoded)
+                if decoded:
+                    return decoded
+        elif key.lower() == "filename":
+            fallback = candidate
+    return fallback
+
+
 
 async def download_file(
     session: aiohttp.ClientSession,
@@ -1530,11 +1551,13 @@ async def download_file(
 
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
-            # Extract filename from URL or Content-Disposition.
-            filename = "file"
-            cd = resp.headers.get("Content-Disposition", "")
-            if "filename=" in cd:
-                filename = cd.split("filename=")[-1].strip('"').strip("'")
+            # Prefer RFC 5987 ``filename*=UTF-8''...`` and retain the legacy
+            # quoted filename fallback. URL paths remain the final fallback.
+            cd_filename = _content_disposition_filename(
+                resp.headers.get("Content-Disposition", "")
+            )
+            if cd_filename:
+                filename = cd_filename
             else:
                 path = urlparse(current_url).path
                 filename = unquote(path.split("/")[-1]) or "file"

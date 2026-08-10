@@ -265,26 +265,32 @@ async def test_group_mention_context_uses_current_group_name_map_not_global_map(
 
 
 @pytest.mark.asyncio
-async def test_startup_prefetch_populates_the_same_scoped_roster_as_refresh():
+async def test_startup_prefetch_does_not_load_group_content_or_member_names():
     adapter = make_bare_adapter()
     adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
     adapter._hydrate_md_cache_from_disk = MagicMock()
-    adapter._write_md_to_disk = MagicMock()
+    get_md = AsyncMock()
+    get_members = AsyncMock()
 
     with (
-        patch.object(api, "fetch_bot_groups", AsyncMock(return_value=[{"group_no": "group-1"}])),
-        patch.object(api, "get_group_md", AsyncMock(return_value=None)),
         patch.object(
             api,
-            "get_group_members",
-            AsyncMock(return_value=[GroupMember(uid="u1", name="Alice")]),
+            "fetch_bot_groups",
+            AsyncMock(return_value=[{"group_no": "group-1"}]),
         ),
+        patch.object(api, "get_group_md", get_md),
+        patch.object(api, "get_group_members", get_members),
     ):
         await adapter._prefetch_groups_and_members()
 
-    assert adapter._group_member_rosters == {"group-1": {"u1": "Alice"}}
+    assert adapter._known_group_ids == {"group-1"}
+    assert adapter._group_member_rosters == {}
+    assert adapter._group_md_cache == {}
+    get_md.assert_not_awaited()
+    get_members.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio
@@ -293,29 +299,15 @@ async def test_inflight_prefetch_cannot_restore_evicted_group_scope():
     adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
-    adapter._hydrate_md_cache_from_disk = MagicMock()
-    adapter._write_md_to_disk = MagicMock()
-    adapter._delete_md_from_disk = MagicMock()
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def blocked_md(*_args, **_kwargs):
+    async def blocked_groups(*_args, **_kwargs):
         entered.set()
         await release.wait()
-        return {"content": "stale", "version": 9}
+        return [{"group_no": "group-1"}]
 
-    get_members = AsyncMock(
-        return_value=[GroupMember(uid="u1", name="Alice", robot=False)]
-    )
-    with (
-        patch.object(
-            api,
-            "fetch_bot_groups",
-            AsyncMock(return_value=[{"group_no": "group-1"}]),
-        ),
-        patch.object(api, "get_group_md", new=blocked_md),
-        patch.object(api, "get_group_members", get_members),
-    ):
+    with patch.object(api, "fetch_bot_groups", new=blocked_groups):
         task = asyncio.create_task(adapter._prefetch_groups_and_members())
         await entered.wait()
         await adapter._evict_group_scope("group-1")
@@ -328,7 +320,8 @@ async def test_inflight_prefetch_cannot_restore_evicted_group_scope():
     assert "group-1" not in adapter._group_member_rosters
     assert "group-1" not in adapter._group_names
     assert adapter.find_shared_groups("u1") == []
-    get_members.assert_not_awaited()
+
+
 
 
 @pytest.mark.asyncio
@@ -376,3 +369,29 @@ async def test_group_prefetch_evicts_membership_facts_absent_from_server_snapsho
     assert not any(key.startswith("group-left") for key in adapter._group_histories)
     assert not any(key.startswith("group-left") for key in adapter._group_md_cache)
     assert not any(key.startswith("group-left") for key in adapter._group_md_checked)
+
+
+@pytest.mark.asyncio
+async def test_group_prefetch_keeps_existing_scopes_on_malformed_snapshot():
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    adapter._known_group_ids = {"group-current"}
+    adapter._group_member_rosters = {"group-current": {"u1": "Alice"}}
+    adapter._group_histories = {"group-current": [{"body": "keep"}]}
+
+    with patch.object(
+        api,
+        "fetch_bot_groups",
+        AsyncMock(return_value=[{"name": "missing group number"}]),
+    ):
+        await adapter._prefetch_groups_and_members()
+
+    assert adapter._known_group_ids == {"group-current"}
+    assert adapter._group_member_rosters == {
+        "group-current": {"u1": "Alice"}
+    }
+    assert adapter._group_histories == {
+        "group-current": [{"body": "keep"}]
+    }

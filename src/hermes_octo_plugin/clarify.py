@@ -17,7 +17,10 @@ from . import api, cards
 from .card_sessions import CardSession, ClarifySession
 from .types import CARD_PROFILE_V2, SendMessageResult
 
+
+
 _NATIVE_CLARIFY_MIN = Version("0.20")
+_NATIVE_CLARIFY_MAX_EXCLUSIVE = Version("0.21")
 
 
 def native_clarify_supported() -> bool:
@@ -25,9 +28,11 @@ def native_clarify_supported() -> bool:
         installed = Version(package_version("hermes-agent"))
     except (PackageNotFoundError, InvalidVersion):
         return False
-    return installed >= _NATIVE_CLARIFY_MIN
-
-
+    return (
+        _NATIVE_CLARIFY_MIN
+        <= installed
+        < _NATIVE_CLARIFY_MAX_EXCLUSIVE
+    )
 def registered_clarify_entry(clarify_id: str) -> Any | None:
     from tools import clarify_gateway
 
@@ -402,8 +407,6 @@ async def deliver(
             success=False,
             error="Octo clarify card delivery missing message_id",
         )
-    if not still_pending(entry):
-        return pending_failure(message_id=result.message_id)
     try:
         adapter._register_card_session(
             CardSession(
@@ -438,4 +441,6 @@ async def deliver(
             message_id=result.message_id,
             error="Octo clarify card binding failed",
         )
+    if not still_pending(entry):
+        return pending_failure(message_id=result.message_id)
     return _delivery_result(result)

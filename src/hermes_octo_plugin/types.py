@@ -256,30 +256,65 @@ class MessagePayload:
         extra = {k: v for k, v in data.items() if k not in known_keys}
 
         mention = None
-        if "mention" in data and data["mention"]:
-            m = data["mention"]
-            entities = None
-            if m.get("entities"):
-                entities = [
-                    MentionEntity(uid=e["uid"], offset=e["offset"], length=e["length"])
-                    for e in m["entities"]
-                    if isinstance(e, dict) and "uid" in e
-                ]
+        raw_mention = data.get("mention")
+        if isinstance(raw_mention, dict) and raw_mention:
+            raw_entities = raw_mention.get("entities")
+            entities: list[MentionEntity] | None = None
+            if isinstance(raw_entities, list):
+                parsed_entities = []
+                for entity in raw_entities:
+                    if not isinstance(entity, dict):
+                        continue
+                    uid = entity.get("uid")
+                    offset = entity.get("offset")
+                    length = entity.get("length")
+                    if (
+                        not isinstance(uid, str)
+                        or not uid
+                        or not isinstance(offset, int)
+                        or isinstance(offset, bool)
+                        or offset < 0
+                        or not isinstance(length, int)
+                        or isinstance(length, bool)
+                        or length <= 0
+                    ):
+                        continue
+                    parsed_entities.append(
+                        MentionEntity(uid=uid, offset=offset, length=length)
+                    )
+                entities = parsed_entities or None
+            raw_uids = raw_mention.get("uids")
+            uids = (
+                [uid for uid in raw_uids if isinstance(uid, str) and uid]
+                if isinstance(raw_uids, list)
+                else None
+            )
             mention = MentionPayload(
-                uids=m.get("uids"),
+                uids=uids or None,
                 entities=entities,
-                all=_coerce_wire_bool(m.get("all")),
-                humans=_coerce_wire_bool(m.get("humans")),
-                ais=_coerce_wire_bool(m.get("ais")),
+                all=_coerce_wire_bool(raw_mention.get("all")),
+                humans=_coerce_wire_bool(raw_mention.get("humans")),
+                ais=_coerce_wire_bool(raw_mention.get("ais")),
             )
 
         reply = None
-        if "reply" in data and data["reply"]:
-            r = data["reply"]
+        raw_reply = data.get("reply")
+        if isinstance(raw_reply, dict) and raw_reply:
+            raw_reply_payload = raw_reply.get("payload")
+            raw_from_uid = raw_reply.get("from_uid")
+            raw_from_name = raw_reply.get("from_name")
             reply = ReplyPayload(
-                payload=r.get("payload"),
-                from_uid=r.get("from_uid"),
-                from_name=r.get("from_name"),
+                payload=(
+                    raw_reply_payload
+                    if isinstance(raw_reply_payload, dict)
+                    else None
+                ),
+                from_uid=raw_from_uid if isinstance(raw_from_uid, str) else None,
+                from_name=(
+                    raw_from_name
+                    if isinstance(raw_from_name, str)
+                    else None
+                ),
             )
 
         # Preserve unknown numeric message types.  Coercing them to Text
@@ -312,11 +347,11 @@ class MessagePayload:
         return cls(
             type=msg_type,
             content=content_str,
-            url=data.get("url"),
-            name=data.get("name"),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+            name=data.get("name") if isinstance(data.get("name"), str) else None,
             mention=mention,
             reply=reply,
-            event=data.get("event"),
+            event=data.get("event") if isinstance(data.get("event"), dict) else None,
             blocks=blocks,
             plain=plain_str,
             extra=extra,

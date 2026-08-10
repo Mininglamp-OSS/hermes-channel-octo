@@ -66,8 +66,9 @@ def _card_nodes(value: object, node_type: str) -> list[dict[str, object]]:
         ("0.19.7", False),
         ("0.20.0", True),
         ("0.20.4", True),
-        ("0.21.0", True),
-        ("1.0.0", True),
+        ("0.21.0", False),
+        ("0.22.0", False),
+        ("1.0.0", False),
         ("not-a-version", False),
         ("0.21.0rc1", True),
     ],
@@ -373,6 +374,49 @@ async def test_profile_failure_after_clarify_cancellation_never_sends_text_fallb
     assert result.success is False
     assert result.error == "Hermes clarify is no longer pending"
     fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clarify_cleared_during_post_keeps_sent_card_session_owned() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    clarify_id = "clarify-cleared-during-post"
+    entry = clarify_gateway.register(
+        clarify_id,
+        _ROUTE.session_key,
+        "Which option?",
+        ["A", "B"],
+    )
+    entry.multi_select = False
+
+    async def send_then_clear(*_args, **_kwargs) -> SendMessageResult:
+        clarify_gateway.clear_session(_ROUTE.session_key)
+        return SendMessageResult(message_id="clarify-orphan-guard")
+
+    fallback = AsyncMock()
+    with (
+        patch.object(BasePlatformAdapter, "send_clarify", fallback),
+        patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
+        patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        patch.object(api, "send_card_message", side_effect=send_then_clear),
+    ):
+        result = await OctoAdapter.send_clarify(
+            adapter,
+            _ROUTE.chat_id,
+            "Which option?",
+            ["A", "B"],
+            clarify_id=clarify_id,
+            session_key=_ROUTE.session_key,
+        )
+
+    assert result.success is False
+    assert result.message_id == "clarify-orphan-guard"
+    claim = adapter._card_sessions.claim("clarify-orphan-guard", 1)
+    assert claim.status == "claimed"
+    assert claim.session is not None
+    assert claim.session.clarify is not None
+    assert claim.session.clarify.clarify_id == clarify_id
+    fallback.assert_not_awaited()
+
 @pytest.mark.asyncio
 async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> None:
     adapter = _bare_clarify_adapter(native=True)
@@ -938,39 +982,6 @@ async def test_definitive_rejection_after_cancellation_never_sends_text_fallback
     fallback.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_cleared_clarify_during_post_is_not_registered_as_live_card() -> None:
-    adapter = _bare_clarify_adapter(native=True)
-    clarify_id = "clarify-cleared-during-post"
-    entry = clarify_gateway.register(
-        clarify_id,
-        _ROUTE.session_key,
-        "Which option?",
-        ["A", "B"],
-    )
-    entry.multi_select = False
-
-    async def send_then_clear(*_args, **_kwargs) -> SendMessageResult:
-        clarify_gateway.clear_session(_ROUTE.session_key)
-        return SendMessageResult(message_id="stale-card-message")
-
-    with (
-        patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
-        patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
-        patch.object(api, "send_card_message", side_effect=send_then_clear),
-    ):
-        result = await OctoAdapter.send_clarify(
-            adapter,
-            _ROUTE.chat_id,
-            "Which option?",
-            ["A", "B"],
-            clarify_id=clarify_id,
-            session_key=_ROUTE.session_key,
-        )
-
-    assert result.success is False
-    assert result.message_id == "stale-card-message"
-    assert adapter._card_sessions.claim("stale-card-message", 1).status == "missing"
 
 
 @pytest.mark.asyncio

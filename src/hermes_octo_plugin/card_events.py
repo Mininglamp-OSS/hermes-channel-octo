@@ -53,7 +53,14 @@ _OWNER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 class EventCursorStore(Protocol):
     async def load(self) -> int: ...
 
-    async def save(self, event_id: int) -> None: ...
+    async def load_pending_ack(self) -> int | None: ...
+
+    async def save(
+        self,
+        event_id: int,
+        *,
+        pending_ack_event_id: int | None = None,
+    ) -> None: ...
 
 
 def _safe_event_id(value: object) -> int | None:
@@ -89,30 +96,68 @@ class FileEventCursorStore:
     async def load(self) -> int:
         return await asyncio.to_thread(self._load_sync)
 
-    async def save(self, event_id: int) -> None:
+    async def load_pending_ack(self) -> int | None:
+        return await asyncio.to_thread(self._load_pending_ack_sync)
+
+    async def save(
+        self,
+        event_id: int,
+        *,
+        pending_ack_event_id: int | None = None,
+    ) -> None:
         if _safe_event_id(event_id) is None:
             raise ValueError("invalid event cursor")
-        await asyncio.to_thread(self._save_sync, event_id)
+        if pending_ack_event_id is not None and (
+            _safe_event_id(pending_ack_event_id) is None
+            or pending_ack_event_id > event_id
+        ):
+            raise ValueError("invalid pending ack event id")
+        await asyncio.to_thread(
+            self._save_sync,
+            event_id,
+            pending_ack_event_id,
+        )
 
     def _load_sync(self) -> int:
         with self._lock:
-            return self._read_unlocked()
+            event_id, _ = self._read_state_unlocked()
+            return event_id
 
-    def _read_unlocked(self) -> int:
+    def _load_pending_ack_sync(self) -> int | None:
+        with self._lock:
+            _, pending_ack_event_id = self._read_state_unlocked()
+            return pending_ack_event_id
+
+    def _read_state_unlocked(self) -> tuple[int, int | None]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            return 0
+            return 0, None
         if not isinstance(raw, dict):
-            return 0
+            return 0, None
         event_id = _safe_event_id(raw.get("event_id"))
-        return event_id if event_id is not None else 0
+        if event_id is None:
+            return 0, None
+        pending_ack_event_id = _safe_event_id(raw.get("pending_ack_event_id"))
+        if (
+            pending_ack_event_id is None
+            or pending_ack_event_id > event_id
+        ):
+            pending_ack_event_id = None
+        return event_id, pending_ack_event_id
 
-    def _save_sync(self, event_id: int) -> None:
+    def _save_sync(
+        self,
+        event_id: int,
+        pending_ack_event_id: int | None,
+    ) -> None:
         with self._lock:
-            current = self._read_unlocked()
+            current, _ = self._read_state_unlocked()
             if event_id < current:
                 raise ValueError("event cursor cannot move backwards")
+            payload: dict[str, int] = {"event_id": event_id}
+            if pending_ack_event_id is not None:
+                payload["pending_ack_event_id"] = pending_ack_event_id
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.parent / (
                 f".events.cursor.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -121,7 +166,7 @@ class FileEventCursorStore:
                 with temporary.open("x", encoding="utf-8") as handle:
                     handle.write(
                         json.dumps(
-                            {"event_id": event_id},
+                            payload,
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
@@ -503,10 +548,9 @@ async def handle_card_action(
             return "dead_letter"
         registry.release(action.message_id, action.event_id)
         raise
-    if accepted is False:
-        registry.release(action.message_id, action.event_id)
-        return "ignored"
-    terminal_status = accepted if isinstance(accepted, str) else "completed"
+    terminal_status = accepted if isinstance(accepted, str) else (
+        "completed" if accepted else "ignored"
+    )
     if terminal_status not in {
         "completed",
         "awaiting_text",
@@ -514,6 +558,13 @@ async def handle_card_action(
         "failed",
     }:
         registry.release(action.message_id, action.event_id)
+        await _update_action_status(
+            update_status,
+            session,
+            action,
+            "failed",
+            transient=False,
+        )
         return "ignored"
     registry.complete(action.message_id, action.event_id)
     await _update_action_status(
@@ -634,6 +685,7 @@ class EventPoller:
         self._limit = max(1, min(100, int(limit)))
         self._clock = clock
         self._cursor = 0
+        self._pending_ack_event_id: int | None = None
         self._consecutive_errors = 0
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -648,8 +700,20 @@ class EventPoller:
         except Exception:
             loaded = 0
         self._cursor = loaded if _safe_event_id(loaded) is not None else 0
+        try:
+            pending_ack_event_id = await self._cursor_store.load_pending_ack()
+        except Exception:
+            pending_ack_event_id = None
+        self._pending_ack_event_id = (
+            pending_ack_event_id
+            if (
+                _safe_event_id(pending_ack_event_id) is not None
+                and pending_ack_event_id <= self._cursor
+            )
+            else None
+        )
 
-    async def _ack(self, event_id: int) -> None:
+    async def _ack(self, event_id: int) -> bool:
         for attempt in range(_ACK_ATTEMPTS):
             try:
                 await api.ack_bot_event(
@@ -658,7 +722,7 @@ class EventPoller:
                     self._bot_token,
                     event_id=event_id,
                 )
-                return
+                return True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -668,12 +732,26 @@ class EventPoller:
                         _ACK_ATTEMPTS,
                         type(exc).__name__,
                     )
-                    return
+                    return False
                 await asyncio.sleep(_ACK_RETRY_SECONDS * (attempt + 1))
+        return False
+
+    async def _flush_pending_ack(self) -> bool:
+        event_id = self._pending_ack_event_id
+        if event_id is None:
+            return True
+        if not await self._ack(event_id):
+            return False
+        await self._cursor_store.save(self._cursor)
+        self._pending_ack_event_id = None
+        return True
 
     async def poll_once(self) -> float:
         started_at = self._clock()
         try:
+            if not await self._flush_pending_ack():
+                self._consecutive_errors = 0
+                return self._interval_seconds
             events = await api.fetch_bot_events(
                 self._session,
                 self._api_url,
@@ -687,28 +765,41 @@ class EventPoller:
                     event
                     for event in events
                     if isinstance(event, dict)
-                    and (event_id := _safe_event_id(event.get("event_id"))) is not None
+                    and (event_id := _safe_event_id(event.get("event_id")))
+                    is not None
                     and event_id > self._cursor
                 ),
                 key=lambda event: int(event["event_id"]),
             )
+            ack_failed = False
             for event in ordered:
                 event_id = int(event["event_id"])
                 action = parse_card_action(event)
-                status = await self._on_card_action(action) if action is not None else None
-                await self._cursor_store.save(event_id)
-                self._cursor = event_id
-                if status in {
+                status = (
+                    await self._on_card_action(action)
+                    if action is not None
+                    else None
+                )
+                should_ack = status in {
                     "completed",
                     "awaiting_text",
                     "expired",
                     "failed",
                     "dead_letter",
                     "duplicate",
-                }:
-                    await self._ack(event_id)
+                }
+                pending_ack_event_id = event_id if should_ack else None
+                await self._cursor_store.save(
+                    event_id,
+                    pending_ack_event_id=pending_ack_event_id,
+                )
+                self._cursor = event_id
+                self._pending_ack_event_id = pending_ack_event_id
+                if should_ack and not await self._flush_pending_ack():
+                    ack_failed = True
+                    break
             self._consecutive_errors = 0
-            if self._wait_seconds == 0:
+            if ack_failed or self._wait_seconds == 0:
                 return self._interval_seconds
             if ordered:
                 return 0.0

@@ -101,18 +101,16 @@ class CardSessionRegistry:
         self,
         *,
         message_id: str,
-        card_seq: int,
         session_key: str,
         channel_id: str,
         channel_type: ChannelType,
         requester_uid: str,
-    ) -> bool:
-        if not _valid_sequence(card_seq):
-            return False
+    ) -> int | None:
+        """Claim a live card and allocate its next server-owned edit sequence."""
         with self._lock:
             entry = self._entry_locked(message_id)
             if entry is None or entry.state != "pending":
-                return False
+                return None
             session = entry.session
             if (
                 session.session_key != session_key
@@ -120,10 +118,12 @@ class CardSessionRegistry:
                 or session.channel_type != channel_type
                 or session.requester_uid != requester_uid
             ):
-                return False
+                return None
+            entry.card_seq += 1
+            card_seq = entry.card_seq
             entry.state = "processing"
             entry.claimed_event_id = -card_seq
-            return True
+            return card_seq
 
     def claim(self, message_id: str, event_id: int) -> CardClaim:
         with self._lock:

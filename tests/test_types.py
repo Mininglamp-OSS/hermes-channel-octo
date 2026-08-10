@@ -200,6 +200,54 @@ class TestMessagePayload:
         assert mp.event == {"type": "group_md_updated"}
 
 
+    def test_from_dict_drops_malformed_optional_wire_containers(self):
+        payload = MessagePayload.from_dict({
+            "type": 1,
+            "content": 42,
+            "url": 7,
+            "name": {"nested": "value"},
+            "mention": "not-an-object",
+            "reply": ["not-an-object"],
+            "event": "not-an-object",
+        })
+
+        assert payload.content is None
+        assert payload.url is None
+        assert payload.name is None
+        assert payload.mention is None
+        assert payload.reply is None
+        assert payload.event is None
+
+
+    def test_from_dict_filters_malformed_mentions_and_reply_fields(self):
+        payload = MessagePayload.from_dict({
+            "type": 1,
+            "mention": {
+                "uids": ["valid", 42, ""],
+                "entities": [
+                    {"uid": "valid", "offset": 0, "length": 5},
+                    {"uid": 42, "offset": 0, "length": 5},
+                    {"uid": "missing-offset"},
+                ],
+            },
+            "reply": {
+                "payload": "not-an-object",
+                "from_uid": 42,
+                "from_name": ["Alice"],
+            },
+        })
+
+        assert payload.mention is not None
+        assert payload.mention.uids == ["valid"]
+        assert payload.mention.entities == [
+            MentionEntity(uid="valid", offset=0, length=5)
+        ]
+        assert payload.reply is not None
+        assert payload.reply.payload is None
+        assert payload.reply.from_uid is None
+        assert payload.reply.from_name is None
+
+
 class TestBotMessage:
     def test_creation(self):
         payload = MessagePayload(type=MessageType.Text, content="test")

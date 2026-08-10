@@ -50,11 +50,11 @@ logger = logging.getLogger(__name__)
 _RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def _new_guarded_http_session(api_url: str) -> aiohttp.ClientSession:
-    """Create a per-call session without bypassing the adapter's SSRF policy."""
-    from .adapter import _new_guarded_http_session as _factory
+def _new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
+    """Create a per-call session with the shared SSRF transport policy."""
+    from .transport import new_guarded_http_session
 
-    return _factory(api_url)
+    return new_guarded_http_session(*configured_urls)
 
 
 def _valid_resource_id(value: Any) -> bool:

@@ -515,9 +515,11 @@ async def test_native_remote_media_uses_the_server_upload_limit(method_name: str
     adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
-    download = AsyncMock(
-        return_value=(b"media", "application/octet-stream", "source.bin")
-    )
+    async def guarded_download(session, *_args, **_kwargs):
+        assert isinstance(session.connector, _SSRFGuardConnector)
+        return b"media", "application/octet-stream", "source.bin"
+
+    download = AsyncMock(side_effect=guarded_download)
 
     with (
         patch.object(api, "download_file", download),
@@ -535,7 +537,7 @@ async def test_native_remote_media_uses_the_server_upload_limit(method_name: str
 
     assert result.success is True
     assert download.await_args.kwargs["max_size"] == api.MAX_OUTBOUND_MEDIA_BYTES
-    assert download.await_args.kwargs["enforce_host_safety"] is False
+    assert download.await_args.kwargs["enforce_host_safety"] is True
 
 
 
@@ -601,3 +603,56 @@ async def test_native_image_download_failure_does_not_fall_back_to_remote_url():
 
     assert result.success is False
     send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inbound_private_media_is_not_forwarded_after_local_download_rejection():
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._robot_id = "bot-1"
+    adapter._aes_key = b"key"
+    adapter._aes_iv = b"iv"
+    adapter._resolve_sender_name = AsyncMock(return_value="Alice")
+    adapter._send_typing_safe = AsyncMock()
+    adapter.build_source = MagicMock(return_value=SimpleNamespace())
+    adapter.handle_message = AsyncMock()
+    raw = b'{"type": 2, "url": "http://127.0.0.1/private.png"}'
+    recv = SimpleNamespace(
+        message_id="message-1",
+        message_seq=1,
+        from_uid="user-1",
+        channel_id="bot-1",
+        channel_type=ChannelType.DM,
+        timestamp=1,
+        encrypted_payload=raw,
+    )
+
+    with patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw):
+        await adapter._handle_recv(recv)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.media_urls == []
+    assert event.media_types == []
+
+
+@pytest.mark.asyncio
+async def test_native_media_failure_redacts_signed_source_from_result_and_logs(caplog):
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    source = "https://source.example/image.png?token=signed-secret"
+
+    with (
+        patch.object(
+            api,
+            "download_file",
+            AsyncMock(side_effect=RuntimeError(f"rejected {source}")),
+        ),
+        patch.object(api, "send_media_message", AsyncMock()),
+    ):
+        result = await adapter.send_image("group-1", source)
+
+    assert result.success is False
+    assert source not in (result.error or "")
+    assert "signed-secret" not in caplog.text

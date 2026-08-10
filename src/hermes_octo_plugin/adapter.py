@@ -2343,15 +2343,14 @@ class OctoAdapter(BasePlatformAdapter):
             # only sent ``all`` and expected every participant, including bots,
             # to activate. Preserve that compatibility unless explicitly
             # disabled, without treating modern human-only broadcasts as AI @s.
-            ai_broadcast = bool(getattr(payload.mention, "ais", False))
-            legacy_all = bool(getattr(payload.mention, "all", False)) and (
-                getattr(payload.mention, "humans", None) is None
-                and getattr(payload.mention, "ais", None) is None
+            ai_broadcast = payload.mention.ais is True
+            legacy_all = payload.mention.all is True and (
+                payload.mention.humans is None
+                and payload.mention.ais is None
             )
-            is_mentioned = (
-                explicit_bot_mention
-                or ai_broadcast
-                or (legacy_all and not self._ignore_mention_all)
+            is_mentioned = explicit_bot_mention or (
+                not self._ignore_mention_all
+                and (ai_broadcast or legacy_all)
             )
 
         # Defensive fallback (G): some senders (older clients, bot-to-bot)
@@ -2517,18 +2516,18 @@ class OctoAdapter(BasePlatformAdapter):
         media_urls: list[str] = []
         media_types: list[str] = []
 
-        # Map Octo media types to Hermes MessageType.
-        # Image/GIF/Voice/Video are streamed to /tmp/octo-media first and
-        # the local path is handed to hermes-core (avoids the vision/audio
-        # pipeline hanging on slow remote URLs). The
-        # download is bounded (20 MB / 120s); on cap-exceeded or error we
-        # fall back to the remote URL so the LLM at least has *something*.
+        # Image/GIF/Voice/Video are downloaded to /tmp/octo-media first and
+        # the local path is handed to hermes-core. Public URLs may be passed
+        # through when the bounded download fails so Hermes can retry them,
+        # but rejected private/metadata targets must never escape this gate.
         async def _local_or_remote(rel_url: str | None, mime: str) -> str | None:
             url = self._build_media_url(rel_url)
             if not url:
                 return None
             local = await self._download_inbound_media_to_local(url, mime)
-            return local or url
+            if local:
+                return local
+            return url if self._inbound_media_url_allowed(url) else None
 
         if payload.type == OctoMessageType.Image:
             hermes_msg_type = MessageType.PHOTO
@@ -3399,20 +3398,11 @@ class OctoAdapter(BasePlatformAdapter):
         self._cache_activity[channel_id] = time.monotonic()
 
     async def _prefetch_groups_and_members(self) -> None:
-        """Warm caches at startup.
+        """Seed group identity caches without loading group-scoped content.
 
-        Concretely:
-          1. List all groups the bot belongs to → seed known_group_ids so
-             parse_target on a bare id can disambiguate group vs DM.
-          2. For each group, fetch GROUP.md once and stash in the cache so
-             the first @ message doesn't pay the round-trip.
-          3. For each group, fetch member list once and stash uid↔name maps
-             so mention resolution works on the very first message.
-
-        Fire-and-forget; every step is wrapped in try/except so a single
-        slow / missing endpoint doesn't poison the warmup. Activity is
-        recorded for every prefetched channel so the cleanup loop doesn't
-        evict cold-but-just-fetched state on its first pass.
+        Startup only needs group IDs to disambiguate bare targets. GROUP.md and
+        member names are loaded lazily when a message or management operation
+        needs them, avoiding an account-wide content read on every reconnect.
         """
         if not self._http_session:
             return
@@ -3427,96 +3417,51 @@ class OctoAdapter(BasePlatformAdapter):
 
         snapshot_group_ids: set[str] = set()
         for group in groups:
-            if isinstance(group, dict):
-                group_no = group.get("group_no")
-            else:
-                group_no = getattr(group, "group_no", None)
-            if group_no:
-                snapshot_group_ids.add(group_no)
+            group_no = (
+                group.get("group_no")
+                if isinstance(group, dict)
+                else getattr(group, "group_no", None)
+            )
+            if not isinstance(group_no, str) or not group_no:
+                logger.warning(
+                    "[%s] prefetch: malformed group snapshot; keeping cached scopes",
+                    self.name,
+                )
+                return
+            snapshot_group_ids.add(group_no)
         for stale_group_no in self._known_group_ids - snapshot_group_ids:
             await self._evict_group_scope(stale_group_no)
 
-        md_count = 0
-        member_count = 0
-        for g in groups:
-            if hasattr(g, "group_no"):
-                gid = g.group_no
-            elif isinstance(g, dict):
-                gid = g.get("group_no")
-            else:
-                gid = None
+        indexed_count = 0
+        for group in groups:
+            gid = (
+                group.get("group_no")
+                if isinstance(group, dict)
+                else getattr(group, "group_no", None)
+            )
             if not gid:
                 continue
-            # A group evicted while the server snapshot or an earlier group
-            # was awaiting I/O must not be resurrected by this older prefetch.
+            # A group evicted while the server snapshot was awaiting I/O must
+            # not be resurrected by this older prefetch.
             if self._group_scope_generation(gid) != snapshot_generations.get(gid, 0):
                 continue
-            generation = self._group_scope_generation(gid)
             self._known_group_ids.add(gid)
             self._touch_cache(gid)
             self._chat_kind[gid] = ChannelType.Group
-
-            # GROUP.md prefetch — best effort.
-            # First hydrate from disk so a restart serves the cached MD
-            # immediately even if the API is slow / down. The next inbound
-            # group_md_updated event invalidates and refetches.
-            self._hydrate_md_cache_from_disk(gid)
-            try:
-                md = await api.get_group_md(
-                    self._http_session,
-                    self._api_url,
-                    self._bot_token,
-                    gid,
-                )
-                if generation != self._group_scope_generation(gid):
-                    continue
-                if md and md.get("content"):
-                    self._group_md_cache[gid] = {
-                        "content": md["content"],
-                        "version": md.get("version", 0),
-                    }
-                    self._group_md_checked.add(gid)
-                    self._write_md_to_disk(gid, md["content"], md.get("version", 0))
-                    md_count += 1
-            except Exception as e:
-                if generation != self._group_scope_generation(gid):
-                    continue
-                logger.debug(
-                    "[%s] prefetch GROUP.md for %s skipped: %s", self.name, gid, e
-                )
-
-            # Member list prefetch — best effort; fills uid↔name maps so
-            # the first @-mention in this group doesn't have to do a
-            # blocking refresh.
-            try:
-                members = await api.get_group_members(
-                    self._http_session,
-                    self._api_url,
-                    self._bot_token,
-                    gid,
-                )
-                if generation != self._group_scope_generation(gid):
-                    continue
-                member_count += self._cache_group_members(gid, members)
-                # Also record the group's display name for shared-groups
-                # answers — fall back to group_no when the API omits it.
-                gname = getattr(g, "name", None) or gid
-                self._group_names[gid] = gname
-                self._group_cache_timestamps[gid] = int(time.time() * 1000)
-            except Exception as e:
-                if generation != self._group_scope_generation(gid):
-                    continue
-                logger.debug(
-                    "[%s] prefetch members for %s skipped: %s", self.name, gid, e
-                )
+            group_name = (
+                group.get("name")
+                if isinstance(group, dict)
+                else getattr(group, "name", None)
+            )
+            if isinstance(group_name, str) and group_name:
+                self._group_names[gid] = group_name
+            indexed_count += 1
 
         if groups:
             logger.info(
-                "[%s] prefetch complete: %d groups, %d GROUP.md cached, %d member names",
+                "[%s] prefetch complete: %d groups indexed",
                 self.name,
-                len(groups),
-                md_count,
-                member_count,
+                indexed_count,
             )
 
     def _evict_group_membership_cache(self, group_no: str) -> None:
@@ -3885,12 +3830,15 @@ class OctoAdapter(BasePlatformAdapter):
                 max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
             )
         if source.startswith(("http://", "https://")):
-            async with aiohttp.ClientSession() as download_session:
+            async with _new_guarded_http_session(
+                self._api_url,
+                self._cdn_url,
+            ) as download_session:
                 return await api.download_file(
                     download_session,
                     source,
                     max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
-                    enforce_host_safety=False,
+                    enforce_host_safety=True,
                 )
         file_data, filename = await asyncio.to_thread(
             api.read_authorized_local_media,
