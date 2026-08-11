@@ -448,6 +448,43 @@ async def test_send_message_returns_the_server_message_identity():
 
 
 @pytest.mark.asyncio
+async def test_management_send_filters_mentions_to_authoritative_target_roster():
+    member_lookup = AsyncMock(
+        return_value=[
+            GroupMember(uid="owner-uid", name="Owner"),
+            GroupMember(uid="member-1", name="Member"),
+        ]
+    )
+    send_message = AsyncMock(
+        return_value=SendMessageResult(message_id="server-message")
+    )
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(agent_tools.api, "get_group_members", member_lookup),
+        patch.object(agent_tools.api, "send_message", send_message),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("send-message"),
+                    "requester_uid": "owner-uid",
+                    "mention_uids": ["member-1", "outsider"],
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    member_lookup.assert_awaited_once_with(
+        ANY,
+        "https://octo.invalid",
+        "test-token",
+        "group-1",
+    )
+    assert send_message.await_args.kwargs["mention_uids"] == ["member-1"]
+
+
+@pytest.mark.asyncio
 async def test_thread_send_does_not_bypass_owner_only_join_permission():
     join_thread = AsyncMock()
     send_message = AsyncMock(

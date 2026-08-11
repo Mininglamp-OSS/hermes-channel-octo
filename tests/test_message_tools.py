@@ -287,6 +287,37 @@ async def test_rich_text_tool_delivers_surviving_blocks_after_one_image_fails():
 
 
 @pytest.mark.asyncio
+async def test_file_tool_rejects_invalid_name_before_upload_side_effect():
+    upload = AsyncMock(
+        return_value=(
+            "https://cdn.example/report.bin",
+            b"data",
+            "application/octet-stream",
+            "report.bin",
+        )
+    )
+    send = AsyncMock(return_value=SendMessageResult(message_id="file-1"))
+
+    with (
+        _tool_context(),
+        patch.object(message_tools, "_upload_media", upload),
+        patch.object(message_tools.api, "send_media_message", send),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_file_handler(
+                {
+                    "source": "https://public.example/report.bin",
+                    "file_name": "../secret.bin",
+                }
+            )
+        )
+
+    assert result == {"error": "file_name is invalid"}
+    upload.assert_not_awaited()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_file_tool_accepts_a_local_path(tmp_path):
     source = tmp_path / "report.txt"
     source.write_text("local media", encoding="utf-8")

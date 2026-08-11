@@ -567,8 +567,15 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 if not _valid_target_channel_id(channel_id, channel_type):
                     return _err("invalid target channel id")
 
+                target_member_uids: set[str] | None = None
+
                 async def _fetch_members(group_no: str):
-                    return await api.get_group_members(session, api_url, bot_token, group_no)
+                    nonlocal target_member_uids
+                    members = await api.get_group_members(
+                        session, api_url, bot_token, group_no
+                    )
+                    target_member_uids = {member.uid for member in members if member.uid}
+                    return members
 
                 pres = await check_permission(
                     requester_uid=requester_uid,
@@ -585,7 +592,19 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     )
                     return _err(pres.reason or "permission denied")
 
-                mention_uids = args.get("mention_uids") or None
+                raw_mention_uids = args.get("mention_uids")
+                mention_uids = (
+                    [
+                        uid
+                        for uid in raw_mention_uids
+                        if isinstance(uid, str)
+                        and target_member_uids is not None
+                        and uid in target_member_uids
+                    ]
+                    if isinstance(raw_mention_uids, list)
+                    else None
+                )
+                mention_uids = mention_uids or None
                 mention_all = bool(args.get("mention_all") or False)
                 # @mentions only make sense in group / thread channels.
                 if channel_type == ChannelType.DM:

@@ -398,6 +398,12 @@ async def _send_media(
         caption_text = caption
         caption_entities: list[Any] | None = None
         caption_uids: list[str] | None = None
+        requested_name = args.get("file_name")
+        validated_name: str | None = None
+        if requested_name is not None:
+            validated_name = _safe_filename(requested_name)
+            if not validated_name:
+                raise ValueError("file_name is invalid")
         async with _new_guarded_http_session(
             adapter._api_url,
             adapter._cdn_url,
@@ -418,11 +424,8 @@ async def _send_media(
                 dimensions = api.parse_image_dimensions(data, content_type)
                 if dimensions is not None:
                     width, height = dimensions
-            requested_name = args.get("file_name")
-            if requested_name is not None:
-                detected_name = _safe_filename(requested_name) or ""
-                if not detected_name:
-                    raise ValueError("file_name is invalid")
+            if validated_name is not None:
+                detected_name = validated_name
             media_client_msg_no = str(uuid.uuid4())
             send_result = await api.send_media_message(
                 session,
