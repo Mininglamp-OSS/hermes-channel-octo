@@ -35,6 +35,28 @@ class TestFilenameDecoding:
     def test_unquote_plain_ascii(self):
         assert unquote("report.xlsx") == "report.xlsx"
 
+    @pytest.mark.parametrize(
+        "filename",
+        ["\u202egnp.exe", "a\u200bb.txt", "a\u0085b.txt", "report.txt.", "report.txt "],
+    )
+    def test_safe_media_filename_rejects_format_controls_and_trailing_spoofing(
+        self,
+        filename,
+    ):
+        from hermes_octo_plugin.api import safe_media_filename
+
+        assert safe_media_filename(filename) is None
+
+    def test_content_disposition_checks_decoded_filename_and_keeps_legacy_percent(self):
+        from hermes_octo_plugin.api import _content_disposition_filename
+
+        assert _content_disposition_filename(
+            "attachment; filename*=UTF-8''%0d%0aX-Injected:%201"
+        ) is None
+        assert _content_disposition_filename(
+            'attachment; filename="100%20.txt"'
+        ) == "100%20.txt"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -176,7 +198,6 @@ class TestPresignedUpload:
             return_value=guarded_session,
         ):
             result = await upload_file_to_presigned_url(
-                session,
                 upload_url="https://storage.example/upload?signature=secret",
                 download_url="https://cdn.example/report.txt",
                 file_data=b"data",
@@ -209,7 +230,6 @@ class TestPresignedUpload:
             return_value=guarded_session,
         ):
             await upload_file_to_presigned_url(
-                session,
                 upload_url="https://storage.example/upload?signature=secret",
                 download_url="https://cdn.example/report.txt",
                 file_data=b"data",
@@ -233,7 +253,6 @@ class TestPresignedUpload:
 
         with pytest.raises(ValueError, match="Content-Length"):
             await upload_file_to_presigned_url(
-                session,
                 upload_url="https://storage.example/upload?signature=secret",
                 download_url="https://cdn.example/report.txt",
                 file_data=b"data",
@@ -407,7 +426,6 @@ class TestPresignedUpload:
         monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
         session = MagicMock()
         from hermes_octo_plugin.transport import TransportPolicy
-
         policy = TransportPolicy({"http://127.0.0.1:9000"})
         presign = {
             "uploadUrl": "http://127.0.0.1:9000/upload?signature=secret",
@@ -415,8 +433,7 @@ class TestPresignedUpload:
             "contentType": "text/plain",
         }
 
-        async def assert_trusted(active_session, **_kwargs):
-            assert active_session is session
+        async def assert_trusted(**_kwargs):
             assert policy.trusted_download_origins() == frozenset({
                 ("http", "127.0.0.1", 9000),
             })
@@ -502,7 +519,6 @@ class TestPresignedUpload:
             create=True,
         ) as session_factory:
             result = await upload_file_to_presigned_url(
-                main_session,
                 upload_url=upload_url,
                 download_url="http://cdn.example/report.txt",
                 file_data=b"data",
@@ -533,7 +549,6 @@ class TestPresignedUpload:
             return_value=guarded_session,
         ) as session_factory:
             result = await upload_file_to_presigned_url(
-                session,
                 upload_url="https://storage.example/upload?signature=secret",
                 download_url="https://cdn.example/report.txt",
                 file_data=b"data",

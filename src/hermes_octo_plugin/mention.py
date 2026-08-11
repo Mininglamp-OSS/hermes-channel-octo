@@ -123,35 +123,14 @@ def _utf16_length(text: str) -> int:
     return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
 
 
-def _utf16_range_to_python_slice(
-    text: str,
-    offset: int,
-    length: int,
-) -> tuple[int, int] | None:
-    """Map a UTF-16 code-unit range to whole Python code point boundaries."""
-    if offset < 0 or length <= 0:
-        return None
-    end_offset = offset + length
+def _utf16_boundaries(text: str) -> dict[int, int]:
+    """Map whole UTF-16 code-unit boundaries to Python string indexes once."""
+    boundaries = {0: 0}
     code_units = 0
-    start: int | None = None
-    end: int | None = None
-    for index, char in enumerate(text):
-        if code_units == offset:
-            start = index
-        if code_units == end_offset:
-            end = index
-        if start is not None and end is not None:
-            return start, end
+    for index, char in enumerate(text, 1):
         code_units += 2 if ord(char) > 0xFFFF else 1
-        if code_units > end_offset:
-            return None
-    if code_units == offset:
-        start = len(text)
-    if code_units == end_offset:
-        end = len(text)
-    if start is None or end is None:
-        return None
-    return start, end
+        boundaries[code_units] = index
+    return boundaries
 
 
 def convert_structured_mentions(
@@ -284,16 +263,11 @@ def convert_content_for_llm(
     if not mention:
         return content
 
-    # Try entities (v2) — precise offset-based replacement.  The sidecar is
-    # atomic: a malformed, non-mention, or overlapping range makes all of it
-    # untrusted, so the v1 fallback can resolve the original text instead.
+    # Try entities (v2) — wire offsets and lengths are authoritative. Build
+    # the UTF-16 boundary map once, then validate each bounded entity in O(1).
     if mention.entities:
-        mention_ranges = {
-            (match.start(), match.end())
-            for match in MENTION_PATTERN.finditer(content)
-        }
+        boundaries = _utf16_boundaries(content)
         entity_ranges: list[tuple[MentionEntity, int, int]] = []
-        sidecar_valid = True
         for entity in mention.entities:
             if not (
                 isinstance(entity, MentionEntity)
@@ -303,29 +277,22 @@ def convert_content_for_llm(
                 and isinstance(entity.length, int)
                 and not isinstance(entity.length, bool)
             ):
-                sidecar_valid = False
-                break
-            slice_indices = _utf16_range_to_python_slice(
-                content,
-                entity.offset,
-                entity.length,
-            )
-            if slice_indices is None or slice_indices not in mention_ranges:
-                sidecar_valid = False
-                break
-            entity_ranges.append((entity, *slice_indices))
+                continue
+            start = boundaries.get(entity.offset)
+            end = boundaries.get(entity.offset + entity.length)
+            if start is None or end is None or start >= end or content[start] != "@":
+                continue
+            entity_ranges.append((entity, start, end))
 
         sorted_entities = sorted(entity_ranges, key=lambda item: item[1])
-        if any(
+        overlaps = any(
             start < previous_end
             for (_, _, previous_end), (_, start, _) in zip(
                 sorted_entities,
                 sorted_entities[1:],
             )
-        ):
-            sidecar_valid = False
-
-        if sidecar_valid:
+        )
+        if sorted_entities and not overlaps:
             result = content
             for entity, start, end in reversed(sorted_entities):
                 name = content[start + 1:end]

@@ -40,26 +40,21 @@ class TestValidateOctoUrl:
         with pytest.raises(ValueError, match="missing host"):
             _validate_octo_url("http://", "OCTO_API_URL")
 
-    @pytest.mark.parametrize("url", [
-        "http://127.0.0.1/",
-        "http://localhost:8080/",
-        "https://10.0.0.1/v1",
-        "http://192.168.1.1/",
-        "http://169.254.169.254/latest/meta-data/",
-        "http://metadata.google.internal/computeMetadata/v1/",
-        "http://octo.internal/",
-        "http://[::1]/",
-    ])
-    def test_rejects_private_and_metadata(self, url):
-        # Make sure OCTO_ALLOW_PRIVATE_HOSTS is not set so the SSRF guard runs.
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1/",
+            "http://localhost:8080/",
+            "https://10.0.0.1/v1",
+            "http://192.168.1.1/",
+            "http://octo.internal/",
+            "http://[::1]/",
+        ],
+    )
+    def test_accepts_explicitly_configured_private_origin(self, url):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OCTO_ALLOW_PRIVATE_HOSTS", None)
-            with pytest.raises(ValueError, match="SSRF guard"):
-                _validate_octo_url(url, "OCTO_API_URL")
-
-    def test_allow_private_hosts_env_bypass(self):
-        with mock.patch.dict(os.environ, {"OCTO_ALLOW_PRIVATE_HOSTS": "true"}):
-            assert _validate_octo_url("http://127.0.0.1/", "OCTO_API_URL") == "http://127.0.0.1/"
+            assert _validate_octo_url(url, "OCTO_API_URL") == url
 
     @pytest.mark.parametrize(
         "url",

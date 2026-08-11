@@ -93,11 +93,13 @@ class CardSessionRegistry:
         with self._lock:
             self._prune_locked()
             existing = self._entries.get(session.message_id)
-            if existing is not None and existing.state != "completed":
+            if existing is not None and existing.state == "pending":
                 existing.session = session
                 existing.expires_at = time.monotonic() + self._ttl_seconds
                 self._entries.move_to_end(session.message_id)
                 return
+            if existing is not None and existing.state != "completed":
+                raise ValueError("card session message_id already active")
             self._entries.pop(session.message_id, None)
             while len(self._entries) >= self._max_sessions:
                 completed_message_id = next(

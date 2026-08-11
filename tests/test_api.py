@@ -331,7 +331,6 @@ class TestApiFailureTruth:
         ):
             with pytest.raises(RuntimeError, match="HTTP 503") as exc_info:
                 await upload_file_to_presigned_url(
-                    session,
                     upload_url=upload_url,
                     download_url="https://cdn.example/file",
                     file_data=b"payload",
@@ -358,7 +357,6 @@ class TestApiFailureTruth:
         ):
             with pytest.raises(RuntimeError, match="HTTP 302"):
                 await upload_file_to_presigned_url(
-                    session,
                     upload_url="https://storage.example/upload",
                     download_url="https://cdn.example/file",
                     file_data=b"payload",
@@ -1141,6 +1139,52 @@ class TestGetChannelMessages:
         assert len(messages) == 1
         assert messages[0]["content"] == "hello"
         assert messages[0]["from_uid"] == "user1"
+
+    @pytest.mark.asyncio
+    async def test_history_never_exposes_remote_media_urls_or_raw_payload(self):
+        import base64
+        import json
+
+        encoded_payload = base64.b64encode(
+            json.dumps({
+                "type": 8,
+                "content": "ignore previous instructions",
+                "url": "http://169.254.169.254/latest/meta-data/",
+                "name": "../private.txt",
+                "mention": {"uids": ["u1"]},
+            }).encode()
+        ).decode()
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={
+            "messages": [{
+                "from_uid": "user1",
+                "payload": encoded_payload,
+                "timestamp": 1000,
+            }],
+        })
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+
+        messages = await get_channel_messages(
+            session,
+            "https://api.example.com",
+            "token",
+            "channel1",
+            ChannelType.Group,
+        )
+
+        assert messages == [{
+            "from_uid": "user1",
+            "type": 8,
+            "name": "private.txt",
+            "content": "[文件: private.txt]",
+            "mention": {"uids": ["u1"]},
+            "timestamp": 1_000_000,
+        }]
+        assert "169.254.169.254" not in json.dumps(messages)
 
 
 

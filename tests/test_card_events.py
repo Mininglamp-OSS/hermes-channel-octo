@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
 
 from types import SimpleNamespace
@@ -219,13 +220,23 @@ def test_registry_registration_rejects_invalid_ids_and_unsafe_capacity_eviction(
 
 
 
-def test_registry_reregistration_preserves_an_active_claim() -> None:
+def test_registry_reregistration_refreshes_pending_session() -> None:
     registry = card_events.CardSessionRegistry()
     registry.register(_session())
-
-    assert registry.claim("message-1", 99).status == "claimed"
     registry.register(_session(plain="Updated"))
 
+    assert registry.peek("message-1") == _session(plain="Updated")
+
+
+def test_registry_reregistration_rejects_active_message_id_collision() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+    assert registry.claim("message-1", 99).status == "claimed"
+
+    with pytest.raises(ValueError, match="already active"):
+        registry.register(_session(plain="Replacement"))
+
+    assert registry.peek("message-1") == _session()
     assert registry.claim("message-1", 100).status == "duplicate"
 
 def test_default_card_session_ttl_covers_the_default_clarify_window() -> None:
@@ -386,6 +397,39 @@ async def test_duplicate_is_owned_only_after_exact_action_validation() -> None:
     ) == "ignored"
 
 
+
+def test_card_status_rerender_neutralizes_all_model_authored_markdown() -> None:
+    session = _session(
+        card={
+            "type": "AdaptiveCard",
+            "body": [
+                {
+                    "type": "Input.Text",
+                    "id": "answer",
+                    "label": r"![label](http://10.0.0.5/pixel)",
+                },
+            ],
+            "actions": [],
+        },
+        action_labels={"submit": r"![action](http://10.0.0.5/pixel)"},
+    )
+    action = card_events.CardAction(
+        event_id=1,
+        message_id=session.message_id,
+        channel_id=session.channel_id,
+        channel_type=session.channel_type,
+        operator_uid=session.requester_uid,
+        action_id="submit",
+        inputs={"answer": r"\[typed](http://10.0.0.5/pixel)"},
+        data={"_octo_binding": session.binding_id},
+    )
+
+    rendered = card_events.render_card_action_status(session, action, "completed")
+    serialized = json.dumps(rendered.card, ensure_ascii=False)
+
+    assert "![label]" not in serialized
+    assert "![action]" not in serialized
+    assert r"\\\[typed" in serialized
 
 @pytest.mark.asyncio
 async def test_poller_orders_dispatch_save_ack_and_preserves_cursor_on_failure() -> None:

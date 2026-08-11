@@ -1154,6 +1154,45 @@ def test_tool_hooks_use_task_local_octo_platform_when_hook_omits_platform() -> N
     controller.tool_finished.assert_called_once()
 
 
+def test_reasoning_registry_capacity_failure_degrades_without_raising() -> None:
+    adapter = _Adapter()
+    adapter._card_sessions = CardSessionRegistry(max_sessions=1)
+    adapter._card_sessions.register(
+        card_progress.CardSession(
+            message_id="occupied",
+            binding_id="occupied",
+            session_key=_ROUTE.session_key,
+            chat_id=_ROUTE.chat_id,
+            channel_id=_ROUTE.channel_id,
+            channel_type=_ROUTE.channel_type,
+            requester_uid=_ROUTE.requester_uid,
+            card={},
+            plain="occupied",
+            action_labels={},
+            input_ids=(),
+        )
+    )
+    state = card_progress._ProgressTurn(
+        adapter=adapter,
+        route=_ROUTE,
+        session_id="session-1",
+        turn_id="turn-1",
+        segment_no=0,
+        message_id="reasoning-1",
+    )
+    state.reasoning_submit_actions = {"reasoning": ("reasoning_stop",)}
+
+    card_progress._sync_reasoning_card_session(
+        state,
+        wire_state="reasoning",
+        preserve_on_drop=True,
+    )
+
+    assert adapter._card_sessions.peek("occupied") is not None
+    assert adapter._card_sessions.peek("reasoning-1") is None
+    assert state.preserve_registry_session_on_drop is False
+
+
 @pytest.mark.asyncio
 async def test_registry_error_progress_keeps_only_the_owned_retry_control() -> None:
     controller = card_progress.CardProgressController()

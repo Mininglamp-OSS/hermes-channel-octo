@@ -64,7 +64,3 @@ optional_env:
     description: "Legacy local Type-17 enablement fallback when the server has no card profile endpoint"
     prompt: "Enable legacy card messages? (1/0)"
     password: false
-  - name: OCTO_ALLOW_PRIVATE_HOSTS
-    description: "Allow only configured Octo API/CDN origins to resolve to private IPs; metadata endpoints stay blocked"
-    prompt: "Allow configured private Octo hosts? (true/false)"
-    password: false

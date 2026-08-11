@@ -18,6 +18,7 @@ import socket
 import stat
 import struct
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -98,7 +99,7 @@ MAX_MEDIA_FILENAME_BYTES = 255
 
 def safe_media_filename(value: object) -> str | None:
     """Return a safe basename for Octo media metadata, or ``None``."""
-    if not isinstance(value, str):
+    if not isinstance(value, str) or value.endswith((".", " ")):
         return None
     candidate = value.strip()
     if (
@@ -107,7 +108,9 @@ def safe_media_filename(value: object) -> str | None:
         or "/" in candidate
         or "\\" in candidate
         or candidate != Path(candidate).name
-        or any(ord(char) < 32 or ord(char) == 127 for char in candidate)
+        or any(unicodedata.category(char) in {"Cc", "Cf"} for char in candidate)
+        or re.search(r"%(?:00|0a|0d|2f|5c)", candidate, re.IGNORECASE) is not None
+        or candidate.endswith((".", " "))
         or len(candidate.encode("utf-8")) > MAX_MEDIA_FILENAME_BYTES
     ):
         return None
@@ -1375,9 +1378,7 @@ def _validate_presigned_upload_origin(
     ):
         raise RuntimeError("unsafe presigned upload URL")
 
-
 async def upload_file_to_presigned_url(
-    session: aiohttp.ClientSession,
     *,
     upload_url: str,
     download_url: str,
@@ -1458,7 +1459,6 @@ async def upload_and_get_url(
     )
     _validate_presigned_upload_origin(policy, presign["uploadUrl"])
     return await upload_file_to_presigned_url(
-        session,
         upload_url=presign["uploadUrl"],
         download_url=presign["downloadUrl"],
         file_data=file_data,
@@ -1551,11 +1551,11 @@ def _content_disposition_filename(value: str) -> str | None:
             charset, marker, encoded = candidate.partition("''")
             if marker and charset.lower() == "utf-8":
                 decoded = unquote(encoded)
-                if decoded:
+                if decoded and "\r" not in decoded and "\n" not in decoded:
                     return decoded
         elif key.lower() == "filename":
             fallback = candidate
-    return unquote(fallback) if fallback else None
+    return fallback
 
 
 
@@ -1678,7 +1678,7 @@ async def get_channel_messages(
         end_message_seq: End sequence (0 = to latest).
 
     Returns:
-        List of dicts with from_uid, content, timestamp, type, url, name, payload.
+        URL-free message summaries safe to expose to the model.
     """
     result = await post_json(
         session,
@@ -1713,13 +1713,30 @@ async def get_channel_messages(
                 if isinstance(raw_payload, dict):
                     payload = raw_payload
 
+        message_type = payload.get("type")
+        raw_name = payload.get("name")
+        name = safe_media_filename(raw_name)
+        if isinstance(raw_name, str) and name is None:
+            normalized_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
+            name = safe_media_filename(normalized_name)
+        mention = payload.get("mention")
+        content = payload.get("content", "")
+        if message_type == MessageType.File:
+            name = name or "未知文件"
+            content = f"[文件: {name}]"
+        elif message_type in {
+            MessageType.Image,
+            MessageType.GIF,
+            MessageType.Voice,
+            MessageType.Video,
+        }:
+            content = f"[{MessageType(message_type).name}]"
         parsed.append({
             "from_uid": m.get("from_uid", "unknown"),
-            "type": payload.get("type"),
-            "url": payload.get("url"),
-            "name": payload.get("name"),
-            "content": payload.get("content", ""),
-            "payload": payload,
+            "type": message_type,
+            "name": name,
+            "content": content if isinstance(content, str) else "",
+            "mention": mention if isinstance(mention, dict) else None,
             # API returns seconds, convert to ms
             "timestamp": (m.get("timestamp", int(time.time()))) * 1000,
         })

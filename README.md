@@ -88,7 +88,6 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_CDN_URL` | no | CDN prefix for media acceleration |
 | `OCTO_WS_URL` | no | WuKongIM `ws://`/`wss://` override; defaults to the URL returned by bot registration |
 | `OCTO_ON_BEHALF_OF` | no | Trusted grantor user ID for server-authorized persona delivery; text, typing, RichText, and media use this identity, display/interactive Type-17 tools fall back to plain text, and automatic progress cards are disabled |
-| `OCTO_ALLOW_PRIVATE_HOSTS` | no | Set to `true` only for trusted self-hosted API/CDN origins that resolve to private IPs; metadata endpoints remain blocked |
 | `OCTO_ALLOWED_USERS` | no | Comma-separated user IDs allowed to talk to the bot |
 | `OCTO_ALLOW_ALL_USERS` | no | Allow any user to trigger the bot (dev only) |
 | `OCTO_HOME_CHANNEL` | no | Default group/chat ID for cron / notification delivery |

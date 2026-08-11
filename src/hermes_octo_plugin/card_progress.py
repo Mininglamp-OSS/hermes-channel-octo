@@ -112,31 +112,36 @@ def _sync_reasoning_card_session(
         state.preserve_registry_session_on_drop = False
         return
     reasoning_id = f"{state.session_id}:{state.turn_id}:{state.segment_no}"
-    state.adapter._register_card_session(
-        CardSession(
-            message_id=message_id,
-            binding_id=reasoning_id,
-            session_key=state.route.session_key,
-            chat_id=state.route.chat_id,
-            channel_id=state.route.channel_id,
-            channel_type=state.route.channel_type,
-            requester_uid=state.route.requester_uid,
-            action_channel_ids=(
-                tuple(
-                    dict.fromkeys(
-                        (state.route.channel_id, state.adapter._robot_id)
+    try:
+        state.adapter._register_card_session(
+            CardSession(
+                message_id=message_id,
+                binding_id=reasoning_id,
+                session_key=state.route.session_key,
+                chat_id=state.route.chat_id,
+                channel_id=state.route.channel_id,
+                channel_type=state.route.channel_type,
+                requester_uid=state.route.requester_uid,
+                action_channel_ids=(
+                    tuple(
+                        dict.fromkeys(
+                            (state.route.channel_id, state.adapter._robot_id)
+                        )
                     )
-                )
-                if state.route.channel_type == ChannelType.DM
-                else (state.route.channel_id,)
-            ),
-            card={},
-            plain="处理进度",
-            action_labels=action_labels,
-            input_ids=(),
-            kind="reasoning",
+                    if state.route.channel_type == ChannelType.DM
+                    else (state.route.channel_id,)
+                ),
+                card={},
+                plain="处理进度",
+                action_labels=action_labels,
+                input_ids=(),
+                kind="reasoning",
+            )
         )
-    )
+    except ValueError:
+        logger.warning("[Octo] reasoning action registry unavailable", exc_info=True)
+        state.preserve_registry_session_on_drop = False
+        return
     state.preserve_registry_session_on_drop = preserve_on_drop
 
 class CardProgressController:

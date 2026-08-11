@@ -214,23 +214,38 @@ def _validated_media_filename(value: object) -> str:
 _INBOUND_FILE_FALLBACK_NAME = "未知文件"
 
 
+def _truncate_utf8_filename(value: str, max_bytes: int) -> str:
+    """Fit a filename into one UTF-8 byte budget while preserving short suffixes."""
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    dot = value.rfind(".")
+    suffix = value[dot:] if dot > 0 else ""
+    if len(suffix.encode("utf-8")) > min(32, max_bytes // 2):
+        suffix = ""
+    budget = max_bytes - len(suffix.encode("utf-8"))
+    stem = value[: -len(suffix)] if suffix else value
+    while stem and len(stem.encode("utf-8")) > budget:
+        stem = stem[:-1]
+    return f"{stem or 'file'}{suffix}"
+
+
 def _inbound_file_display_name(value: object) -> str:
     """Return one bounded basename that is safe inside LLM-facing labels."""
-    filename = api.safe_media_filename(value)
-    if filename is None:
+    if not isinstance(value, str) or "/" in value or "\\" in value:
         return _INBOUND_FILE_FALLBACK_NAME
-
-    display: list[str] = []
-    for char in filename:
-        if unicodedata.category(char) in {"Cc", "Cf"}:
-            display.append("_")
-        elif char == "[":
-            display.append("(")
-        elif char == "]":
-            display.append(")")
-        else:
-            display.append(char)
-    return "".join(display)
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        return _INBOUND_FILE_FALLBACK_NAME
+    basename = os.path.basename(value)
+    if basename != value or not basename or basename in {".", ".."}:
+        return _INBOUND_FILE_FALLBACK_NAME
+    display = "".join(
+        "_" if unicodedata.category(char) in {"Cc", "Cf"}
+        else "(" if char == "["
+        else ")" if char == "]"
+        else char
+        for char in basename
+    )
+    return _truncate_utf8_filename(display, api.MAX_MEDIA_FILENAME_BYTES)
 
 
 
@@ -425,16 +440,6 @@ def _validate_octo_endpoint(
     if hostname in _METADATA_HOSTS:
         raise ValueError(
             f"{name} points at blocked metadata host {parsed.hostname!r} (SSRF guard)."
-        )
-    allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if not allow_private and _is_private_or_metadata_host(hostname):
-        raise ValueError(
-            f"{name} points at private/loopback/metadata host {parsed.hostname!r} "
-            f"(SSRF guard). Set OCTO_ALLOW_PRIVATE_HOSTS=true for dev/self-hosted setups."
         )
     return url
 
@@ -1572,12 +1577,11 @@ class OctoAdapter(BasePlatformAdapter):
         return {}
 
     def _inbound_media_url_allowed(self, url: str) -> bool:
-        """Reject attachment URLs that can reach private services.
+        """Reject attachment URLs that can reach unconfigured private services.
 
         Public object stores remain supported. Private addresses are allowed
         only when they exactly match an explicitly configured Octo API/CDN
-        origin and ``OCTO_ALLOW_PRIVATE_HOSTS`` is enabled for self-hosting.
-        Well-known metadata hosts are never allowed.
+        origin. Well-known metadata hosts are never allowed.
         """
         try:
             parsed = urlparse(url)
@@ -1589,41 +1593,14 @@ class OctoAdapter(BasePlatformAdapter):
         if scheme not in {"http", "https"} or not hostname:
             return False
         policy = getattr(self._http_session, "transport_policy", None)
-        if (
-            isinstance(policy, _TransportPolicy)
-            and policy.is_download_endpoint_trusted(url)
-            and not policy.is_download_url_trusted(url)
-        ):
-            return False
+        if isinstance(policy, _TransportPolicy):
+            if policy.is_download_endpoint_trusted(url):
+                return policy.is_download_url_trusted(url)
         if not _is_private_or_metadata_host(hostname):
             return True
         if hostname in _METADATA_HOSTS:
             return False
-        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() not in {
-            "1",
-            "true",
-            "yes",
-        }:
-            return False
 
-        for configured in (self._api_url, self._cdn_url):
-            if not configured:
-                continue
-            try:
-                candidate = urlparse(configured)
-                candidate_scheme = candidate.scheme.lower()
-                candidate_host = (candidate.hostname or "").lower()
-                candidate_port = candidate.port or (
-                    443 if candidate_scheme == "https" else 80
-                )
-            except (TypeError, ValueError):
-                continue
-            if (scheme, hostname, port) == (
-                candidate_scheme,
-                candidate_host,
-                candidate_port,
-            ):
-                return True
         return False
 
     # ── Sender Name Resolution ────────────────────────────────────────────
@@ -1940,7 +1917,7 @@ class OctoAdapter(BasePlatformAdapter):
                     api_entries.append({
                         "sender": m.get("from_uid", "unknown"),
                         "body": body,
-                        "mention": m.get("payload", {}).get("mention"),
+                        "mention": m.get("mention"),
                         "timestamp": m.get("timestamp", 0),
                     })
                 if api_entries:
@@ -2680,7 +2657,7 @@ class OctoAdapter(BasePlatformAdapter):
         # download must not fall back to the original URL: hostname-only
         # validation cannot preserve the resolver's DNS/IP decision, and
         # forwarding the URL would let a rejected private target escape.
-        async def _local_or_remote(rel_url: str | None, mime: str) -> str | None:
+        async def _download_to_local(rel_url: str | None, mime: str) -> str | None:
             url = self._build_media_url(rel_url)
             if not url:
                 return None
@@ -2688,30 +2665,34 @@ class OctoAdapter(BasePlatformAdapter):
 
         if payload.type == OctoMessageType.Image:
             hermes_msg_type = MessageType.PHOTO
-            u = await _local_or_remote(payload.url, "image/jpeg")
+            u = await _download_to_local(payload.url, "image/jpeg")
             if u:
                 media_urls.append(u)
                 media_types.append("image/jpeg")
         elif payload.type == OctoMessageType.GIF:
             hermes_msg_type = MessageType.PHOTO
-            u = await _local_or_remote(payload.url, "image/gif")
+            u = await _download_to_local(payload.url, "image/gif")
             if u:
                 media_urls.append(u)
                 media_types.append("image/gif")
         elif payload.type == OctoMessageType.Voice:
             hermes_msg_type = MessageType.VOICE
-            u = await _local_or_remote(payload.url, "audio/ogg")
+            u = await _download_to_local(payload.url, "audio/ogg")
             if u:
                 media_urls.append(u)
                 media_types.append("audio/ogg")
         elif payload.type == OctoMessageType.Video:
             hermes_msg_type = MessageType.VIDEO
-            u = await _local_or_remote(payload.url, "video/mp4")
+            u = await _download_to_local(payload.url, "video/mp4")
             if u:
                 media_urls.append(u)
                 media_types.append("video/mp4")
         elif payload.type == OctoMessageType.File:
-            hermes_msg_type = MessageType.DOCUMENT
+            hermes_msg_type = (
+                MessageType.TEXT
+                if inbound_file and inbound_file.local_path is None
+                else MessageType.DOCUMENT
+            )
             if inbound_file and inbound_file.local_path:
                 media_urls.append(inbound_file.local_path)
                 media_types.append("application/octet-stream")
@@ -2722,7 +2703,7 @@ class OctoAdapter(BasePlatformAdapter):
             _, rt_urls = self._resolve_rich_text_content(payload)
             for url in rt_urls:
                 mime = _infer_image_mime(url)
-                u = await _local_or_remote(url, mime)
+                u = await _download_to_local(url, mime)
                 if u:
                     media_urls.append(u)
                     media_types.append(mime)
@@ -3012,6 +2993,7 @@ class OctoAdapter(BasePlatformAdapter):
                         )
                         or "file"
                     )
+                    safe_name = _truncate_utf8_filename(safe_name, 255 - 33)
                     tmp_name = f"{_uuid.uuid4().hex}-{safe_name}"
                     tmp_path = _os.path.join(FILE_TEMP_DIR, tmp_name)
                     total = 0

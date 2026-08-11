@@ -12,7 +12,7 @@ from hermes_octo_plugin.mention import (
     MENTION_PATTERN,
     STRUCTURED_MENTION_PATTERN,
 )
-from hermes_octo_plugin.types import MentionEntity, MentionPayload
+from hermes_octo_plugin.types import MentionEntity, MentionPayload, MessagePayload
 from gateway.platforms.base import MessageEvent
 
 
@@ -130,6 +130,54 @@ class TestConvertContentForLLM:
         )
 
         assert convert_content_for_llm(content, mention) == "😀 @[uid1:Alice]"
+
+    @pytest.mark.parametrize(
+        ("content", "name"),
+        [
+            ("hi @John Smith please", "John Smith"),
+            ("hi @买买提·艾力 x", "买买提·艾力"),
+            ("hi @Bob(PM) x", "Bob(PM)"),
+            ("hi @Dev😀 x", "Dev😀"),
+        ],
+    )
+    def test_v2_entities_accept_wire_authoritative_display_names(self, content, name):
+        start = content.index("@")
+        wire_length = sum(2 if ord(char) > 0xFFFF else 1 for char in f"@{name}")
+        mention = MentionPayload(
+            entities=[MentionEntity(uid="uid1", offset=start, length=wire_length)],
+        )
+        assert convert_content_for_llm(content, mention) == content.replace(
+            f"@{name}", f"@[uid1:{name}]"
+        )
+
+    def test_invalid_entity_does_not_discard_independent_valid_entity(self):
+        content = "@Alice and not-a-mention"
+        mention = MentionPayload(
+            entities=[
+                MentionEntity(uid="alice", offset=0, length=6),
+                MentionEntity(uid="invalid", offset=11, length=13),
+            ],
+        )
+
+        assert convert_content_for_llm(content, mention) == (
+            "@[alice:Alice] and not-a-mention"
+        )
+
+    def test_entity_count_is_capped_before_conversion(self):
+        payload = MessagePayload.from_dict({
+            "type": 1,
+            "content": "x" * 20_000 + "@Alice",
+            "mention": {
+                "entities": [
+                    {"uid": f"u{index}", "offset": 20_000, "length": 6}
+                    for index in range(5_000)
+                ],
+            },
+        })
+
+        assert payload.mention is not None
+        assert payload.mention.entities is not None
+        assert len(payload.mention.entities) == MAX_MENTIONS_PER_MESSAGE
 
     def test_half_surrogate_entity_range_is_ignored_without_slicing_text(self):
         content = "😀@Alice"

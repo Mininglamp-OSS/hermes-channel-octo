@@ -428,7 +428,9 @@ def _freeze_action_node(
         safe_label = label.strip() if isinstance(label, str) and label.strip() else input_id
         return {
             "type": "TextBlock",
-            "text": f"{safe_label}: {_neutralize_action_echo(inputs[input_id])}",
+            "text": cards.literal_card_text(
+                f"{safe_label}: {_neutralize_action_echo(inputs[input_id])}"
+            ),
             "wrap": True,
             "spacing": "Small",
         }
@@ -467,7 +469,7 @@ def _render_clarify_action_status(
         body = list(source_body) if isinstance(source_body, list) else []
         body.append({
             "type": "TextBlock",
-            "text": status_line,
+            "text": cards.literal_card_text(status_line),
             "wrap": True,
             "spacing": "Medium",
             "color": "Attention",
@@ -498,7 +500,7 @@ def _render_clarify_action_status(
     body = [
         {
             "type": "TextBlock",
-            "text": text,
+            "text": cards.literal_card_text(text),
             "wrap": True,
             **(
                 {"weight": "Bolder", "size": "Medium"}
@@ -546,7 +548,7 @@ def render_card_action_status(
     body.append(
         {
             "type": "TextBlock",
-            "text": status_line,
+            "text": cards.literal_card_text(status_line),
             "wrap": True,
             "spacing": "Medium",
             "separator": True,

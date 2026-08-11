@@ -749,9 +749,9 @@ def sanitize_error_text(error: object) -> str:
     return summary
 
 
-def _literal_card_text(text: str) -> str:
+def literal_card_text(text: str) -> str:
     """Escape Markdown link/image openers in untrusted Adaptive Card prose."""
-    return text.replace("[", r"\[")
+    return text.replace("\\", r"\\").replace("[", r"\[")
 
 
 def _literal_card_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -984,7 +984,7 @@ def validate_card_limits(
 def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
     element: dict[str, Any] = {
         "type": "TextBlock",
-        "text": _literal_card_text(text),
+        "text": literal_card_text(text),
         "wrap": True,
     }
     if bold:
@@ -1111,8 +1111,8 @@ def build_display_card(
                 if clean_label is None or clean_value is None:
                     continue
                 facts.append({
-                    "title": _literal_card_text(clean_label),
-                    "value": _literal_card_text(clean_value),
+                    "title": literal_card_text(clean_label),
+                    "value": literal_card_text(clean_value),
                 })
                 lines.append(f"{clean_label}: {clean_value}")
             if not facts:
@@ -1140,7 +1140,7 @@ def build_display_card(
                 body.append({
                     "type": "Image",
                     "url": resource_url,
-                    "altText": _literal_card_text(clean_alt),
+                    "altText": literal_card_text(clean_alt),
                 })
             else:
                 _require_element(capabilities, "TextBlock")
@@ -1347,7 +1347,7 @@ def build_interactive_card(
     body: list[dict[str, Any]] = [
         {
             "type": "TextBlock",
-            "text": _literal_card_text(clean_title),
+            "text": literal_card_text(clean_title),
             "weight": "Bolder",
             "size": "Medium",
             "wrap": True,
@@ -1362,7 +1362,7 @@ def build_interactive_card(
         )
         body.append({
             "type": "TextBlock",
-            "text": _literal_card_text(clean_text),
+            "text": literal_card_text(clean_text),
             "wrap": True,
             "spacing": "Small",
         })
@@ -2126,7 +2126,7 @@ def _reasoning_text_block(
 ) -> dict[str, object]:
     return {
         "type": "TextBlock",
-        "text": _literal_card_text(text),
+        "text": literal_card_text(text),
         "wrap": True,
         **extra,
     }

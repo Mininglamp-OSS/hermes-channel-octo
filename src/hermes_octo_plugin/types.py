@@ -261,8 +261,10 @@ class MessagePayload:
             raw_entities = raw_mention.get("entities")
             entities: list[MentionEntity] | None = None
             if isinstance(raw_entities, list):
+                from .mention import MAX_MENTIONS_PER_MESSAGE
+
                 parsed_entities = []
-                for entity in raw_entities:
+                for entity in raw_entities[:MAX_MENTIONS_PER_MESSAGE]:
                     if not isinstance(entity, dict):
                         continue
                     uid = entity.get("uid")

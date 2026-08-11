@@ -230,13 +230,7 @@ async def open_guarded_websocket_socket(
     if origin is None or origin[0] not in {"ws", "wss"}:
         raise ValueError("WebSocket URL must use ws or wss")
     _, host, port = origin
-    trusted_origins = (
-        {url}
-        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower()
-        in {"1", "true", "yes"}
-        else set()
-    )
-    policy = TransportPolicy(trusted_origins)
+    policy = TransportPolicy({url})
     resolver = SSRFGuardResolver(policy=policy)
     last_error: OSError | None = None
     async with asyncio.timeout(timeout_seconds):
@@ -320,10 +314,7 @@ def new_guarded_http_session(
     policy: TransportPolicy | None = None,
 ) -> aiohttp.ClientSession:
     if policy is None:
-        trusted_origins: set[str] = set()
-        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}:
-            trusted_origins.update(url for url in configured_urls if url)
-        policy = TransportPolicy(trusted_origins)
+        policy = TransportPolicy({url for url in configured_urls if url})
     resolver = SSRFGuardResolver(policy=policy)
     connector = SSRFGuardConnector(resolver=resolver, policy=policy)
     session = aiohttp.ClientSession(connector=connector)
