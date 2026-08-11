@@ -1641,8 +1641,19 @@ async def download_file(
                 filename = unquote(path.split("/")[-1]) or "file"
 
             cl = resp.headers.get("Content-Length")
-            if cl and int(cl) > max_size:
-                raise RuntimeError(f"File too large ({cl} bytes, max {max_size})")
+            if cl:
+                try:
+                    content_length = int(cl)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "Download failed (invalid Content-Length)"
+                    ) from None
+                if content_length < 0:
+                    raise RuntimeError("Download failed (invalid Content-Length)")
+                if content_length > max_size:
+                    raise RuntimeError(
+                        f"File too large ({content_length} bytes, max {max_size})"
+                    )
 
             data = bytearray()
             async for chunk in resp.content.iter_any():

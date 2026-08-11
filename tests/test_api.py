@@ -370,6 +370,26 @@ class TestApiFailureTruth:
         assert "signed-secret" not in str(exc_info.value)
 
     @pytest.mark.asyncio
+    async def test_download_rejects_malformed_content_length_without_echoing_it(self):
+        response = _SuccessfulDownloadResponse()
+        response.headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": "signed-secret",
+        }
+        session = MagicMock()
+        session.get = MagicMock(return_value=response)
+
+        with pytest.raises(
+            RuntimeError, match="Download failed \\(invalid Content-Length\\)"
+        ) as exc_info:
+            await download_file(
+                session,
+                "https://files.example.invalid/report",
+            )
+
+        assert "signed-secret" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "unsafe_url",
         [

@@ -12,6 +12,7 @@ from typing import Any
 
 
 from . import api, cards
+from .mention import _utf16_length
 from .card_tools import (
     DISPLAY_BLOCK_SCHEMA,
     TrustedOctoRoute,
@@ -26,6 +27,7 @@ from .types import (
     RICH_TEXT_BLOCK_TEXT,
     RICH_TEXT_IMAGE_PLACEHOLDER,
     CardProfileManifest,
+    MentionEntity,
     MessageType,
     RichTextBlock,
     SendMessageResult,
@@ -277,6 +279,9 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
             blocks: list[RichTextBlock] = []
             plain_parts: list[str] = []
             failed_images = 0
+            mention_uids: list[str] = []
+            mention_entities: list[MentionEntity] = []
+            plain_utf16_length = 0
             for raw_block in raw_blocks:
                 if not isinstance(raw_block, dict):
                     raise ValueError("RichText blocks must be objects")
@@ -285,8 +290,30 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                     text = raw_block.get("text")
                     if not isinstance(text, str) or not text or len(text) > _MAX_TEXT_CHARS:
                         raise ValueError("RichText text must be non-empty and bounded")
-                    blocks.append(RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=text))
-                    plain_parts.append(text)
+                    converted_text, block_entities, block_uids = (
+                        await adapter._prepare_outbound_mentions(
+                            text,
+                            route.chat_id,
+                            route.channel_type,
+                            http_session=session,
+                        )
+                    )
+                    blocks.append(
+                        RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=converted_text)
+                    )
+                    plain_parts.append(converted_text)
+                    if block_entities:
+                        mention_entities.extend(
+                            MentionEntity(
+                                uid=entity.uid,
+                                offset=plain_utf16_length + entity.offset,
+                                length=entity.length,
+                            )
+                            for entity in block_entities
+                        )
+                    if block_uids:
+                        mention_uids.extend(block_uids)
+                    plain_utf16_length += _utf16_length(converted_text)
                     continue
                 if block_type != RICH_TEXT_BLOCK_IMAGE:
                     raise ValueError("unsupported RichText block type")
@@ -311,6 +338,7 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                         )
                     )
                     plain_parts.append(RICH_TEXT_IMAGE_PLACEHOLDER)
+                    plain_utf16_length += _utf16_length(RICH_TEXT_IMAGE_PLACEHOLDER)
                 except Exception as exc:
                     failed_images += 1
                     logger.warning(
@@ -327,6 +355,8 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                 channel_type=route.channel_type,
                 blocks=blocks,
                 plain="".join(plain_parts),
+                mention_uids=mention_uids or None,
+                mention_entities=mention_entities or None,
                 reply_msg_id=args.get("reply_to_message_id") or None,
                 client_msg_no=client_msg_no,
                 on_behalf_of=adapter.on_behalf_of,
