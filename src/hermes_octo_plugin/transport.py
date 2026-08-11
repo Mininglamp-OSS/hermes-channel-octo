@@ -77,81 +77,124 @@ def _canonical_trust_host(host: str) -> str:
     return _canonical_literal_ip(normalized) or normalized
 
 
-class TransportPolicy:
-    """Thread-safe hostname trust authority shared by validation and DNS."""
+TransportOrigin = tuple[str, str, int]
+TransportEndpoint = tuple[str, int]
+_DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
-    def __init__(self, trusted_hosts: set[str] | None = None) -> None:
+
+def _canonical_origin(url: str) -> TransportOrigin | None:
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = _canonical_trust_host(parsed.hostname or "")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        scheme not in _DEFAULT_ORIGIN_PORTS
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_ORIGIN_PORTS[scheme]
+
+
+def _safe_private_trust_origin(url: str) -> TransportOrigin | None:
+    origin = _canonical_origin(url)
+    if origin is None:
+        return None
+    _, host, _ = origin
+    if host in _METADATA_HOSTS:
+        return None
+    literal = _canonical_literal_ip(host)
+    if literal is not None and _unconditionally_unsafe_address(literal):
+        return None
+    return origin
+
+
+class TransportPolicy:
+    """Thread-safe origin trust authority shared by validation and DNS."""
+
+    def __init__(self, trusted_origins: set[str] | None = None) -> None:
         self._lock = threading.Lock()
-        self._trusted_hosts = {
-            _canonical_trust_host(host)
-            for host in (trusted_hosts or set())
-            if host
+        self._trusted_download_origins = {
+            origin
+            for value in (trusted_origins or set())
+            if (origin := _safe_private_trust_origin(value)) is not None
+        }
+        self._trusted_upload_origins: set[TransportOrigin] = set()
+        self._trusted_connection_endpoints = {
+            (host, port) for _, host, port in self._trusted_download_origins
         }
 
-    def is_trusted(self, host: str) -> bool:
-        canonical = _canonical_trust_host(host)
+    def is_download_url_trusted(self, url: str) -> bool:
+        origin = _canonical_origin(url)
+        if origin is None:
+            return False
         with self._lock:
-            return canonical in self._trusted_hosts
+            return origin in self._trusted_download_origins
 
-    def trusted_hosts(self) -> frozenset[str]:
+    def is_download_endpoint_trusted(self, url: str) -> bool:
+        """Return whether *url* reuses a configured download host and port."""
+        origin = _canonical_origin(url)
+        if origin is None:
+            return False
+        _, host, port = origin
         with self._lock:
-            return frozenset(self._trusted_hosts)
+            return (host, port) in self._trusted_connection_endpoints
 
-    def trust_validated_private_host(self, url: str) -> None:
-        try:
-            parsed = urlparse(url)
-            host = (parsed.hostname or "").lower().rstrip(".")
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("unsafe presigned upload URL") from exc
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not host
-            or parsed.username is not None
-            or parsed.password is not None
-            or host in _METADATA_HOSTS
-        ):
+    def is_connection_trusted(self, host: str, port: int) -> bool:
+        endpoint = (_canonical_trust_host(host), port)
+        with self._lock:
+            return endpoint in self._trusted_connection_endpoints
+
+    def trusted_download_origins(self) -> frozenset[TransportOrigin]:
+        with self._lock:
+            return frozenset(self._trusted_download_origins)
+
+    def trusted_connection_endpoints(self) -> frozenset[TransportEndpoint]:
+        with self._lock:
+            return frozenset(self._trusted_connection_endpoints)
+
+    def is_upload_url_trusted(self, url: str) -> bool:
+        origin = _canonical_origin(url)
+        if origin is None:
+            return False
+        with self._lock:
+            return origin in self._trusted_upload_origins
+
+    def trust_validated_upload_origin(self, url: str) -> None:
+        origin = _safe_private_trust_origin(url)
+        if origin is None:
             raise RuntimeError("unsafe presigned upload URL")
+        _, host, _ = origin
         literal = _canonical_literal_ip(host)
-        if literal is not None and _unconditionally_unsafe_address(literal):
-            raise RuntimeError("unsafe presigned upload URL")
-        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() not in {"1", "true", "yes"}:
+        literal_ip = ipaddress.ip_address(literal) if literal is not None else None
+        requires_private_opt_in = is_private_or_metadata_host(host) or (
+            literal_ip is not None
+            and (literal_ip.is_loopback or literal_ip.is_private)
+        )
+        allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if requires_private_opt_in and not allow_private:
             return
-        self.trust_host(host)
-
-    def trust_host(self, host: str) -> None:
-        canonical = _canonical_trust_host(host)
-        if canonical:
-            with self._lock:
-                self._trusted_hosts.add(canonical)
-
-
-class _TrustedHostView(set[str]):
-    """Compatibility view; mutations still update the policy authority."""
-
-    def __init__(self, policy: TransportPolicy) -> None:
-        super().__init__(policy.trusted_hosts())
-        self._policy = policy
-
-    def add(self, element: str) -> None:
-        self._policy.trust_host(element)
-        super().add(element)
-
+        with self._lock:
+            self._trusted_upload_origins.add(origin)
 
 class SSRFGuardResolver(AbstractResolver):
     def __init__(
         self,
         *,
         policy: TransportPolicy | None = None,
-        trusted_hosts: set[str] | None = None,
+        trusted_origins: set[str] | None = None,
     ) -> None:
         super().__init__()
-        self.policy = policy or TransportPolicy(trusted_hosts)
+        self.policy = policy or TransportPolicy(trusted_origins)
         self._delegate = DefaultResolver()
-
-    @property
-    def _trusted_hosts(self) -> set[str]:
-        return _TrustedHostView(self.policy)
-
     async def resolve(
         self,
         host: str,
@@ -161,7 +204,7 @@ class SSRFGuardResolver(AbstractResolver):
         normalized = host.lower().rstrip(".")
         if normalized in _METADATA_HOSTS:
             raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
-        trusted = self.policy.is_trusted(normalized)
+        trusted = self.policy.is_connection_trusted(normalized, port)
         if not trusted and is_private_or_metadata_host(normalized):
             raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
         records = await self._delegate.resolve(host, port, family)
@@ -199,7 +242,7 @@ class SSRFGuardConnector(aiohttp.TCPConnector):
 
     async def _resolve_host(self, host: str, port: int, traces: Any = None) -> list[ResolveResult]:
         normalized = host.lower().strip("[]").rstrip(".")
-        trusted = self.policy.is_trusted(normalized)
+        trusted = self.policy.is_connection_trusted(normalized, port)
         literal = _canonical_literal_ip(normalized)
         if normalized in _METADATA_HOSTS:
             raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
@@ -223,18 +266,10 @@ class SSRFGuardConnector(aiohttp.TCPConnector):
 
 
 def new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
-    trusted_hosts: set[str] = set()
+    trusted_origins: set[str] = set()
     if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}:
-        for configured_url in configured_urls:
-            if not configured_url:
-                continue
-            try:
-                host = (urlparse(configured_url).hostname or "").lower().rstrip(".")
-            except (TypeError, ValueError):
-                host = ""
-            if host and host not in _METADATA_HOSTS:
-                trusted_hosts.add(host)
-    policy = TransportPolicy(trusted_hosts)
+        trusted_origins.update(url for url in configured_urls if url)
+    policy = TransportPolicy(trusted_origins)
     resolver = SSRFGuardResolver(policy=policy)
     connector = SSRFGuardConnector(resolver=resolver, policy=policy)
     session = aiohttp.ClientSession(connector=connector)

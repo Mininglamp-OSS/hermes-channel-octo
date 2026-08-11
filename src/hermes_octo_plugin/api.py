@@ -24,7 +24,11 @@ from typing import Any, cast
 from urllib.parse import quote, unquote, unquote_to_bytes, urlencode, urljoin, urlparse
 
 import aiohttp
-from .transport import TransportPolicy, is_private_or_metadata_host
+from .transport import (
+    TransportPolicy,
+    is_private_or_metadata_host,
+    new_guarded_http_session,
+)
 
 from .types import (
     CARD_VERSION,
@@ -1344,7 +1348,7 @@ def _trust_presigned_upload_origin(
     policy: TransportPolicy | None,
     upload_url: str,
 ) -> None:
-    """Trust one authenticated server-issued private upload host after opt-in."""
+    """Trust one authenticated server-issued private upload origin after opt-in."""
     if policy is None:
         try:
             parsed = urlparse(upload_url)
@@ -1372,7 +1376,7 @@ def _trust_presigned_upload_origin(
         ):
             raise RuntimeError("unsafe presigned upload URL")
         return
-    policy.trust_validated_private_host(upload_url)
+    policy.trust_validated_upload_origin(upload_url)
 
 
 
@@ -1385,8 +1389,11 @@ async def upload_file_to_presigned_url(
     content_type: str,
     content_disposition: str | None = None,
     headers: Mapping[str, str] | None = None,
+    policy: TransportPolicy | None = None,
 ) -> str:
     """PUT one exact body while replaying the server-signed request headers."""
+    if policy is not None and not policy.is_upload_url_trusted(upload_url):
+        raise RuntimeError("unsafe presigned upload URL")
     put_headers = dict(headers or ())
     if any(
         not isinstance(key, str)
@@ -1415,19 +1422,30 @@ async def upload_file_to_presigned_url(
         put_headers["Content-Disposition"] = content_disposition
 
     upload_timeout = aiohttp.ClientTimeout(total=300)
-    async with session.put(
-        upload_url,
-        data=file_data,
-        headers=put_headers,
-        timeout=upload_timeout,
-        allow_redirects=False,
-    ) as resp:
-        if 300 <= resp.status < 400:
-            raise RuntimeError(
-                f"Presigned PUT upload failed (HTTP {resp.status})"
-            )
-        if not resp.ok:
-            raise RuntimeError(f"Presigned PUT upload failed (HTTP {resp.status})")
+    upload_session = session
+    owned_upload_session: aiohttp.ClientSession | None = None
+    if policy is not None:
+        owned_upload_session = new_guarded_http_session(upload_url)
+        upload_session = owned_upload_session
+    try:
+        async with upload_session.put(
+            upload_url,
+            data=file_data,
+            headers=put_headers,
+            timeout=upload_timeout,
+            allow_redirects=False,
+        ) as resp:
+            if 300 <= resp.status < 400:
+                raise RuntimeError(
+                    f"Presigned PUT upload failed (HTTP {resp.status})"
+                )
+            if not resp.ok:
+                raise RuntimeError(
+                    f"Presigned PUT upload failed (HTTP {resp.status})"
+                )
+    finally:
+        if owned_upload_session is not None:
+            await owned_upload_session.close()
     return download_url
 
 
@@ -1458,6 +1476,7 @@ async def upload_and_get_url(
         content_type=presign["contentType"],
         content_disposition=presign.get("contentDisposition"),
         headers=presign.get("headers"),
+        policy=policy,
     )
 
 
@@ -1514,7 +1533,13 @@ def _validate_download_url(
         raise RuntimeError("unsafe download URL")
     if not enforce_host_safety:
         return url
-    trusted = policy is not None and policy.is_trusted(host)
+    trusted = policy is not None and policy.is_download_url_trusted(url)
+    if (
+        policy is not None
+        and policy.is_download_endpoint_trusted(url)
+        and not trusted
+    ):
+        raise RuntimeError("unsafe download URL")
     if (
         is_private_or_metadata_host(host)
         or (

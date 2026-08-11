@@ -409,7 +409,7 @@ class TestApiFailureTruth:
         session.get = MagicMock(return_value=_SuccessfulDownloadResponse())
         from hermes_octo_plugin.transport import TransportPolicy
 
-        policy = TransportPolicy({"10.0.0.8"})
+        policy = TransportPolicy({"http://10.0.0.8"})
         data, content_type, filename = await download_file(
             session,
             "http://10.0.0.8/report.bin",
@@ -419,6 +419,67 @@ class TestApiFailureTruth:
         assert data == b""
         assert content_type == "application/octet-stream"
         assert filename == "report.bin"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://10.0.0.8/report.bin",
+            "http://10.0.0.8:8080/report.bin",
+        ],
+    )
+    async def test_download_rejects_private_same_host_different_origin(
+        self,
+        url: str,
+    ):
+        session = MagicMock()
+        session.get = MagicMock(side_effect=AssertionError("network I/O attempted"))
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"http://10.0.0.8"})
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(session, url, policy=policy)
+
+        session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_split_dns_opposite_scheme_before_io(self):
+        session = MagicMock()
+        session.get = MagicMock(side_effect=AssertionError("network I/O attempted"))
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"https://storage.example:443"})
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(
+                session,
+                "http://storage.example:443/private",
+                policy=policy,
+            )
+
+        session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_split_dns_opposite_scheme_redirect(self):
+        redirect = _RedirectResponse()
+        redirect.headers = {"Location": "http://storage.example:443/private"}
+        session = MagicMock()
+        session.get = MagicMock(
+            side_effect=[
+                redirect,
+                AssertionError("followed unsafe redirect"),
+            ]
+        )
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"https://storage.example:443"})
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(
+                session,
+                "https://files.example.invalid/report",
+                policy=policy,
+            )
+
+        session.get.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_download_decodes_rfc5987_content_disposition_filename(self):

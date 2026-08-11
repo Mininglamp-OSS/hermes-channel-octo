@@ -260,19 +260,24 @@ class TestPresignedUpload:
         session = MagicMock()
         from hermes_octo_plugin.transport import TransportPolicy
 
-        policy = TransportPolicy({"api.internal"})
+        policy = TransportPolicy({"http://api.internal"})
         presign = {
-            "uploadUrl": "http://minio.internal/upload?signature=secret",
-            "downloadUrl": "http://cdn.internal/report.txt",
+            "uploadUrl": "http://storage.example:9000/upload?signature=secret",
+            "downloadUrl": "http://cdn.example/report.txt",
             "contentType": "text/plain",
         }
 
         async def assert_trusted(active_session, **_kwargs):
             assert active_session is session
-            assert policy.trusted_hosts() == frozenset({
-                "api.internal",
-                "minio.internal",
+            assert policy.trusted_download_origins() == frozenset({
+                ("http", "api.internal", 80),
             })
+            assert policy.trusted_connection_endpoints() == frozenset({
+                ("api.internal", 80),
+            })
+            assert policy.is_upload_url_trusted(presign["uploadUrl"]) is True
+            assert policy.is_connection_trusted("storage.example", 9000) is False
+            assert _kwargs["policy"] is policy
             return presign["downloadUrl"]
 
         with (
@@ -298,6 +303,47 @@ class TestPresignedUpload:
         assert result == presign["downloadUrl"]
 
     @pytest.mark.asyncio
+    async def test_presigned_put_uses_isolated_exact_origin_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        upload_url = "http://storage.example:9000/upload?signature=secret"
+        policy = TransportPolicy({"http://api.internal"})
+        policy.trust_validated_upload_origin(upload_url)
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        main_session = MagicMock()
+        isolated_session = MagicMock()
+        isolated_session.put.return_value = response
+        isolated_session.close = AsyncMock()
+
+        with patch(
+            "hermes_octo_plugin.api.new_guarded_http_session",
+            return_value=isolated_session,
+            create=True,
+        ) as session_factory:
+            result = await upload_file_to_presigned_url(
+                main_session,
+                upload_url=upload_url,
+                download_url="http://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="text/plain",
+                policy=policy,
+            )
+
+        assert result == "http://cdn.example/report.txt"
+        session_factory.assert_called_once_with(upload_url)
+        main_session.put.assert_not_called()
+        isolated_session.put.assert_called_once()
+        isolated_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_presign_metadata_upload_origin_is_never_trusted(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -306,7 +352,7 @@ class TestPresignedUpload:
         session = MagicMock()
         from hermes_octo_plugin.transport import TransportPolicy
 
-        policy = TransportPolicy({"api.internal"})
+        policy = TransportPolicy({"http://api.internal"})
         presign = {
             "uploadUrl": "http://169.254.169.254/latest/meta-data/",
             "downloadUrl": "http://cdn.internal/report.txt",
@@ -327,4 +373,6 @@ class TestPresignedUpload:
                     policy=policy,
                 )
 
-        assert policy.trusted_hosts() == frozenset({"api.internal"})
+        assert policy.trusted_download_origins() == frozenset({
+            ("http", "api.internal", 80),
+        })

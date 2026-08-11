@@ -85,9 +85,9 @@ async def test_guarded_session_factory_accepts_api_and_cdn_origins() -> None:
             "https://cdn.octo.invalid/assets",
         )
     try:
-        assert session.transport_policy.trusted_hosts() == frozenset({
-            "api.octo.invalid",
-            "cdn.octo.invalid",
+        assert session.transport_policy.trusted_download_origins() == frozenset({
+            ("https", "api.octo.invalid", 443),
+            ("https", "cdn.octo.invalid", 443),
         })
     finally:
         await session.close()

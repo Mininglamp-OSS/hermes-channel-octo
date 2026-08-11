@@ -141,7 +141,9 @@ async def test_inbound_media_rejects_private_and_metadata_urls_before_io(url: st
 
 @pytest.mark.asyncio
 async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_origin():
-    resolver = _SSRFGuardResolver(trusted_hosts={"api.octo.example"})
+    resolver = _SSRFGuardResolver(
+        trusted_origins={"https://api.octo.example"}
+    )
     resolver._delegate.resolve = AsyncMock(
         return_value=[
             {
@@ -160,6 +162,8 @@ async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_orig
 
     trusted = await resolver.resolve("api.octo.example", 443)
     assert trusted[0]["host"] == "127.0.0.1"
+    with pytest.raises(OSError, match="unsafe"):
+        await resolver.resolve("api.octo.example", 8443)
 
     resolver._delegate.resolve = AsyncMock(
         return_value=[
@@ -183,13 +187,19 @@ async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_orig
     ("allow_private", "expected_trusted"),
     [
         (False, set()),
-        (True, {"api.octo.example", "cdn.octo.example"}),
+        (
+            True,
+            {
+                ("https", "api.octo.example", 443),
+                ("https", "cdn.octo.example", 443),
+            },
+        ),
     ],
 )
-async def test_http_session_trusts_configured_private_hosts_only_with_opt_in(
+async def test_http_session_trusts_configured_private_origins_only_with_opt_in(
     monkeypatch: pytest.MonkeyPatch,
     allow_private: bool,
-    expected_trusted: set[str],
+    expected_trusted: set[tuple[str, str, int]],
 ):
     adapter = make_bare_adapter()
     adapter._api_url = "https://api.octo.example/v1"
@@ -211,13 +221,15 @@ async def test_http_session_trusts_configured_private_hosts_only_with_opt_in(
         assert adapter._new_http_session() is session
 
     resolver = connector_cls.call_args.kwargs["resolver"]
-    assert resolver._trusted_hosts == expected_trusted
+    assert resolver.policy.trusted_download_origins() == expected_trusted
     await resolver.close()
 
 
 @pytest.mark.asyncio
 async def test_ssrf_resolver_rejects_metadata_hostname_before_dns():
-    resolver = _SSRFGuardResolver(trusted_hosts={"metadata.google.internal"})
+    resolver = _SSRFGuardResolver(
+        trusted_origins={"http://metadata.google.internal"}
+    )
     resolver._delegate.resolve = AsyncMock()
 
     with pytest.raises(OSError, match="unsafe host"):
@@ -291,7 +303,9 @@ async def test_cancelled_resolver_close_remains_retryable():
 
 @pytest.mark.asyncio
 async def test_guarded_connector_allows_opted_in_private_literal_origin():
-    resolver = _SSRFGuardResolver(trusted_hosts={"127.0.0.1"})
+    resolver = _SSRFGuardResolver(
+        trusted_origins={"http://127.0.0.1:8080"}
+    )
     connector = _SSRFGuardConnector(resolver=resolver)
     try:
         records = await connector._resolve_host("127.0.0.1", 8080)
@@ -303,22 +317,22 @@ async def test_guarded_connector_allows_opted_in_private_literal_origin():
 
 
 @pytest.mark.asyncio
-async def test_private_host_policy_allows_explicitly_trusted_ipv4_mapped_loopback(
+async def test_private_upload_origin_does_not_expand_shared_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
-    policy = TransportPolicy()
-    policy.trust_validated_private_host(
-        "http://[::ffff:127.0.0.1]:8080/upload"
+    policy = TransportPolicy({"https://api.example"})
+    policy.trust_validated_upload_origin(
+        "http://storage.example:8080/upload"
     )
     resolver = _SSRFGuardResolver(policy=policy)
     resolver._delegate.resolve = AsyncMock(
         return_value=[
             {
-                "hostname": "::ffff:7f00:1",
-                "host": "::ffff:7f00:1",
+                "hostname": "storage.example",
+                "host": "10.0.0.8",
                 "port": 8080,
-                "family": socket.AF_INET6,
+                "family": socket.AF_INET,
                 "proto": 6,
                 "flags": 0,
             }
@@ -326,11 +340,18 @@ async def test_private_host_policy_allows_explicitly_trusted_ipv4_mapped_loopbac
     )
 
     try:
-        records = await resolver.resolve("::ffff:7f00:1", 8080)
+        with pytest.raises(OSError, match="unsafe address"):
+            await resolver.resolve("storage.example", 8080)
     finally:
         await resolver.close()
 
-    assert records[0]["host"] == "::ffff:7f00:1"
+
+def test_transport_origin_preserves_explicit_zero_port() -> None:
+    policy = TransportPolicy({"http://10.0.0.8"})
+
+    assert policy.is_download_url_trusted("http://10.0.0.8/file") is True
+    assert policy.is_download_url_trusted("http://10.0.0.8:80/file") is True
+    assert policy.is_download_url_trusted("http://10.0.0.8:0/file") is False
 
 
 def test_private_host_policy_still_rejects_ipv4_mapped_link_local(
@@ -340,7 +361,7 @@ def test_private_host_policy_still_rejects_ipv4_mapped_link_local(
     policy = TransportPolicy()
 
     with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
-        policy.trust_validated_private_host(
+        policy.trust_validated_upload_origin(
             "http://[::ffff:169.254.169.254]/latest/meta-data/"
         )
 
@@ -352,7 +373,7 @@ def test_private_host_policy_rejects_ipv4_mapped_metadata_literal(
     policy = TransportPolicy()
 
     with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
-        policy.trust_validated_private_host(
+        policy.trust_validated_upload_origin(
             "http://[::ffff:6464:64c8]/latest/meta-data/"
         )
 
