@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import logging
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -462,6 +463,105 @@ async def test_failed_ack_is_persisted_and_retried_without_redispatch() -> None:
     recovered_ack.assert_awaited_once()
     assert cursor.pending_ack_event_id is None
     assert dispatch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_abandons_stuck_ack_and_resumes_fetching(caplog) -> None:
+    operations: list[str] = []
+    cursor = _MemoryCursor(11, operations)
+    cursor.pending_ack_event_id = 11
+    ack = AsyncMock(side_effect=RuntimeError("ack permanently rejected"))
+
+    async def fetch_events(
+        *_args,
+        since_event_id: int,
+        **_kwargs,
+    ) -> list[dict]:
+        operations.append(f"fetch:{since_event_id}")
+        return [_event(11), _event(12)]
+
+    async def dispatch(action) -> str:
+        operations.append(f"dispatch:{action.event_id}")
+        return "missing"
+
+    fetch = AsyncMock(side_effect=fetch_events)
+    with (
+        caplog.at_level(logging.ERROR, logger="hermes_octo_plugin.card_events"),
+        patch.object(card_events.api, "fetch_bot_events", fetch),
+        patch.object(card_events.api, "ack_bot_event", ack),
+        patch.object(card_events.asyncio, "sleep", AsyncMock()),
+    ):
+        restarted = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=dispatch,
+            wait_seconds=0,
+        )
+        await restarted.initialize()
+        for _ in range(3):
+            await restarted.poll_once()
+
+    assert ack.await_count == 9
+    fetch.assert_awaited_once()
+    assert operations == [
+        "save:11",
+        "fetch:11",
+        "dispatch:12",
+        "save:12",
+    ]
+    assert cursor.value == 12
+    assert cursor.pending_ack_event_id is None
+    assert cursor.pending_saved == [None, None]
+    assert "abandoning pending ack" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ack_abandon_save_failure_preserves_pending_state(caplog) -> None:
+    class _FailingClearCursor(_MemoryCursor):
+        async def save(
+            self,
+            event_id: int,
+            *,
+            pending_ack_event_id: int | None = None,
+        ) -> None:
+            if event_id == 11 and pending_ack_event_id is None:
+                raise RuntimeError("cursor disk unavailable")
+            await super().save(
+                event_id,
+                pending_ack_event_id=pending_ack_event_id,
+            )
+
+    cursor = _FailingClearCursor(11)
+    cursor.pending_ack_event_id = 11
+    ack = AsyncMock(side_effect=RuntimeError("ack permanently rejected"))
+    fetch = AsyncMock(return_value=[])
+
+    with (
+        caplog.at_level(logging.ERROR, logger="hermes_octo_plugin.card_events"),
+        patch.object(card_events.api, "fetch_bot_events", fetch),
+        patch.object(card_events.api, "ack_bot_event", ack),
+        patch.object(card_events.asyncio, "sleep", AsyncMock()),
+    ):
+        restarted = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=AsyncMock(),
+            wait_seconds=0,
+        )
+        await restarted.initialize()
+        for _ in range(3):
+            await restarted.poll_once()
+
+    assert ack.await_count == 9
+    assert restarted._pending_ack_event_id == 11
+    assert cursor.pending_ack_event_id == 11
+    fetch.assert_not_awaited()
+    assert "abandoning pending ack" not in caplog.text
+
 
 @pytest.mark.asyncio
 async def test_registry_blocks_replay_binding_channel_operator_and_input_mismatch() -> None:

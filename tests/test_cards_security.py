@@ -217,6 +217,14 @@ def test_automatic_error_summary_redacts_only_explicit_credentials() -> None:
             "oauth_signature=oauth-secret",
             "oauth-secret",
         ),
+        (
+            "authorization=basic dXNlcjpwYXNz",
+            "dXNlcjpwYXNz",
+        ),
+        (
+            'authorization=digest username="alice", response="deadbeef"',
+            "deadbeef",
+        ),
     ],
 )
 def test_automatic_error_summary_redacts_all_recognized_credentials(

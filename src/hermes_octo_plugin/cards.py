@@ -304,7 +304,7 @@ _DIGEST_AUTHORIZATION_VALUE_RE = re.compile(
     r"(?i)\b(authorization\s*:\s*digest)\b[^\r\n]*"
 )
 _AUTHORIZATION_VALUE_RE = re.compile(
-    r"(?i)\b(authorization\s*:\s*)([^\r\n]*)"
+    r"(?i)\b(authorization\s*[:=]\s*)([^\r\n]*)"
 )
 _BEARER_VALUE_RE = re.compile(r"(?i)\b(bearer\s+)[^\s,;]+")
 _COOKIE_VALUE_RE = re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)[^\r\n]*")

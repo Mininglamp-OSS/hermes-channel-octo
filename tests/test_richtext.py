@@ -419,14 +419,19 @@ class TestSendImageWithCaption:
         assert [entity.uid for entity in kwargs["mention_entities"]] == ["u1"]
 
     @pytest.mark.asyncio
-    async def test_caption_without_dims_roster_failure_sends_nothing(self):
+    async def test_caption_without_dims_roster_failure_sends_inert_caption(self):
         a = _make_adapter_with_api()
         a._http_session = MagicMock()
         a._bot_token = "tok"
         a._chat_kind = {"G1": ChannelType.Group}
         download = AsyncMock(return_value=(b"", "image/webp", "y.webp"))
         upload = AsyncMock(return_value="https://cdn/y.webp")
-        send_media = AsyncMock()
+        send_media = AsyncMock(
+            return_value=SendMessageResult(
+                message_id="media-message-1",
+                client_msg_no="media-client-1",
+            )
+        )
         send_text = AsyncMock()
 
         with (
@@ -461,12 +466,16 @@ class TestSendImageWithCaption:
                 caption="@[u1:Alice] fallback caption",
             )
 
-        assert result.success is False
-        assert "roster" in (result.error or "")
-        download.assert_not_awaited()
-        upload.assert_not_awaited()
-        send_media.assert_not_awaited()
-        send_text.assert_not_awaited()
+        assert result.success is True
+        assert result.message_id == "media-message-1"
+        download.assert_awaited_once()
+        upload.assert_awaited_once()
+        send_media.assert_awaited_once()
+        send_text.assert_awaited_once()
+        kwargs = send_text.await_args.kwargs
+        assert kwargs["content"] == "@Alice fallback caption"
+        assert kwargs["mention_uids"] == []
+        assert kwargs["mention_entities"] == []
 
     @pytest.mark.asyncio
     async def test_no_caption_uses_legacy_image_path(self):

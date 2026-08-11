@@ -46,6 +46,7 @@ _MAX_EVENT_INPUT_VALUE_BYTES = 16 << 10
 _MAX_EVENT_ENVELOPE_BYTES = 64 << 10
 _ACK_ATTEMPTS = 3
 _ACK_RETRY_SECONDS = 0.1
+_MAX_PENDING_ACK_FLUSH_FAILURES = 3
 
 logger = logging.getLogger(__name__)
 _OWNER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -789,6 +790,7 @@ class EventPoller:
         self._cursor = 0
         self._pending_ack_event_id: int | None = None
         self._consecutive_errors = 0
+        self._pending_ack_flush_failures = 0
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -842,11 +844,27 @@ class EventPoller:
     async def _flush_pending_ack(self) -> bool:
         event_id = self._pending_ack_event_id
         if event_id is None:
+            self._pending_ack_flush_failures = 0
             return True
         if not await self._ack(event_id):
-            return False
+            self._pending_ack_flush_failures += 1
+            if (
+                self._pending_ack_flush_failures
+                < _MAX_PENDING_ACK_FLUSH_FAILURES
+            ):
+                return False
+            await self._cursor_store.save(self._cursor)
+            self._pending_ack_event_id = None
+            self._pending_ack_flush_failures = 0
+            logger.error(
+                "Octo event poller abandoning pending ack for event %d "
+                "after repeated failures",
+                event_id,
+            )
+            return True
         await self._cursor_store.save(self._cursor)
         self._pending_ack_event_id = None
+        self._pending_ack_flush_failures = 0
         return True
 
     async def poll_once(self) -> float:

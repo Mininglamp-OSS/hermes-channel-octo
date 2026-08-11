@@ -599,12 +599,19 @@ async def _standalone_send(
             structured = _parse_sm(message)
             if structured:
                 parent_group_no = str(chat_id).split("____", 1)[0]
-                members = await api.get_group_members(
-                    session,
-                    api_url,
-                    bot_token,
-                    parent_group_no,
-                )
+                try:
+                    members = await api.get_group_members(
+                        session,
+                        api_url,
+                        bot_token,
+                        parent_group_no,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[Octo] standalone group member roster refresh failed: %s",
+                        exc,
+                    )
+                    members = []
                 valid_uids = {
                     member.uid
                     for member in members
@@ -612,8 +619,6 @@ async def _standalone_send(
                     and STRUCTURED_MENTION_UID_PATTERN.fullmatch(member.uid)
                     is not None
                 }
-                if not valid_uids:
-                    raise RuntimeError("group member roster is unavailable")
                 send_content, send_entities, send_uids = _convert_sm(
                     message,
                     structured,
@@ -3848,8 +3853,6 @@ class OctoAdapter(BasePlatformAdapter):
             if isinstance(uid, str)
             and STRUCTURED_MENTION_UID_PATTERN.fullmatch(uid) is not None
         }
-        if not valid_uids:
-            raise RuntimeError("group member roster is unavailable")
         return valid_uids
 
     async def _send_normal(

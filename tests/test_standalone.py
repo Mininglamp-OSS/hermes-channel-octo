@@ -106,7 +106,7 @@ async def test_standalone_sender_filters_mentions_with_authoritative_roster():
 
 
 @pytest.mark.asyncio
-async def test_standalone_sender_fails_closed_when_mention_roster_is_unavailable():
+async def test_standalone_sender_sends_inert_mention_when_roster_is_unavailable():
     config = SimpleNamespace(
         extra={
             "api_url": "https://api.example.invalid",
@@ -114,7 +114,9 @@ async def test_standalone_sender_fails_closed_when_mention_roster_is_unavailable
         },
         token="",
     )
-    send_message = AsyncMock()
+    send_message = AsyncMock(
+        return_value=SendMessageResult(message_id="standalone-message")
+    )
     with (
         patch.object(
             adapter_module,
@@ -134,12 +136,15 @@ async def test_standalone_sender_fails_closed_when_mention_roster_is_unavailable
             "@[member-1:Member]",
         )
 
-    assert result == {"error": "Octo API send failed (see logs)"}
-    send_message.assert_not_awaited()
+    assert result["success"] is True
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@Member"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
 
 
 @pytest.mark.asyncio
-async def test_standalone_sender_rejects_unusable_roster_uids():
+async def test_standalone_sender_sends_inert_mention_for_unusable_roster_uids():
     config = SimpleNamespace(
         extra={
             "api_url": "https://api.example.invalid",
@@ -147,7 +152,9 @@ async def test_standalone_sender_rejects_unusable_roster_uids():
         },
         token="",
     )
-    send_message = AsyncMock()
+    send_message = AsyncMock(
+        return_value=SendMessageResult(message_id="standalone-message")
+    )
     with (
         patch.object(
             adapter_module,
@@ -169,5 +176,8 @@ async def test_standalone_sender_rejects_unusable_roster_uids():
             "@[member-1:Member]",
         )
 
-    assert result == {"error": "Octo API send failed (see logs)"}
-    send_message.assert_not_awaited()
+    assert result["success"] is True
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@Member"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
