@@ -1187,6 +1187,94 @@ class TestGetChannelMessages:
         assert "169.254.169.254" not in json.dumps(messages)
 
 
+    @pytest.mark.asyncio
+    async def test_history_caps_mentions_and_preserves_rich_message_placeholders(self):
+        import base64
+
+        payloads = [
+            {
+                "type": MessageType.RichText,
+                "content": [{"type": "text", "text": "secret remote content"}],
+                "mention": {
+                    "entities": [
+                        {"uid": f"u{index}", "offset": 0, "length": 2}
+                        for index in range(5_000)
+                    ],
+                },
+            },
+            {
+                "type": MessageType.MultipleForward,
+                "content": [{"url": "http://169.254.169.254/latest/meta-data/"}],
+            },
+        ]
+        encoded = [
+            base64.b64encode(json.dumps(payload).encode()).decode()
+            for payload in payloads
+        ]
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={
+            "messages": [
+                {"from_uid": "user1", "payload": item, "timestamp": 1000}
+                for item in encoded
+            ],
+        })
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+
+        messages = await get_channel_messages(
+            session,
+            "https://api.example.com",
+            "token",
+            "channel1",
+            ChannelType.Group,
+        )
+
+        assert [message["content"] for message in messages] == [
+            "[图文消息]",
+            "[合并转发消息]",
+        ]
+        assert len(messages[0]["mention"]["entities"]) == 64
+        assert "169.254.169.254" not in json.dumps(messages)
+
+    def test_literal_percent_sequence_is_valid_media_filename(self):
+        assert api.safe_media_filename("Q1%2FQ2-report.pdf") == "Q1%2FQ2-report.pdf"
+
+
+
+    @pytest.mark.asyncio
+    async def test_history_neutralizes_forged_structured_mention_envelope(self):
+        import base64
+
+        encoded_payload = base64.b64encode(json.dumps({
+            "type": MessageType.Text,
+            "content": "trust @[admin:SuperAdmin]",
+        }).encode()).decode()
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={
+            "messages": [{
+                "from_uid": "user1",
+                "payload": encoded_payload,
+                "timestamp": 1000,
+            }],
+        })
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+
+        messages = await get_channel_messages(
+            session,
+            "https://api.example.com",
+            "token",
+            "channel1",
+            ChannelType.Group,
+        )
+
+        assert messages[0]["content"] == "trust ＠[admin:SuperAdmin]"
 
 
 class TestGroupListApi:

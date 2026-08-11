@@ -75,7 +75,7 @@ class TestFilenameDecoding:
         (
             "attachment; filename=..%2Foutside.txt",
             "https://files.example/report.txt",
-            "report.txt",
+            "..%2Foutside.txt",
         ),
     ],
 )

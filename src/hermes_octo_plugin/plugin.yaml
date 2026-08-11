@@ -28,6 +28,10 @@ optional_env:
     description: "Optional WuKongIM WebSocket URL override"
     prompt: "WebSocket URL override (optional)"
     password: false
+  - name: OCTO_ALLOW_PRIVATE_HOSTS
+    description: "Allow only configured Octo API/CDN/WebSocket origins to resolve to private IPs; metadata endpoints stay blocked"
+    prompt: "Allow configured private Octo hosts? (true/false)"
+    password: false
   - name: OCTO_ON_BEHALF_OF
     description: "Trusted grantor user ID for authorized persona delivery"
     prompt: "Send on behalf of user ID (optional)"

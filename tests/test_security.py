@@ -51,10 +51,26 @@ class TestValidateOctoUrl:
             "http://[::1]/",
         ],
     )
-    def test_accepts_explicitly_configured_private_origin(self, url):
+    def test_private_origin_requires_explicit_opt_in(self, url):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OCTO_ALLOW_PRIVATE_HOSTS", None)
+            with pytest.raises(ValueError, match="OCTO_ALLOW_PRIVATE_HOSTS"):
+                _validate_octo_url(url, "OCTO_API_URL")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1/",
+            "http://localhost:8080/",
+            "https://10.0.0.1/v1",
+            "http://octo.internal/",
+            "http://[::1]/",
+        ],
+    )
+    def test_accepts_opted_in_configured_private_origin(self, url):
+        with mock.patch.dict(os.environ, {"OCTO_ALLOW_PRIVATE_HOSTS": "true"}):
             assert _validate_octo_url(url, "OCTO_API_URL") == url
+
 
     @pytest.mark.parametrize(
         "url",

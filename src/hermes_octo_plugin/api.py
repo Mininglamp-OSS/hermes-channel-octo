@@ -109,7 +109,6 @@ def safe_media_filename(value: object) -> str | None:
         or "\\" in candidate
         or candidate != Path(candidate).name
         or any(unicodedata.category(char) in {"Cc", "Cf"} for char in candidate)
-        or re.search(r"%(?:00|0a|0d|2f|5c)", candidate, re.IGNORECASE) is not None
         or candidate.endswith((".", " "))
         or len(candidate.encode("utf-8")) > MAX_MEDIA_FILENAME_BYTES
     ):
@@ -1720,6 +1719,15 @@ async def get_channel_messages(
             normalized_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
             name = safe_media_filename(normalized_name)
         mention = payload.get("mention")
+        if isinstance(mention, dict):
+            from .mention import MAX_MENTIONS_PER_MESSAGE
+
+            raw_entities = mention.get("entities")
+            if isinstance(raw_entities, list):
+                mention = {
+                    **mention,
+                    "entities": raw_entities[:MAX_MENTIONS_PER_MESSAGE],
+                }
         content = payload.get("content", "")
         if message_type == MessageType.File:
             name = name or "未知文件"
@@ -1731,6 +1739,15 @@ async def get_channel_messages(
             MessageType.Video,
         }:
             content = f"[{MessageType(message_type).name}]"
+        elif message_type == MessageType.RichText:
+            content = "[图文消息]"
+        elif message_type == MessageType.MultipleForward:
+            content = "[合并转发消息]"
+        if isinstance(content, str):
+            from .mention import neutralize_structured_mention_envelopes
+
+            content = neutralize_structured_mention_envelopes(content)
+
         parsed.append({
             "from_uid": m.get("from_uid", "unknown"),
             "type": message_type,

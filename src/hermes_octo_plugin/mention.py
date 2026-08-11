@@ -123,14 +123,43 @@ def _utf16_length(text: str) -> int:
     return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
 
 
-def _utf16_boundaries(text: str) -> dict[int, int]:
-    """Map whole UTF-16 code-unit boundaries to Python string indexes once."""
-    boundaries = {0: 0}
+def neutralize_structured_mention_envelopes(text: str) -> str:
+    """Keep user-authored ``@[...`` text visible but outside Hermes syntax."""
+    return text.replace("@[", "＠[")
+
+
+
+def _utf16_boundaries(text: str, targets: set[int]) -> dict[int, int]:
+    """Map only requested UTF-16 boundaries, keeping memory O(entity count)."""
+    boundaries = {0: 0} if 0 in targets else {}
+    if not targets:
+        return boundaries
+    max_code_units = max(targets)
     code_units = 0
     for index, char in enumerate(text, 1):
         code_units += 2 if ord(char) > 0xFFFF else 1
-        boundaries[code_units] = index
+        if code_units in targets:
+            boundaries[code_units] = index
+        if code_units >= max_code_units:
+            break
     return boundaries
+
+
+def _render_trusted_replacements(
+    content: str,
+    replacements: list[tuple[int, int, str]],
+) -> str:
+    """Neutralize untrusted envelopes while inserting trusted replacements."""
+    parts: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        parts.append(neutralize_structured_mention_envelopes(content[cursor:start]))
+        parts.append(replacement)
+        cursor = end
+    parts.append(neutralize_structured_mention_envelopes(content[cursor:]))
+    return "".join(parts)
+
+
 
 
 def convert_structured_mentions(
@@ -193,13 +222,14 @@ def _coerce_mention(mention: Any) -> MentionPayload | None:
         if isinstance(raw_entities, list):
             entities = [
                 MentionEntity(uid=e["uid"], offset=e["offset"], length=e["length"])
-                for e in raw_entities
+                for e in raw_entities[:MAX_MENTIONS_PER_MESSAGE]
                 if isinstance(e, dict) and "uid" in e and "offset" in e and "length" in e
             ]
         uids = mention.get("uids") if isinstance(mention.get("uids"), list) else None
         all_flag = mention.get("all")
         return MentionPayload(uids=uids, entities=entities, all=all_flag)
     return None
+
 
 
 def extract_mention_uids(mention: Any) -> list[str]:
@@ -261,25 +291,48 @@ def convert_content_for_llm(
         return ""
     mention = _coerce_mention(mention)
     if not mention:
-        return content
+        return neutralize_structured_mention_envelopes(content)
 
-    # Try entities (v2) — wire offsets and lengths are authoritative. Build
-    # the UTF-16 boundary map once, then validate each bounded entity in O(1).
+    # Try entities (v2) — wire offsets and lengths are authoritative. Validate
+    # the bounded sidecar before scanning any content, then inspect only the
+    # prefix through the largest referenced UTF-16 endpoint.
     if mention.entities:
-        boundaries = _utf16_boundaries(content)
-        entity_ranges: list[tuple[MentionEntity, int, int]] = []
-        for entity in mention.entities:
-            if not (
+        valid_entities = [
+            entity
+            for entity in mention.entities
+            if (
                 isinstance(entity, MentionEntity)
                 and entity.uid
                 and isinstance(entity.offset, int)
                 and not isinstance(entity.offset, bool)
                 and isinstance(entity.length, int)
                 and not isinstance(entity.length, bool)
-            ):
-                continue
-            start = boundaries.get(entity.offset)
-            end = boundaries.get(entity.offset + entity.length)
+                and entity.offset >= 0
+                and entity.length > 0
+            )
+        ]
+        boundary_targets = {
+            boundary
+            for entity in valid_entities
+            for boundary in (entity.offset, entity.offset + entity.length)
+            if boundary <= 2 * len(content)
+        }
+        max_end = max(boundary_targets, default=0)
+        prefix = content[:max_end]
+        boundaries = (
+            None
+            if all(ord(char) <= 0xFFFF for char in prefix)
+            else _utf16_boundaries(content, boundary_targets)
+        )
+        entity_ranges: list[tuple[MentionEntity, int, int]] = []
+        for entity in valid_entities:
+            if boundaries is None:
+                start = entity.offset if entity.offset <= len(content) else None
+                end_offset = entity.offset + entity.length
+                end = end_offset if end_offset <= len(content) else None
+            else:
+                start = boundaries.get(entity.offset)
+                end = boundaries.get(entity.offset + entity.length)
             if start is None or end is None or start >= end or content[start] != "@":
                 continue
             entity_ranges.append((entity, start, end))
@@ -293,23 +346,24 @@ def convert_content_for_llm(
             )
         )
         if sorted_entities and not overlaps:
-            result = content
-            for entity, start, end in reversed(sorted_entities):
-                name = content[start + 1:end]
-                replacement = f"@[{entity.uid}:{name}]"
-                result = result[:start] + replacement + result[end:]
-            return result
+            replacements = [
+                (
+                    start,
+                    end,
+                    f"@[{entity.uid}:{content[start + 1:end]}]",
+                )
+                for entity, start, end in sorted_entities
+            ]
+            return _render_trusted_replacements(content, replacements)
+
 
     # Fallback (v1): member_map lookup or uids positional pairing
     has_member_map = member_map and len(member_map) > 0
     has_uids = mention.uids and len(mention.uids) > 0
 
     if has_member_map or has_uids:
-        result = content
         uid_index = 0
-        replacements: list[tuple[int, int, str]] = []  # (start, end, replacement)
-
-        # Sort member names by length descending for longest-match-first
+        replacements: list[tuple[int, int, str]] = []
         sorted_names = sorted(member_map.keys(), key=len, reverse=True) if has_member_map else []
 
         for i, match in enumerate(MENTION_PATTERN.finditer(content)):
@@ -322,13 +376,11 @@ def convert_content_for_llm(
             name = match.group(1)
             uid: str | None = None
             matched_name = name
-
             if has_member_map and member_map:
-                # Try longest prefix match (supports names with spaces)
                 longer = _try_longest_member_match(content, match.start(), member_map, sorted_names)
                 if longer:
-                    uid = longer["uid"]
                     matched_name = longer["name"]
+                    uid = longer["uid"]
                 else:
                     uid = member_map.get(name)
             elif has_uids and mention.uids and uid_index < len(mention.uids):
@@ -343,13 +395,13 @@ def convert_content_for_llm(
                     f"@[{uid}:{matched_name}]",
                 ))
 
-        # Apply replacements from back to front
-        for start, end, replacement in reversed(replacements):
-            result = result[:start] + replacement + result[end:]
+        return _render_trusted_replacements(
+            content,
+            sorted(replacements, key=lambda item: item[0]),
+        )
 
-        return result
+    return neutralize_structured_mention_envelopes(content)
 
-    return content
 
 
 # ─── Build Entities from Plain @name ─────────────────────────────────────────

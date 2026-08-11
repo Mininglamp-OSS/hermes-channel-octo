@@ -26,6 +26,12 @@ _METADATA_HOSTS = frozenset({
 })
 
 
+def private_hosts_enabled() -> bool:
+    """Return whether the operator explicitly trusts configured private origins."""
+    return os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}
+
+
+
 def is_private_or_metadata_host(hostname: str) -> bool:
     normalized = _canonical_trust_host(hostname)
     if not normalized:
@@ -230,7 +236,8 @@ async def open_guarded_websocket_socket(
     if origin is None or origin[0] not in {"ws", "wss"}:
         raise ValueError("WebSocket URL must use ws or wss")
     _, host, port = origin
-    policy = TransportPolicy({url})
+    trusted_origins = {url} if private_hosts_enabled() else set()
+    policy = TransportPolicy(trusted_origins)
     resolver = SSRFGuardResolver(policy=policy)
     last_error: OSError | None = None
     async with asyncio.timeout(timeout_seconds):
@@ -314,8 +321,14 @@ def new_guarded_http_session(
     policy: TransportPolicy | None = None,
 ) -> aiohttp.ClientSession:
     if policy is None:
-        policy = TransportPolicy({url for url in configured_urls if url})
+        trusted_origins = (
+            {url for url in configured_urls if url}
+            if private_hosts_enabled()
+            else set()
+        )
+        policy = TransportPolicy(trusted_origins)
     resolver = SSRFGuardResolver(policy=policy)
+
     connector = SSRFGuardConnector(resolver=resolver, policy=policy)
     session = aiohttp.ClientSession(connector=connector)
     session.transport_policy = policy  # type: ignore[attr-defined]

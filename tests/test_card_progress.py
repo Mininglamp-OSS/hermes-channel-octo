@@ -1193,6 +1193,37 @@ def test_reasoning_registry_capacity_failure_degrades_without_raising() -> None:
     assert state.preserve_registry_session_on_drop is False
 
 
+def test_reasoning_registry_refreshes_stop_control_to_retry_for_same_card() -> None:
+    adapter = _Adapter()
+    state = card_progress._ProgressTurn(
+        adapter=adapter,
+        route=_ROUTE,
+        session_id="session-1",
+        turn_id="turn-1",
+        segment_no=0,
+        message_id="reasoning-1",
+    )
+    state.reasoning_submit_actions = {
+        "reasoning": ("reasoning_stop",),
+        "error": ("reasoning_retry",),
+    }
+
+    card_progress._sync_reasoning_card_session(
+        state,
+        wire_state="reasoning",
+        preserve_on_drop=True,
+    )
+    card_progress._sync_reasoning_card_session(
+        state,
+        wire_state="error",
+        preserve_on_drop=True,
+    )
+
+    registered = adapter._card_sessions.peek("reasoning-1")
+    assert registered is not None
+    assert registered.action_labels == {"reasoning_retry": "重试"}
+
+
 @pytest.mark.asyncio
 async def test_registry_error_progress_keeps_only_the_owned_retry_control() -> None:
     controller = card_progress.CardProgressController()

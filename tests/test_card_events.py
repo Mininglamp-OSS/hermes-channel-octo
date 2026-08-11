@@ -220,13 +220,50 @@ def test_registry_registration_rejects_invalid_ids_and_unsafe_capacity_eviction(
 
 
 
-def test_registry_reregistration_refreshes_pending_session() -> None:
+def test_registry_reregistration_rejects_pending_message_id_collision() -> None:
     registry = card_events.CardSessionRegistry()
     registry.register(_session())
-    registry.register(_session(plain="Updated"))
 
-    assert registry.peek("message-1") == _session(plain="Updated")
+    with pytest.raises(ValueError, match="already active"):
+        registry.register(_session(plain="Replacement"))
 
+    assert registry.peek("message-1") == _session()
+
+def test_action_echo_is_escaped_once() -> None:
+    frozen = card_events._freeze_action_node(
+        {"type": "Input.Text", "id": "note", "label": "Note"},
+        {"note": "a[b"},
+    )
+
+    assert frozen is not None
+    assert frozen["text"] == r"Note: a\[b"
+
+
+
+def test_registry_refreshes_only_same_reasoning_session_identity() -> None:
+    registry = card_events.CardSessionRegistry()
+    original = _session(
+        kind="reasoning",
+        action_labels={"reasoning_stop": "停止"},
+    )
+    registry.register(original)
+
+    refreshed = _session(
+        kind="reasoning",
+        action_labels={"reasoning_retry": "重试"},
+    )
+    registry.refresh_reasoning(refreshed)
+    assert registry.peek("message-1") == refreshed
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        registry.refresh_reasoning(
+            _session(
+                kind="reasoning",
+                binding_id="forged-binding",
+                action_labels={"reasoning_retry": "重试"},
+            )
+        )
+    assert registry.peek("message-1") == refreshed
 
 def test_registry_reregistration_rejects_active_message_id_collision() -> None:
     registry = card_events.CardSessionRegistry()
@@ -784,6 +821,7 @@ async def test_registry_blocks_replay_binding_channel_operator_and_input_mismatc
         _event(23, action_id="forged"),
         _event(24, inputs={"unknown": "value"}),
     ):
+        registry.discard("message-1")
         registry.register(_session())
         action = card_events.parse_card_action(raw)
         assert action is not None

@@ -186,21 +186,28 @@ async def test_inbound_media_rejects_opposite_scheme_trusted_endpoint_before_io(
     )
     adapter._http_session.get.assert_not_called()
 
-def test_inbound_private_media_allows_exact_configured_origin_without_flag(
+def test_inbound_private_media_requires_opt_in_for_exact_configured_origin(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
     adapter = make_bare_adapter()
     adapter._api_url = "http://api.internal:8080/v1"
     adapter._http_session = MagicMock()
-    adapter._http_session.transport_policy = TransportPolicy({adapter._api_url})
 
+    monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+    adapter._http_session.transport_policy = TransportPolicy()
+    assert not adapter._inbound_media_url_allowed(
+        "http://api.internal:8080/download/report.pdf"
+    )
+
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+    adapter._http_session.transport_policy = TransportPolicy({adapter._api_url})
     assert adapter._inbound_media_url_allowed(
         "http://api.internal:8080/download/report.pdf"
     )
     assert not adapter._inbound_media_url_allowed(
         "http://api.internal:8081/download/report.pdf"
     )
+
 
 @pytest.mark.asyncio
 async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_origin():
@@ -246,32 +253,42 @@ async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_orig
 
 
 @pytest.mark.asyncio
-async def test_http_session_trusts_only_configured_connection_origins_by_default(
+async def test_http_session_private_trust_requires_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
     adapter = make_bare_adapter()
     adapter._api_url = "https://api.octo.example/v1"
     adapter._cdn_url = "https://cdn.octo.example/assets"
 
-    connector = MagicMock()
-    session = MagicMock()
-    with (
-        patch(
-            "hermes_octo_plugin.transport.SSRFGuardConnector",
-            return_value=connector,
-        ) as connector_cls,
-        patch("hermes_octo_plugin.transport.aiohttp.ClientSession", return_value=session),
+    for enabled, expected in (
+        (False, frozenset()),
+        (
+            True,
+            frozenset({
+                ("https", "api.octo.example", 443),
+                ("https", "cdn.octo.example", 443),
+            }),
+        ),
     ):
-        assert adapter._new_http_session() is session
+        if enabled:
+            monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        else:
+            monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+        connector = MagicMock()
+        session = MagicMock()
+        with (
+            patch(
+                "hermes_octo_plugin.transport.SSRFGuardConnector",
+                return_value=connector,
+            ) as connector_cls,
+            patch("hermes_octo_plugin.transport.aiohttp.ClientSession", return_value=session),
+        ):
+            assert adapter._new_http_session() is session
 
-    resolver = connector_cls.call_args.kwargs["resolver"]
-    assert resolver.policy.trusted_download_origins() == frozenset({
-        ("https", "api.octo.example", 443),
-        ("https", "cdn.octo.example", 443),
-    })
-    assert not resolver.policy.is_connection_trusted("other.example", 443)
-    await resolver.close()
+        resolver = connector_cls.call_args.kwargs["resolver"]
+        assert resolver.policy.trusted_download_origins() == expected
+        await resolver.close()
+
 
 
 def test_transport_policy_normalizes_public_idn_and_private_host_aliases(
@@ -457,9 +474,7 @@ async def test_guarded_websocket_socket_connects_only_validated_numeric_address(
 
     assert result is guarded_socket
     policy = resolver_factory.call_args.kwargs["policy"]
-    assert policy.trusted_download_origins() == frozenset({
-        ("wss", "socket.example", 443),
-    })
+    assert policy.trusted_download_origins() == frozenset()
     resolver.resolve.assert_awaited_once_with(
         "socket.example",
         443,
@@ -527,7 +542,7 @@ async def test_guarded_websocket_socket_stops_on_unsafe_dns_before_connect(
 
 
 @pytest.mark.asyncio
-async def test_guarded_websocket_socket_trusts_exact_server_origin_by_default(
+async def test_guarded_websocket_socket_never_trusts_target_without_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
@@ -545,14 +560,32 @@ async def test_guarded_websocket_socket_trusts_exact_server_origin_by_default(
         )
 
     policy = resolver_factory.call_args.kwargs["policy"]
+    assert policy.trusted_download_origins() == frozenset()
+    resolver.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guarded_websocket_socket_trusts_exact_target_with_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(side_effect=OSError("stop after policy capture"))
+    resolver.close = AsyncMock()
+    resolver_factory = MagicMock(return_value=resolver)
+
+    with (
+        patch.object(transport_module, "SSRFGuardResolver", resolver_factory),
+        pytest.raises(OSError, match="policy capture"),
+    ):
+        await transport_module.open_guarded_websocket_socket(
+            "wss://socket.internal:9443/ws"
+        )
+
+    policy = resolver_factory.call_args.kwargs["policy"]
     assert policy.trusted_download_origins() == frozenset({
         ("wss", "socket.internal", 9443),
     })
-    resolver.resolve.assert_awaited_once_with(
-        "socket.internal",
-        9443,
-        family=socket.AF_UNSPEC,
-    )
     resolver.close.assert_awaited_once()
 
 
@@ -653,6 +686,16 @@ def test_inbound_long_filename_is_bounded_without_losing_its_identity() -> None:
     assert display_name != "未知文件"
     assert display_name.endswith(".pdf")
     assert len(display_name.encode("utf-8")) <= 255
+
+
+def test_inbound_megabyte_filename_truncation_has_bounded_work() -> None:
+    raw_filename = f"{'a' * 1_000_000}.pdf"
+
+    display_name = adapter_module._inbound_file_display_name(raw_filename)
+
+    assert display_name.endswith(".pdf")
+    assert len(display_name.encode("utf-8")) <= 255
+
 
 
 def test_inbound_long_extension_is_bounded() -> None:

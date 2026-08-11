@@ -87,6 +87,8 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_BOT_TOKEN` | yes | Octo bot authentication token |
 | `OCTO_CDN_URL` | no | CDN prefix for media acceleration |
 | `OCTO_WS_URL` | no | WuKongIM `ws://`/`wss://` override; defaults to the URL returned by bot registration |
+| `OCTO_ALLOW_PRIVATE_HOSTS` | no | Set to `true` only for trusted self-hosted API/CDN/WebSocket origins that resolve to private IPs; metadata endpoints remain blocked |
+
 | `OCTO_ON_BEHALF_OF` | no | Trusted grantor user ID for server-authorized persona delivery; text, typing, RichText, and media use this identity, display/interactive Type-17 tools fall back to plain text, and automatic progress cards are disabled |
 | `OCTO_ALLOWED_USERS` | no | Comma-separated user IDs allowed to talk to the bot |
 | `OCTO_ALLOW_ALL_USERS` | no | Allow any user to trigger the bot (dev only) |
@@ -115,6 +117,11 @@ validator fails closed: the plugin never substitutes its own authorization
 decision. HTTP(S) media retains the guarded download flow. Adapter-native Hermes
 media delivery also accepts `data:` URLs; the model-facing tools accept HTTP(S),
 `file://`, and authorized local paths.
+
+Management audit logs intentionally contain only bounded action, result,
+channel-type, and item-count metadata. Stable requester/target identifiers and
+model-supplied reason text are omitted to avoid copying cross-channel identity
+and content into gateway logs.
 
 For inbound commands, the plugin removes only a leading self-mention immediately
 followed by a slash command so Hermes can route that command. Other self-mentions

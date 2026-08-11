@@ -428,9 +428,9 @@ def _freeze_action_node(
         safe_label = label.strip() if isinstance(label, str) and label.strip() else input_id
         return {
             "type": "TextBlock",
-            "text": cards.literal_card_text(
-                f"{safe_label}: {_neutralize_action_echo(inputs[input_id])}"
-            ),
+            "text": f"{cards.literal_card_text(safe_label)}: "
+            f"{_neutralize_action_echo(inputs[input_id])}",
+
             "wrap": True,
             "spacing": "Small",
         }

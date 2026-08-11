@@ -41,6 +41,7 @@ from .mention import (
     convert_content_for_llm,
     convert_structured_mentions,
     extract_mention_uids,
+    neutralize_structured_mention_envelopes,
     parse_structured_mentions,
     strip_leading_self_mention_for_command,
 )
@@ -216,17 +217,20 @@ _INBOUND_FILE_FALLBACK_NAME = "未知文件"
 
 def _truncate_utf8_filename(value: str, max_bytes: int) -> str:
     """Fit a filename into one UTF-8 byte budget while preserving short suffixes."""
-    if len(value.encode("utf-8")) <= max_bytes:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
         return value
     dot = value.rfind(".")
     suffix = value[dot:] if dot > 0 else ""
-    if len(suffix.encode("utf-8")) > min(32, max_bytes // 2):
+    suffix_bytes = suffix.encode("utf-8")
+    if len(suffix_bytes) > min(32, max_bytes // 2):
         suffix = ""
-    budget = max_bytes - len(suffix.encode("utf-8"))
+        suffix_bytes = b""
+    budget = max_bytes - len(suffix_bytes)
     stem = value[: -len(suffix)] if suffix else value
-    while stem and len(stem.encode("utf-8")) > budget:
-        stem = stem[:-1]
-    return f"{stem or 'file'}{suffix}"
+    truncated = stem.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    return f"{truncated or 'file'}{suffix}"
+
 
 
 def _inbound_file_display_name(value: object) -> str:
@@ -440,6 +444,16 @@ def _validate_octo_endpoint(
     if hostname in _METADATA_HOSTS:
         raise ValueError(
             f"{name} points at blocked metadata host {parsed.hostname!r} (SSRF guard)."
+        )
+    allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if not allow_private and _is_private_or_metadata_host(hostname):
+        raise ValueError(
+            f"{name} points at private/loopback host {parsed.hostname!r}. "
+            "Set OCTO_ALLOW_PRIVATE_HOSTS=true only for a trusted self-hosted Octo origin."
         )
     return url
 
@@ -1948,11 +1962,11 @@ class OctoAdapter(BasePlatformAdapter):
                 else sender_uid
             )
             body = e.get("body", "")
-            # Convert mentions to @[uid:name] format for LLM
+            # Convert trusted sidecars and neutralize user-authored envelopes.
             mention = e.get("mention")
-            if mention:
-                scoped_name_map = {name: uid for uid, name in roster.items()}
-                body = convert_content_for_llm(body, mention, scoped_name_map)
+            scoped_name_map = {name: uid for uid, name in roster.items()}
+            body = convert_content_for_llm(body, mention, scoped_name_map)
+
             formatted.append({"sender": sender_label, "body": body})
 
         messages_json = json.dumps(formatted, ensure_ascii=False, indent=2)
@@ -2586,6 +2600,8 @@ class OctoAdapter(BasePlatformAdapter):
                 llm_content = convert_content_for_llm(
                     content, payload.mention, dict(self._member_map)
                 )
+        else:
+            llm_content = convert_content_for_llm(content)
         if is_group:
             llm_content = strip_leading_self_mention_for_command(
                 llm_content,
@@ -3133,9 +3149,10 @@ class OctoAdapter(BasePlatformAdapter):
         if not isinstance(reply_payload, dict):
             return ""
         try:
-            return self._resolve_content(MessagePayload.from_dict(reply_payload))
+            rendered = self._resolve_content(MessagePayload.from_dict(reply_payload))
         except (TypeError, ValueError):
             return ""
+        return neutralize_structured_mention_envelopes(rendered)
 
     def _resolve_inner_message_text(self, inner: dict[str, Any]) -> str:
         """Render a single inner message inside a MultipleForward payload.

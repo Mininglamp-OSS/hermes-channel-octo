@@ -93,13 +93,9 @@ class CardSessionRegistry:
         with self._lock:
             self._prune_locked()
             existing = self._entries.get(session.message_id)
-            if existing is not None and existing.state == "pending":
-                existing.session = session
-                existing.expires_at = time.monotonic() + self._ttl_seconds
-                self._entries.move_to_end(session.message_id)
-                return
             if existing is not None and existing.state != "completed":
                 raise ValueError("card session message_id already active")
+
             self._entries.pop(session.message_id, None)
             while len(self._entries) >= self._max_sessions:
                 completed_message_id = next(
@@ -117,6 +113,35 @@ class CardSessionRegistry:
                 session=session,
                 expires_at=time.monotonic() + self._ttl_seconds,
             )
+
+    def refresh_reasoning(self, session: CardSession) -> None:
+        """Refresh actions for the same pending reasoning-card identity only."""
+        if not _bounded_message_id(session.message_id) or session.kind != "reasoning":
+            raise ValueError("invalid reasoning card session")
+        with self._lock:
+            self._prune_locked()
+            entry = self._entries.get(session.message_id)
+            if entry is None or entry.state != "pending":
+                raise ValueError("reasoning card session is not pending")
+            existing = entry.session
+            identity = (
+                "binding_id",
+                "session_key",
+                "chat_id",
+                "channel_id",
+                "channel_type",
+                "requester_uid",
+                "action_channel_ids",
+                "input_ids",
+                "clarify",
+                "kind",
+            )
+            if any(getattr(existing, field) != getattr(session, field) for field in identity):
+                raise ValueError("reasoning card session identity mismatch")
+            entry.session = session
+            entry.expires_at = time.monotonic() + self._ttl_seconds
+            self._entries.move_to_end(session.message_id)
+
 
 
     def peek(self, message_id: str) -> CardSession | None:
