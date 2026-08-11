@@ -12,7 +12,7 @@ from typing import Any
 
 
 from . import api, cards
-from .mention import _utf16_length
+from .mention import _utf16_length, parse_structured_mentions
 from .card_tools import (
     DISPLAY_BLOCK_SCHEMA,
     TrustedOctoRoute,
@@ -280,8 +280,11 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
             plain_parts: list[str] = []
             failed_images = 0
             mention_uids: list[str] = []
+            seen_mention_uids: set[str] = set()
             mention_entities: list[MentionEntity] = []
             plain_utf16_length = 0
+            message_mention_allowlist: set[str] | None = None
+            filtered_mentions = 0
             for raw_block in raw_blocks:
                 if not isinstance(raw_block, dict):
                     raise ValueError("RichText blocks must be objects")
@@ -290,13 +293,29 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                     text = raw_block.get("text")
                     if not isinstance(text, str) or not text or len(text) > _MAX_TEXT_CHARS:
                         raise ValueError("RichText text must be non-empty and bounded")
+                    structured_mention_count = len(parse_structured_mentions(text))
+                    if (
+                        structured_mention_count
+                        and message_mention_allowlist is None
+                    ):
+                        message_mention_allowlist = (
+                            await adapter._mention_uid_allowlist(
+                                route.chat_id,
+                                route.channel_type,
+                                http_session=session,
+                            )
+                        )
                     converted_text, block_entities, block_uids = (
                         await adapter._prepare_outbound_mentions(
                             text,
                             route.chat_id,
                             route.channel_type,
-                            http_session=session,
+                            mention_uid_allowlist=message_mention_allowlist,
+                            log_filtered=False,
                         )
+                    )
+                    filtered_mentions += structured_mention_count - len(
+                        block_uids or ()
                     )
                     blocks.append(
                         RichTextBlock(type=RICH_TEXT_BLOCK_TEXT, text=converted_text)
@@ -312,7 +331,10 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                             for entity in block_entities
                         )
                     if block_uids:
-                        mention_uids.extend(block_uids)
+                        for uid in block_uids:
+                            if uid not in seen_mention_uids:
+                                seen_mention_uids.add(uid)
+                                mention_uids.append(uid)
                     plain_utf16_length += _utf16_length(converted_text)
                     continue
                 if block_type != RICH_TEXT_BLOCK_IMAGE:
@@ -344,6 +366,11 @@ async def octo_send_rich_text_handler(args: dict[str, Any], **_kwargs: Any) -> s
                     logger.warning(
                         "Octo RichText image omitted after %s", type(exc).__name__
                     )
+            if filtered_mentions:
+                logger.warning(
+                    "Octo RichText filtered %d unverified mention(s)",
+                    filtered_mentions,
+                )
             if not blocks:
                 return _error("all RichText image blocks failed")
             client_msg_no = str(uuid.uuid4())

@@ -272,6 +272,7 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset({
     "authorization",
     "clientsecret",
     "credential",
+    "credentials",
     "key",
     "password",
     "passwd",
@@ -285,6 +286,7 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset({
     "accesskey",
     "cookie",
     "secretkey",
+    "secretaccesskey",
     "sessiontoken",
     "setcookie",
     "xapikey",
@@ -324,13 +326,13 @@ _EXPLICIT_CREDENTIAL_VALUE_RE = re.compile(
             |
             cookie
             |
-            credential
+            credentials?
             |
             key
             |
             pass(?:word|wd)
             |
-            secret(?:[-_.]?key)?
+            secret(?:[-_.]?(?:access[-_.]?key|key))?
             |
             set[-_.]?cookie
             |

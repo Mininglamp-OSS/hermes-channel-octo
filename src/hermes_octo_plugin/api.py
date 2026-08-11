@@ -26,6 +26,7 @@ from urllib.parse import quote, unquote, unquote_to_bytes, urlencode, urljoin, u
 import aiohttp
 from .transport import (
     TransportPolicy,
+    canonical_url_host,
     is_private_or_metadata_host,
     new_guarded_http_session,
 )
@@ -1340,10 +1341,10 @@ def _trust_presigned_upload_origin(
     if policy is None:
         try:
             parsed = urlparse(upload_url)
-            host = (parsed.hostname or "").lower().rstrip(".")
+            host = canonical_url_host(upload_url)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("unsafe presigned upload URL") from exc
-        literal = _canonical_download_ip(host)
+        literal = _canonical_download_ip(host) if host is not None else None
         if (
             parsed.scheme not in {"http", "https"}
             or not host
@@ -1365,6 +1366,11 @@ def _trust_presigned_upload_origin(
             raise RuntimeError("unsafe presigned upload URL")
         return
     policy.trust_validated_upload_origin(upload_url)
+    if not policy.is_upload_url_trusted(upload_url):
+        logger.warning(
+            "Private presigned upload origin was rejected because "
+            "OCTO_ALLOW_PRIVATE_HOSTS is disabled"
+        )
 
 
 
@@ -1501,7 +1507,7 @@ def _validate_download_url(
     """Validate one download hop before any network I/O."""
     try:
         parsed = urlparse(url)
-        host = (parsed.hostname or "").lower().rstrip(".")
+        host = canonical_url_host(url)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("unsafe download URL") from exc
     if parsed.scheme not in {"http", "https"} or not host:

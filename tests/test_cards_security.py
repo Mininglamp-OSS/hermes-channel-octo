@@ -237,6 +237,35 @@ def test_automatic_error_summary_redacts_all_recognized_credentials(
     assert "[redacted]" in summary
 
 
+@pytest.mark.parametrize(
+    ("error", "credential"),
+    [
+        ("SecretAccessKey: unquoted-access-key", "unquoted-access-key"),
+        ("'SecretAccessKey': 'quoted-access-key'", "quoted-access-key"),
+        ("SecretAccessKey=assigned-access-key", "assigned-access-key"),
+        ("SessionToken: bare-session-token", "bare-session-token"),
+        ('"SessionToken": "quoted-session-token"', "quoted-session-token"),
+        ("SessionToken=assigned-session-token", "assigned-session-token"),
+        ("Credentials: unquoted-credentials", "unquoted-credentials"),
+        ("'Credentials': 'quoted-credentials'", "quoted-credentials"),
+        ("Credentials=assigned-credentials", "assigned-credentials"),
+    ],
+)
+def test_automatic_error_summary_redacts_aws_credential_field_variants(
+    error: str,
+    credential: str,
+) -> None:
+    summary = cards.sanitize_error_text(error)
+
+    assert credential not in summary
+    assert "[redacted]" in summary
+
+
+def test_automatic_error_summary_preserves_credential_word_in_prose() -> None:
+    error = "Credentials were unavailable after the remote service timed out"
+
+    assert cards.sanitize_error_text(error) == error
+
 def test_automatic_error_summary_preserves_noncredential_assignments() -> None:
     error = "worker failed: mode=debug retry_count=2"
 

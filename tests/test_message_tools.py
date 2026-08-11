@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from uuid import UUID
 
 import pytest
@@ -182,12 +182,14 @@ async def test_rich_text_tool_converts_structured_mentions_with_plain_offsets():
             ["u1"],
         )
     )
+    mention_uid_allowlist = AsyncMock(return_value={"u1"})
     adapter = SimpleNamespace(
         _api_url=_ADAPTER._api_url,
         _bot_token=_ADAPTER._bot_token,
         _cdn_url=_ADAPTER._cdn_url,
         on_behalf_of=_ADAPTER.on_behalf_of,
         _prepare_outbound_mentions=prepare_mentions,
+        _mention_uid_allowlist=mention_uid_allowlist,
     )
     upload = AsyncMock(
         return_value=("https://cdn.example/a.png", b"png", "image/png", "a.png")
@@ -212,11 +214,17 @@ async def test_rich_text_tool_converts_structured_mentions_with_plain_offsets():
         )
 
     assert result["ok"] is True
+    mention_uid_allowlist.assert_awaited_once_with(
+        _ROUTE.chat_id,
+        _ROUTE.channel_type,
+        http_session=session,
+    )
     prepare_mentions.assert_awaited_once_with(
         "@[u1:Alice] report",
         _ROUTE.chat_id,
         _ROUTE.channel_type,
-        http_session=session,
+        mention_uid_allowlist={"u1"},
+        log_filtered=False,
     )
     kwargs = send.await_args.kwargs
     assert kwargs["plain"] == "[图片]@Alice report"
@@ -226,6 +234,80 @@ async def test_rich_text_tool_converts_structured_mentions_with_plain_offsets():
         (entity.uid, entity.offset, entity.length)
         for entity in kwargs["mention_entities"]
     ] == [("u1", 4, 6)]
+
+
+@pytest.mark.asyncio
+async def test_rich_text_tool_deduplicates_mention_uids_across_text_blocks():
+    session = _Session()
+    prepare_mentions = AsyncMock(
+        side_effect=[
+            (
+                "@Alice one",
+                [MentionEntity(uid="u1", offset=0, length=6)],
+                ["u1"],
+            ),
+            (
+                "@Alice two",
+                [MentionEntity(uid="u1", offset=0, length=6)],
+                ["u1"],
+            ),
+        ]
+    )
+    mention_uid_allowlist = AsyncMock(return_value={"u1"})
+    adapter = SimpleNamespace(
+        _api_url=_ADAPTER._api_url,
+        _bot_token=_ADAPTER._bot_token,
+        _cdn_url=_ADAPTER._cdn_url,
+        on_behalf_of=_ADAPTER.on_behalf_of,
+        _prepare_outbound_mentions=prepare_mentions,
+        _mention_uid_allowlist=mention_uid_allowlist,
+    )
+    send = AsyncMock(return_value=SendMessageResult(message_id="rich-mention"))
+
+    with (
+        _tool_context(adapter, session),
+        patch.object(message_tools.api, "send_rich_text_message", send),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_rich_text_handler(
+                {
+                    "blocks": [
+                        {"type": "text", "text": "@[u1:Alice] one"},
+                        {"type": "text", "text": "@[u1:Alice] two"},
+                    ]
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    mention_uid_allowlist.assert_awaited_once_with(
+        _ROUTE.chat_id,
+        _ROUTE.channel_type,
+        http_session=session,
+    )
+    assert prepare_mentions.await_args_list == [
+        call(
+            "@[u1:Alice] one",
+            _ROUTE.chat_id,
+            _ROUTE.channel_type,
+            mention_uid_allowlist={"u1"},
+            log_filtered=False,
+        ),
+        call(
+            "@[u1:Alice] two",
+            _ROUTE.chat_id,
+            _ROUTE.channel_type,
+            mention_uid_allowlist={"u1"},
+            log_filtered=False,
+        ),
+    ]
+    kwargs = send.await_args.kwargs
+    assert [block.text for block in kwargs["blocks"]] == ["@Alice one", "@Alice two"]
+    assert kwargs["mention_uids"] == ["u1"]
+    assert [
+        (entity.uid, entity.offset, entity.length)
+        for entity in kwargs["mention_entities"]
+    ] == [("u1", 0, 6), ("u1", 10, 6)]
 
 @pytest.mark.asyncio
 async def test_rich_text_tool_delivers_surviving_blocks_after_one_image_fails():

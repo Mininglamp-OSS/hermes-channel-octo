@@ -14,6 +14,8 @@ import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
 
+from yarl import URL
+
 _METADATA_HOSTS = frozenset({
     "169.254.169.254",
     "fd00:ec2::254",
@@ -25,15 +27,15 @@ _METADATA_HOSTS = frozenset({
 
 
 def is_private_or_metadata_host(hostname: str) -> bool:
-    if not hostname:
+    normalized = _canonical_trust_host(hostname)
+    if not normalized:
         return True
-    lowered = hostname.lower()
-    if lowered in _METADATA_HOSTS:
+    if normalized in _METADATA_HOSTS:
         return True
-    if lowered.endswith((".local", ".internal", ".localhost")) or lowered == "localhost":
+    if normalized.endswith((".local", ".internal", ".localhost")) or normalized == "localhost":
         return True
     try:
-        ip = ipaddress.ip_address(lowered.strip("[]"))
+        ip = ipaddress.ip_address(normalized)
     except ValueError:
         return False
     return (
@@ -74,9 +76,26 @@ def _canonical_literal_ip(host: str) -> str | None:
             return None
 
 
-def _canonical_trust_host(host: str) -> str:
+def canonical_url_host(url: str) -> str | None:
+    """Return yarl-normalized, literal-canonicalized host for one URL."""
+    try:
+        host = URL(url).raw_host
+    except (TypeError, UnicodeError, ValueError):
+        return None
+    if not host:
+        return None
     normalized = host.lower().strip("[]").rstrip(".")
     return _canonical_literal_ip(normalized) or normalized
+
+
+def _canonical_trust_host(host: str) -> str:
+    normalized = host.strip("[]").rstrip(".")
+    try:
+        return canonical_url_host(
+            str(URL.build(scheme="http", host=normalized))
+        ) or normalized.lower()
+    except (TypeError, UnicodeError, ValueError):
+        return ""
 
 
 TransportOrigin = tuple[str, str, int]
@@ -88,7 +107,7 @@ def _canonical_origin(url: str) -> TransportOrigin | None:
     try:
         parsed = urlparse(url)
         scheme = parsed.scheme.lower()
-        host = _canonical_trust_host(parsed.hostname or "")
+        host = canonical_url_host(url)
         port = parsed.port
     except (TypeError, ValueError):
         return None
@@ -203,7 +222,7 @@ class SSRFGuardResolver(AbstractResolver):
         port: int = 0,
         family: socket.AddressFamily = socket.AF_INET,
     ) -> list[ResolveResult]:
-        normalized = host.lower().rstrip(".")
+        normalized = _canonical_trust_host(host)
         if normalized in _METADATA_HOSTS:
             raise OSError(f"unsafe host blocked by SSRF guard: {normalized}")
         trusted = self.policy.is_connection_trusted(normalized, port)
@@ -295,7 +314,7 @@ class SSRFGuardConnector(aiohttp.TCPConnector):
         return self._resolver_closed
 
     async def _resolve_host(self, host: str, port: int, traces: Any = None) -> list[ResolveResult]:
-        normalized = host.lower().strip("[]").rstrip(".")
+        normalized = _canonical_trust_host(host)
         trusted = self.policy.is_connection_trusted(normalized, port)
         literal = _canonical_literal_ip(normalized)
         if normalized in _METADATA_HOSTS:

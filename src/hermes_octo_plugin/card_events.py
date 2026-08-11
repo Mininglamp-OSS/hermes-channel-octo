@@ -934,13 +934,28 @@ class EventPoller:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             self._consecutive_errors += 1
             exponent = min(self._consecutive_errors - 1, 30)
-            return min(
+            delay = min(
                 MAX_EVENT_BACKOFF_SECONDS,
                 self._interval_seconds * (2**exponent),
             )
+            previous_delay = (
+                min(
+                    MAX_EVENT_BACKOFF_SECONDS,
+                    self._interval_seconds * (2 ** min(exponent - 1, 30)),
+                )
+                if self._consecutive_errors > 1
+                else None
+            )
+            if previous_delay is None or delay > previous_delay:
+                logger.warning(
+                    "Octo event polling failed (%s); retrying in %.1f seconds",
+                    type(exc).__name__,
+                    delay,
+                )
+            return delay
 
     async def run(self) -> None:
         await self.initialize()

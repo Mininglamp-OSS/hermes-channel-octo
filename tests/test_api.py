@@ -395,6 +395,7 @@ class TestApiFailureTruth:
         "unsafe_url",
         [
             "http://127.0.0.1/private",
+            "http://①②⑦.0.0.1/private",
             "http://2130706433/private",
             "http://169.254.169.254/latest/meta-data/",
             "http://metadata.google.internal/computeMetadata/v1/",
@@ -474,6 +475,24 @@ class TestApiFailureTruth:
             await download_file(
                 session,
                 "http://storage.example:443/private",
+                policy=policy,
+            )
+
+        session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_unicode_loopback_alias_on_opposite_scheme(
+        self,
+    ):
+        session = MagicMock()
+        session.get = MagicMock(side_effect=AssertionError("network I/O attempted"))
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"http://127.0.0.1:443"})
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(
+                session,
+                "https://①②⑦.0.0.1:443/private",
                 policy=policy,
             )
 

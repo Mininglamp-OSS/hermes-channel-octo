@@ -103,7 +103,7 @@ async def test_concurrent_connect_calls_never_overlap_handshakes():
 
 
 @pytest.mark.asyncio
-async def test_cold_connect_failure_closes_partial_transport_resources():
+async def test_cold_connect_failure_closes_partial_transport_resources(caplog):
     a = _make_adapter()
     a._http_session = None
     a._reconnect_task = None
@@ -115,7 +115,9 @@ async def test_cold_connect_failure_closes_partial_transport_resources():
     a._mark_disconnected = MagicMock()
     session = MagicMock()
     session.close = AsyncMock()
-    a._do_connect = AsyncMock(side_effect=RuntimeError("handshake failed"))  # type: ignore[method-assign]
+    a._do_connect = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Authorization=Bearer secret-connect-token")
+    )
 
     with patch(
         "hermes_octo_plugin.adapter.aiohttp.ClientSession",
@@ -125,6 +127,9 @@ async def test_cold_connect_failure_closes_partial_transport_resources():
 
     session.close.assert_awaited_once()
     assert a._http_session is None
+    assert "secret-connect-token" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
 
 
 @pytest.mark.asyncio
@@ -425,7 +430,7 @@ async def test_repeated_disconnect_cancellation_cannot_cancel_transport_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_reconnect_reschedules_on_connect_failure():
+async def test_reconnect_reschedules_on_connect_failure(caplog):
     """When _do_connect raises, a fresh reconnect task is spawned."""
     a = _make_adapter()
     calls = 0
@@ -434,7 +439,7 @@ async def test_reconnect_reschedules_on_connect_failure():
         nonlocal calls
         calls += 1
         if calls < 2:
-            raise RuntimeError("simulated failure")
+            raise RuntimeError("SessionToken=secret-reconnect-token")
 
     a._do_connect = flaky_connect  # type: ignore[method-assign]
 
@@ -460,6 +465,8 @@ async def test_reconnect_reschedules_on_connect_failure():
             await t
 
     assert calls >= 2, "failure should trigger a retry"
+    assert "secret-reconnect-token" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio

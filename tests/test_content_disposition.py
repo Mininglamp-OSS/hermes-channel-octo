@@ -1,8 +1,10 @@
 """Backend-agnostic presigned media upload and filename decoding contracts."""
 
-import pytest
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
+
+import pytest
 
 from hermes_octo_plugin.api import (
     download_file,
@@ -249,6 +251,87 @@ class TestPresignedUpload:
                 )
 
         put_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_private_presign_rejection_logs_safe_opt_in_diagnostic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        upload_url = (
+            "http://127.0.0.1:9000/upload"
+            "?X-Amz-Signature=top-secret&X-Amz-Credential=bot-token"
+        )
+        presign = {
+            "uploadUrl": upload_url,
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        session = MagicMock()
+        policy = TransportPolicy({"https://api.example"})
+        caplog.set_level(logging.WARNING, logger="hermes_octo_plugin.api")
+
+        with patch(
+            "hermes_octo_plugin.api.get_upload_presign",
+            AsyncMock(return_value=presign),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    session,
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        assert caplog.messages == [
+            "Private presigned upload origin was rejected because "
+            "OCTO_ALLOW_PRIVATE_HOSTS is disabled"
+        ]
+        assert upload_url not in caplog.text
+        assert "127.0.0.1" not in caplog.text
+        assert "top-secret" not in caplog.text
+        session.put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unicode_loopback_presign_requires_private_host_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        upload_url = "http://①②⑦.0.0.1:9000/upload?X-Amz-Signature=top-secret"
+        presign = {
+            "uploadUrl": upload_url,
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        session = MagicMock()
+        policy = TransportPolicy({"https://api.example"})
+
+        with patch(
+            "hermes_octo_plugin.api.get_upload_presign",
+            AsyncMock(return_value=presign),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    session,
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        assert policy.is_upload_url_trusted(upload_url) is False
+        session.put.assert_not_called()
 
 
     @pytest.mark.asyncio

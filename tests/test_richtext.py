@@ -375,7 +375,7 @@ class TestSendImageWithCaption:
         a = _make_adapter_with_api()
         a._http_session = MagicMock()
         a._bot_token = "tok"
-        a._chat_kind = {"G1": "group"}
+        a._chat_kind = {"G1": ChannelType.Group}
 
         # parse_image_dimensions returns None (bad header, unsupported format,
         # etc.) — must NOT go the RichText path.
@@ -712,6 +712,11 @@ class TestSendImageCaptionMentions:
                    new_callable=AsyncMock, return_value=(b"", "image/jpeg", "y.png")), \
              patch("hermes_octo_plugin.adapter.api.parse_image_dimensions",
                    return_value=(200, 100)), \
+             patch(
+                 "hermes_octo_plugin.adapter.api.get_group_members",
+                 new_callable=AsyncMock,
+                 return_value=[GroupMember(uid="u1", name="Alice", robot=False)],
+             ), \
              patch("hermes_octo_plugin.adapter.api.upload_and_get_url",
                    new_callable=AsyncMock, return_value="https://cdn/y.png"), \
              patch("hermes_octo_plugin.adapter.api.send_rich_text_message",

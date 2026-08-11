@@ -567,6 +567,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 if not _valid_target_channel_id(channel_id, channel_type):
                     return _err("invalid target channel id")
 
+                # The permission callback's roster also authorizes mentions;
+                # do not introduce a second, potentially divergent lookup.
                 target_member_uids: set[str] | None = None
 
                 async def _fetch_members(group_no: str):
@@ -593,6 +595,20 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     return _err(pres.reason or "permission denied")
 
                 raw_mention_uids = args.get("mention_uids")
+                mention_all = bool(args.get("mention_all") or False)
+                mentions_requested = mention_all or (
+                    isinstance(raw_mention_uids, list) and bool(raw_mention_uids)
+                )
+                if (
+                    channel_type
+                    in (ChannelType.Group, ChannelType.CommunityTopic)
+                    and mentions_requested
+                    and target_member_uids is None
+                ):
+                    return _err(
+                        "Unable to verify target members for requested mentions"
+                    )
+
                 mention_uids = (
                     [
                         uid
@@ -605,7 +621,6 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     else None
                 )
                 mention_uids = mention_uids or None
-                mention_all = bool(args.get("mention_all") or False)
                 # @mentions only make sense in group / thread channels.
                 if channel_type == ChannelType.DM:
                     mention_uids = None

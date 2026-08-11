@@ -225,6 +225,26 @@ async def test_http_session_trusts_configured_private_origins_only_with_opt_in(
     await resolver.close()
 
 
+def test_transport_policy_normalizes_public_idn_and_private_host_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    public_policy = TransportPolicy({"https://bücher.example"})
+
+    assert public_policy.is_download_url_trusted(
+        "https://xn--bcher-kva.example/report.bin"
+    )
+
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+    self_hosted_policy = TransportPolicy({"http://127.0.0.1:8443"})
+
+    assert self_hosted_policy.is_download_url_trusted(
+        "http://①②⑦.0.0.1:8443/report.bin"
+    )
+    assert not self_hosted_policy.is_download_url_trusted(
+        "https://①②⑦.0.0.1:8443/report.bin"
+    )
+
+
 @pytest.mark.asyncio
 async def test_ssrf_resolver_rejects_metadata_hostname_before_dns():
     resolver = _SSRFGuardResolver(
@@ -242,7 +262,7 @@ async def test_ssrf_resolver_rejects_metadata_hostname_before_dns():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "host",
-    ["127.0.0.1", "2130706433", "127.1", "0177.0.0.1"],
+    ["127.0.0.1", "①②⑦.0.0.1", "2130706433", "127.1", "0177.0.0.1"],
 )
 async def test_ssrf_connector_blocks_literal_and_legacy_loopback_before_aiohttp_bypass(
     host: str,
@@ -659,6 +679,7 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
     adapter._chat_kind = {"s14_user-1": ChannelType.DM}
     adapter._space_dm_targets = {"s14_user-1": "user-1"}
 
+    get_members = AsyncMock()
     with (
         patch.object(
             api,
@@ -671,6 +692,7 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
             "upload_and_get_url",
             AsyncMock(return_value="https://cdn.example/uploaded"),
         ),
+        patch.object(api, "get_group_members", get_members),
         patch.object(api, "send_media_message", AsyncMock()) as send_media,
         patch.object(api, "send_message", AsyncMock()) as send_text,
     ):
@@ -712,6 +734,7 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
     assert video_call.kwargs["height"] == 720
     assert video_call.kwargs["duration"] == 12
 
+    get_members.assert_not_awaited()
     assert [call.kwargs["content"] for call in send_text.await_args_list] == [
         "@Alice image caption", "@Alice file caption",
         "@Alice voice caption", "@Alice video caption",
@@ -720,8 +743,57 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
         assert call.kwargs["channel_id"] == "user-1"
         assert call.kwargs["channel_type"] == ChannelType.DM
         assert call.kwargs["reply_msg_id"] == "parent-message"
-        assert call.kwargs["mention_uids"] == ["u1"]
-        assert [entity.uid for entity in call.kwargs["mention_entities"]] == ["u1"]
+        assert call.kwargs["mention_uids"] == []
+        assert call.kwargs["mention_entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_group_image_caption_uses_adapter_session_for_fresh_mention_roster():
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    adapter._chat_kind = {"group-1": ChannelType.Group}
+    get_members = AsyncMock(
+        return_value=[SimpleNamespace(uid="member-1", name="Member")]
+    )
+    send_media = AsyncMock(
+        return_value=SimpleNamespace(
+            message_id="media-1",
+            message_seq=None,
+            client_msg_no=None,
+        )
+    )
+    send_text = AsyncMock()
+
+    with (
+        patch.object(
+            api,
+            "upload_and_get_url",
+            AsyncMock(return_value="https://cdn.example/uploaded"),
+        ),
+        patch.object(api, "parse_image_dimensions", return_value=None),
+        patch.object(api, "get_group_members", get_members),
+        patch.object(api, "send_media_message", send_media),
+        patch.object(api, "send_message", send_text),
+    ):
+        result = await adapter.send_image(
+            "group-1",
+            "data:image/png;base64,bWVkaWE=",
+            caption="@[member-1:Member]",
+        )
+
+    assert result.success is True
+    get_members.assert_awaited_once_with(
+        adapter._http_session,
+        "https://api.example.invalid",
+        "test-token",
+        "group-1",
+    )
+    caption = send_text.await_args.kwargs
+    assert caption["content"] == "@Member"
+    assert caption["mention_uids"] == ["member-1"]
+    assert [entity.uid for entity in caption["mention_entities"]] == ["member-1"]
 
 
 @pytest.mark.asyncio
@@ -843,7 +915,7 @@ async def test_native_document_rejects_unsafe_explicit_filename(
                     "report.txt",
                 )
             ),
-        ),
+        ) as load,
         patch.object(api, "upload_and_get_url", upload),
         patch.object(api, "send_media_message", send),
     ):
@@ -856,6 +928,8 @@ async def test_native_document_rejects_unsafe_explicit_filename(
     assert result.success is False
     assert result.error == "media filename is invalid"
     upload.assert_not_awaited()
+    load.assert_not_awaited()
+
     send.assert_not_awaited()
 
 
@@ -1105,20 +1179,69 @@ async def test_guarded_download_failure_never_forwards_remote_media_url():
 async def test_native_media_failure_redacts_signed_source_from_result_and_logs(caplog):
     adapter = make_bare_adapter()
     adapter.platform = SimpleNamespace(value="octo")
+    adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
     source = "https://source.example/image.png?token=signed-secret"
+    download = AsyncMock(side_effect=RuntimeError(f"rejected {source}"))
 
     with (
-        patch.object(
-            api,
-            "download_file",
-            AsyncMock(side_effect=RuntimeError(f"rejected {source}")),
-        ),
+        patch.object(api, "download_file", download),
         patch.object(api, "send_media_message", AsyncMock()),
     ):
         result = await adapter.send_image("group-1", source)
 
     assert result.success is False
+    assert "rejected https://source.example/image.png" in (result.error or "")
     assert source not in (result.error or "")
+    assert "signed-secret" not in (result.error or "")
+    assert source not in caplog.text
     assert "signed-secret" not in caplog.text
+    download.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_normal_send_failure_redacts_signed_error_and_keeps_retryability(caplog):
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    source = "https://source.example/message?SessionToken=signed-secret"
+    send = AsyncMock(side_effect=RuntimeError(f"timeout while sending {source}"))
+
+    with patch.object(api, "send_message", send):
+        result = await adapter.send("group-1", "message")
+
+    assert result.success is False
+    assert result.retryable is True
+    assert "timeout while sending https://source.example/message" in (result.error or "")
+    assert source not in (result.error or "")
+    assert "signed-secret" not in (result.error or "")
+    assert source not in caplog.text
+    assert "signed-secret" not in caplog.text
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["send_document", "send_voice", "send_video"])
+async def test_native_media_send_failures_redact_signed_errors(
+    caplog,
+    method_name: str,
+) -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    source = "https://source.example/media?Credentials=signed-secret"
+    load = AsyncMock(side_effect=RuntimeError(f"rejected {source}"))
+
+    with patch.object(adapter, "_load_outbound_media", load):
+        result = await getattr(adapter, method_name)("group-1", source)
+
+    assert result.success is False
+    assert "rejected https://source.example/media" in (result.error or "")
+    assert source not in (result.error or "")
+    assert "signed-secret" not in (result.error or "")
+    assert source not in caplog.text
+    assert "signed-secret" not in caplog.text
+    load.assert_awaited_once_with(source)

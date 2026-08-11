@@ -1135,8 +1135,8 @@ class OctoAdapter(BasePlatformAdapter):
             if cancellation is not None:
                 raise cancellation
             raise
-        except Exception as e:
-            logger.error("[%s] Connection failed: %s", self.name, e)
+        except Exception as exc:
+            logger.error("[%s] Connection failed (%s)", self.name, type(exc).__name__)
             cancellation = await self._finalize_disconnect_resources_shielded()
             if cancellation is not None:
                 raise cancellation
@@ -3701,8 +3701,8 @@ class OctoAdapter(BasePlatformAdapter):
                         self._ws = None
                     self._temp_buffer = bytearray()
                     await self._do_connect()
-            except Exception as e:
-                logger.error("[%s] Reconnection failed: %s", self.name, e)
+            except Exception as exc:
+                logger.error("[%s] Reconnection failed (%s)", self.name, type(exc).__name__)
                 if self._need_reconnect:
                     # Reset the in-progress flag BEFORE re-scheduling so the
                     # next attempt's dedup check sees a clear lane.
@@ -3857,10 +3857,10 @@ class OctoAdapter(BasePlatformAdapter):
         channel_type: ChannelType,
         *,
         http_session: aiohttp.ClientSession | None = None,
-    ) -> set[str] | None:
-        """Resolve the authoritative parent-group member UID allowlist."""
+    ) -> set[str]:
+        """Resolve verified group members; non-group mentions are inert."""
         if channel_type not in _GROUP_CHANNEL_TYPES:
-            return None
+            return set()
         parent_group_no = chat_id.split("____", 1)[0]
         if http_session is not None:
             try:
@@ -3895,23 +3895,27 @@ class OctoAdapter(BasePlatformAdapter):
         channel_type: ChannelType,
         *,
         http_session: aiohttp.ClientSession | None = None,
+        mention_uid_allowlist: set[str] | None = None,
+        log_filtered: bool = True,
     ) -> tuple[str, list[Any] | None, list[str] | None]:
         """Convert one unfragmented outbound string into Octo mention fields."""
         structured = parse_structured_mentions(content)
         if not structured:
             return content, None, None
-        valid_uids = await self._mention_uid_allowlist(
-            chat_id,
-            channel_type,
-            http_session=http_session,
-        )
+        valid_uids = mention_uid_allowlist
+        if valid_uids is None:
+            valid_uids = await self._mention_uid_allowlist(
+                chat_id,
+                channel_type,
+                http_session=http_session,
+            )
         send_content, send_entities, send_uids = convert_structured_mentions(
             content,
             structured,
             valid_uids,
         )
         filtered = len(structured) - len(send_uids)
-        if filtered:
+        if filtered and log_filtered:
             logger.warning(
                 "[%s] filtered %d unverified mention(s)",
                 self.name,
@@ -3962,6 +3966,7 @@ class OctoAdapter(BasePlatformAdapter):
                 valid_uids = await self._mention_uid_allowlist(
                     chat_id,
                     channel_type,
+                    http_session=self._http_session,
                 )
 
             prepared_chunks: list[
@@ -4016,12 +4021,17 @@ class OctoAdapter(BasePlatformAdapter):
                     error="Octo send response missing message_id",
                 )
             return _delivery_result(last_send_result)
-        except Exception as e:
-            logger.error("[%s] Send failed: %s", self.name, e)
+        except Exception as exc:
+            raw_error = str(exc)
+            error = cards.sanitize_error_text(raw_error)
+            retryable = (
+                "connect" in raw_error.lower() or "timeout" in raw_error.lower()
+            )
+            logger.error("[%s] Send failed: %s", self.name, error)
             return SendResult(
                 success=False,
-                error=str(e),
-                retryable="connect" in str(e).lower() or "timeout" in str(e).lower(),
+                error=error,
+                retryable=retryable,
             )
 
     async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
@@ -4094,6 +4104,7 @@ class OctoAdapter(BasePlatformAdapter):
                         caption,
                         chat_id,
                         channel_type,
+                        http_session=self._http_session,
                     )
                 )
             file_data, content_type, filename = await self._load_outbound_media(
@@ -4180,9 +4191,10 @@ class OctoAdapter(BasePlatformAdapter):
                     on_behalf_of=self.on_behalf_of,
                 )
             return _delivery_result(send_result)
-        except Exception as e:
-            logger.error("[%s] send_image failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        except Exception as exc:
+            error = cards.sanitize_error_text(str(exc))
+            logger.error("[%s] send_image failed: %s", self.name, error)
+            return SendResult(success=False, error=error)
 
     async def send_document(
         self,
@@ -4196,6 +4208,11 @@ class OctoAdapter(BasePlatformAdapter):
         if not self._http_session:
             return SendResult(success=False, error="Not connected")
         try:
+            validated_explicit_filename = (
+                _validated_media_filename(file_name)
+                if file_name is not None
+                else None
+            )
             metadata = _merged_media_metadata(kwargs)
             channel_type = self._resolve_channel_type(chat_id, metadata)
             _media_metadata_fields(metadata, allowed=frozenset(), media_name="file")
@@ -4209,13 +4226,18 @@ class OctoAdapter(BasePlatformAdapter):
                         caption,
                         chat_id,
                         channel_type,
+                        http_session=self._http_session,
                     )
                 )
             file_data, content_type, filename = await self._load_outbound_media(
                 file_path
             )
 
-            selected_filename = file_name if file_name is not None else filename
+            selected_filename = (
+                validated_explicit_filename
+                if validated_explicit_filename is not None
+                else filename
+            )
             filename = _validated_media_filename(selected_filename)
 
             uploaded_url = await api.upload_and_get_url(
@@ -4258,9 +4280,10 @@ class OctoAdapter(BasePlatformAdapter):
                     on_behalf_of=self.on_behalf_of,
                 )
             return _delivery_result(send_result)
-        except Exception as e:
-            logger.error("[%s] send_document failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        except Exception as exc:
+            error = cards.sanitize_error_text(str(exc))
+            logger.error("[%s] send_document failed: %s", self.name, error)
+            return SendResult(success=False, error=error)
 
     async def send_voice(
         self,
@@ -4288,6 +4311,7 @@ class OctoAdapter(BasePlatformAdapter):
                         caption,
                         chat_id,
                         channel_type,
+                        http_session=self._http_session,
                     )
                 )
             file_data, content_type, filename = await self._load_outbound_media(
@@ -4334,9 +4358,10 @@ class OctoAdapter(BasePlatformAdapter):
                     on_behalf_of=self.on_behalf_of,
                 )
             return _delivery_result(send_result)
-        except Exception as e:
-            logger.error("[%s] send_voice failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        except Exception as exc:
+            error = cards.sanitize_error_text(str(exc))
+            logger.error("[%s] send_voice failed: %s", self.name, error)
+            return SendResult(success=False, error=error)
 
     async def send_video(
         self,
@@ -4366,6 +4391,7 @@ class OctoAdapter(BasePlatformAdapter):
                         caption,
                         chat_id,
                         channel_type,
+                        http_session=self._http_session,
                     )
                 )
             file_data, content_type, filename = await self._load_outbound_media(
@@ -4414,9 +4440,10 @@ class OctoAdapter(BasePlatformAdapter):
                     on_behalf_of=self.on_behalf_of,
                 )
             return _delivery_result(send_result)
-        except Exception as e:
-            logger.error("[%s] send_video failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        except Exception as exc:
+            error = cards.sanitize_error_text(str(exc))
+            logger.error("[%s] send_video failed: %s", self.name, error)
+            return SendResult(success=False, error=error)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         if not self._http_session:

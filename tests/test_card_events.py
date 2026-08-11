@@ -358,6 +358,38 @@ async def test_long_poll_immediate_empty_and_errors_are_paced_not_hot_loop() -> 
 
 
 @pytest.mark.asyncio
+async def test_poller_backoff_warnings_are_bounded_and_do_not_leak_errors(
+    caplog,
+) -> None:
+    poller = card_events.EventPoller(
+        session=object(),
+        api_url="https://api.example.invalid",
+        bot_token="test-token",
+        cursor_store=_MemoryCursor(),
+        on_card_action=AsyncMock(),
+        interval_seconds=8,
+        wait_seconds=0,
+    )
+    failure = RuntimeError("https://private.example/upload?signature=secret")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="hermes_octo_plugin.card_events"),
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(side_effect=failure),
+        ),
+    ):
+        assert [await poller.poll_once() for _ in range(4)] == [8, 16, 30, 30]
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Octo event polling failed (RuntimeError); retrying in 8.0 seconds",
+        "Octo event polling failed (RuntimeError); retrying in 16.0 seconds",
+        "Octo event polling failed (RuntimeError); retrying in 30.0 seconds",
+    ]
+    assert "https://private.example/upload?signature=secret" not in caplog.text
+
+@pytest.mark.asyncio
 async def test_backoff_saturates_without_large_exponent_overflow() -> None:
     poller = card_events.EventPoller(
         session=object(),

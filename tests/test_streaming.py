@@ -95,21 +95,36 @@ async def test_explicit_reply_still_quotes_target_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_send_converts_mention_and_preserves_trailing_text() -> None:
+async def test_complete_send_uses_fresh_group_roster_for_mentions() -> None:
     adapter = _make_adapter()
     adapter._chat_kind["chatA"] = ChannelType.Group
-    adapter._group_member_rosters["chatA"] = {"member-1": "成员"}
-    adapter._group_robot_map["chatA"] = {"member-1": False}
+    adapter._group_member_rosters["chatA"] = {"stale-member": "过期成员"}
+    adapter._group_robot_map["chatA"] = {"stale-member": False}
     adapter._group_cache_timestamps["chatA"] = 2**63
     complete = "结果：@[member-1:成员]，尾部完整。"
+    get_members = AsyncMock(
+        return_value=[GroupMember(uid="member-1", name="成员", robot=False)]
+    )
 
-    with patch(
-        "hermes_octo_plugin.adapter.api.send_message",
-        new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
-    ) as send_message:
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
         result = await adapter.send("chatA", complete)
 
     assert result.success is True
+    get_members.assert_awaited_once_with(
+        adapter._http_session,
+        "https://example.test",
+        "tok",
+        "chatA",
+    )
     send_call = send_message.await_args
     assert send_call is not None
     kwargs = send_call.kwargs
@@ -270,6 +285,32 @@ async def test_unusable_group_roster_sends_inert_mention(
     assert result.success is True
     kwargs = send_message.await_args.kwargs
     assert kwargs["content"] == "@成员"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_dm_structured_mention_is_inert_without_roster_lookup() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["user-1"] = ChannelType.DM
+    get_members = AsyncMock()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("user-1", "@[arbitrary-uid:Alice]")
+
+    assert result.success is True
+    get_members.assert_not_awaited()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@Alice"
     assert kwargs["mention_uids"] == []
     assert kwargs["mention_entities"] == []
 

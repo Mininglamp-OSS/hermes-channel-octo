@@ -484,6 +484,39 @@ async def test_management_send_filters_mentions_to_authoritative_target_roster()
     assert send_message.await_args.kwargs["mention_uids"] == ["member-1"]
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    ["group:group-1", "group:group-1____thread-1"],
+)
+async def test_management_send_fails_closed_when_permission_skips_requested_roster(
+    target: str,
+) -> None:
+    permission = AsyncMock(return_value=SimpleNamespace(allowed=True, reason=None))
+    send_message = AsyncMock()
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(agent_tools, "check_permission", permission),
+        patch.object(agent_tools.api, "send_message", send_message),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("send-message"),
+                    "target": target,
+                    "requester_uid": "owner-uid",
+                    "mention_uids": ["member-1"],
+                }
+            )
+        )
+
+    assert result == {
+        "error": "Unable to verify target members for requested mentions"
+    }
+    send_message.assert_not_awaited()
+
 @pytest.mark.asyncio
 async def test_thread_send_does_not_bypass_owner_only_join_permission():
     join_thread = AsyncMock()
