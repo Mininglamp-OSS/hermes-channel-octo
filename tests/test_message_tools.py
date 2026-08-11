@@ -15,10 +15,11 @@ from hermes_octo_plugin.card_tools import TrustedOctoRoute
 from hermes_octo_plugin.types import (
     CardProfileManifest,
     ChannelType,
+    GroupMember,
     MessageType,
     SendMessageResult,
 )
-
+from tests.conftest import make_bare_adapter
 
 class _Session:
     async def __aenter__(self):
@@ -41,6 +42,9 @@ _ADAPTER = SimpleNamespace(
     _cdn_url="https://cdn.octo.invalid/assets",
     on_behalf_of="grantor-1",
     _card_profile_cache=message_tools.cards.CardProfileCache(),
+    _prepare_outbound_mentions=AsyncMock(
+        side_effect=lambda content, *_args, **_kwargs: (content, None, None)
+    ),
 )
 _CARD_SESSIONS = MagicMock()
 _CARD_SESSIONS.claim_edit.return_value = 1
@@ -60,18 +64,20 @@ _MANIFEST = CardProfileManifest(
 
 
 @contextmanager
-def _tool_context():
+def _tool_context(
+    adapter: SimpleNamespace = _ADAPTER,
+    session: _Session | None = None,
+):
     with (
-        patch.object(message_tools, "_resolve_adapter", return_value=_ADAPTER),
+        patch.object(message_tools, "_resolve_adapter", return_value=adapter),
         patch.object(message_tools, "_trusted_route", return_value=_ROUTE),
         patch.object(
             message_tools,
             "_new_guarded_http_session",
-            return_value=_Session(),
+            return_value=session or _Session(),
         ),
     ):
         yield
-
 
 def test_message_tool_schemas_expose_no_model_controlled_route_or_identity():
     schemas = message_tools.MESSAGE_TOOL_SCHEMAS
@@ -401,6 +407,56 @@ async def test_image_tool_routes_verified_remote_media_to_current_conversation()
         client_msg_no=ANY,
         on_behalf_of="grantor-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_media_tool_converts_caption_mentions_for_current_route():
+    tool_session = _Session()
+    roster = AsyncMock(
+        return_value=[GroupMember(uid="u1", name="Alice", robot=False)]
+    )
+    adapter = make_bare_adapter()
+    adapter._api_url = _ADAPTER._api_url
+    adapter._bot_token = _ADAPTER._bot_token
+    adapter._cdn_url = _ADAPTER._cdn_url
+    adapter._on_behalf_of = _ADAPTER.on_behalf_of
+    adapter._http_session = object()
+    download = AsyncMock(
+        return_value=(b"document", "application/octet-stream", "report.bin")
+    )
+    upload = AsyncMock(return_value="https://cdn.example/report.bin")
+    send_media = AsyncMock(
+        return_value=SendMessageResult(message_id="media-caption")
+    )
+    send_caption = AsyncMock()
+    with (
+        _tool_context(adapter, tool_session),
+        patch.object(message_tools.api, "get_group_members", roster),
+        patch.object(message_tools.api, "download_file", download),
+        patch.object(message_tools.api, "upload_and_get_url", upload),
+        patch.object(message_tools.api, "send_media_message", send_media),
+        patch.object(message_tools.api, "send_message", send_caption),
+    ):
+        result = json.loads(
+            await message_tools.octo_send_file_handler(
+                {
+                    "source": "https://public.example/report.bin",
+                    "caption": "@[u1:Alice] report",
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    roster.assert_awaited_once_with(
+        tool_session,
+        _ADAPTER._api_url,
+        _ADAPTER._bot_token,
+        _ROUTE.chat_id,
+    )
+    kwargs = send_caption.await_args.kwargs
+    assert kwargs["content"] == "@Alice report"
+    assert kwargs["mention_uids"] == ["u1"]
+    assert [entity.uid for entity in kwargs["mention_entities"]] == ["u1"]
 
 
 @pytest.mark.asyncio

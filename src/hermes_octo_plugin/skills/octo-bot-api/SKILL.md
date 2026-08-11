@@ -14,7 +14,7 @@ Connect an AI Agent to Octo messaging platform with full real-time capabilities.
 When you (the agent) need to deliver a message on the `octo` platform, **always use `octo_management(action="send-message")` instead of the generic `send_message` tool**.
 
 Reasons:
-- Octo channel IDs are 32-char hex strings (e.g. `a44a7f3c2c214a63be8a86c9a6c1dd4a`) and thread IDs use the `{group_no}____{short_id}` composite form. The core `send_message` dispatcher does not parse these formats — calls silently fall back to the bot's home channel and return `success: true` with a synthetic `octo-buf-*` message ID, so the message never reaches the intended recipient.
+- Octo channel IDs are 32-char hex strings (e.g. `a44a7f3c2c214a63be8a86c9a6c1dd4a`) and thread IDs use the `{group_no}____{short_id}` composite form. The generic dispatcher does not expose the plugin's destination parser or its permission, reply, and mention controls, so target-shaped strings do not carry the same Octo routing contract.
 - `octo_management(action="send-message")` parses targets via the plugin's own `parse_target()`, performs permission checks, supports `reply_to_message_id` / `mention_uids` / `mention_all`, and returns the real server-assigned message ID. Sending never changes Thread membership; use the explicit `join-thread` / `leave-thread` actions when needed.
 
 ### Quick Reference

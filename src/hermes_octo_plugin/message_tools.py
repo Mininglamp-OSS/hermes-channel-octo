@@ -365,10 +365,22 @@ async def _send_media(
             not isinstance(caption, str) or len(caption) > _MAX_TEXT_CHARS
         ):
             raise ValueError("caption must be bounded text")
+        caption_text = caption
+        caption_entities: list[Any] | None = None
+        caption_uids: list[str] | None = None
         async with _new_guarded_http_session(
             adapter._api_url,
             adapter._cdn_url,
         ) as session:
+            if caption:
+                caption_text, caption_entities, caption_uids = (
+                    await adapter._prepare_outbound_mentions(
+                        caption,
+                        route.chat_id,
+                        route.channel_type,
+                        http_session=session,
+                    )
+                )
             uploaded_url, data, content_type, detected_name = await _upload_media(
                 session, adapter, args.get("source"), media_kind=media_kind
             )
@@ -407,8 +419,10 @@ async def _send_media(
                     adapter._bot_token,
                     channel_id=route.channel_id,
                     channel_type=route.channel_type,
-                    content=caption,
+                    content=caption_text,
                     reply_msg_id=args.get("reply_to_message_id") or None,
+                    mention_uids=caption_uids,
+                    mention_entities=caption_entities,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=adapter.on_behalf_of,
                 )

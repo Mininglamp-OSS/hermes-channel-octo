@@ -3840,20 +3840,69 @@ class OctoAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         channel_type: ChannelType,
+        *,
+        http_session: aiohttp.ClientSession | None = None,
     ) -> set[str] | None:
         """Resolve the authoritative parent-group member UID allowlist."""
         if channel_type not in _GROUP_CHANNEL_TYPES:
             return None
         parent_group_no = chat_id.split("____", 1)[0]
-        await self._refresh_group_member_cache(parent_group_no)
-        member_map = self._group_robot_map.get(parent_group_no) or {}
-        valid_uids = {
+        if http_session is not None:
+            try:
+                members = await api.get_group_members(
+                    http_session,
+                    self._api_url,
+                    self._bot_token,
+                    parent_group_no,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] Group member roster fetch failed (%s)",
+                    self.name,
+                    type(exc).__name__,
+                )
+                members = []
+            member_uids = (member.uid for member in members)
+        else:
+            await self._refresh_group_member_cache(parent_group_no)
+            member_uids = iter(self._group_robot_map.get(parent_group_no) or {})
+        return {
             uid
-            for uid in member_map
+            for uid in member_uids
             if isinstance(uid, str)
             and STRUCTURED_MENTION_UID_PATTERN.fullmatch(uid) is not None
         }
-        return valid_uids
+
+    async def _prepare_outbound_mentions(
+        self,
+        content: str,
+        chat_id: str,
+        channel_type: ChannelType,
+        *,
+        http_session: aiohttp.ClientSession | None = None,
+    ) -> tuple[str, list[Any] | None, list[str] | None]:
+        """Convert one unfragmented outbound string into Octo mention fields."""
+        structured = parse_structured_mentions(content)
+        if not structured:
+            return content, None, None
+        valid_uids = await self._mention_uid_allowlist(
+            chat_id,
+            channel_type,
+            http_session=http_session,
+        )
+        send_content, send_entities, send_uids = convert_structured_mentions(
+            content,
+            structured,
+            valid_uids,
+        )
+        filtered = len(structured) - len(send_uids)
+        if filtered:
+            logger.warning(
+                "[%s] filtered %d unverified mention(s)",
+                self.name,
+                filtered,
+            )
+        return send_content, send_entities, send_uids
 
     async def _send_normal(
         self,
@@ -4025,26 +4074,13 @@ class OctoAdapter(BasePlatformAdapter):
             send_uids: list[str] | None = None
             send_entities: list[Any] | None = None
             if caption:
-                structured = parse_structured_mentions(caption)
-                if structured:
-                    valid_uids = await self._mention_uid_allowlist(
+                caption_text, send_entities, send_uids = (
+                    await self._prepare_outbound_mentions(
+                        caption,
                         chat_id,
                         channel_type,
                     )
-                    caption_text, send_entities, send_uids = (
-                        convert_structured_mentions(
-                            caption,
-                            structured,
-                            valid_uids,
-                        )
-                    )
-                    filtered = len(structured) - len(send_uids)
-                    if filtered:
-                        logger.warning(
-                            "[%s] filtered %d unverified caption mention(s)",
-                            self.name,
-                            filtered,
-                        )
+                )
             file_data, content_type, filename = await self._load_outbound_media(
                 image_url
             )
@@ -4148,6 +4184,17 @@ class OctoAdapter(BasePlatformAdapter):
             channel_type = self._resolve_channel_type(chat_id, metadata)
             _media_metadata_fields(metadata, allowed=frozenset(), media_name="file")
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
+            caption_text = caption
+            caption_entities: list[Any] | None = None
+            caption_uids: list[str] | None = None
+            if caption:
+                caption_text, caption_entities, caption_uids = (
+                    await self._prepare_outbound_mentions(
+                        caption,
+                        chat_id,
+                        channel_type,
+                    )
+                )
             file_data, content_type, filename = await self._load_outbound_media(
                 file_path
             )
@@ -4190,8 +4237,10 @@ class OctoAdapter(BasePlatformAdapter):
                     self._bot_token,
                     channel_id=outbound_channel_id,
                     channel_type=channel_type,
-                    content=caption,
+                    content=caption_text,
                     reply_msg_id=reply_to,
+                    mention_uids=caption_uids,
+                    mention_entities=caption_entities,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4217,6 +4266,17 @@ class OctoAdapter(BasePlatformAdapter):
                 metadata, allowed=frozenset({"duration"}), media_name="voice"
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
+            caption_text = caption
+            caption_entities: list[Any] | None = None
+            caption_uids: list[str] | None = None
+            if caption:
+                caption_text, caption_entities, caption_uids = (
+                    await self._prepare_outbound_mentions(
+                        caption,
+                        chat_id,
+                        channel_type,
+                    )
+                )
             file_data, content_type, filename = await self._load_outbound_media(
                 audio_path
             )
@@ -4252,8 +4312,10 @@ class OctoAdapter(BasePlatformAdapter):
                     self._bot_token,
                     channel_id=outbound_channel_id,
                     channel_type=channel_type,
-                    content=caption,
+                    content=caption_text,
                     reply_msg_id=reply_to,
+                    mention_uids=caption_uids,
+                    mention_entities=caption_entities,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )
@@ -4281,6 +4343,17 @@ class OctoAdapter(BasePlatformAdapter):
                 media_name="video",
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
+            caption_text = caption
+            caption_entities: list[Any] | None = None
+            caption_uids: list[str] | None = None
+            if caption:
+                caption_text, caption_entities, caption_uids = (
+                    await self._prepare_outbound_mentions(
+                        caption,
+                        chat_id,
+                        channel_type,
+                    )
+                )
             file_data, content_type, filename = await self._load_outbound_media(
                 video_path
             )
@@ -4318,8 +4391,10 @@ class OctoAdapter(BasePlatformAdapter):
                     self._bot_token,
                     channel_id=outbound_channel_id,
                     channel_type=channel_type,
-                    content=caption,
+                    content=caption_text,
                     reply_msg_id=reply_to,
+                    mention_uids=caption_uids,
+                    mention_entities=caption_entities,
                     client_msg_no=caption_client_msg_no,
                     on_behalf_of=self.on_behalf_of,
                 )

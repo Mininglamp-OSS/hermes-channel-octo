@@ -495,20 +495,20 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
     ):
         assert (await adapter.send_image(
             "s14_user-1", "https://source.example/image.webp",
-            caption="image caption", reply_to="parent-message",
+            caption="@[u1:Alice] image caption", reply_to="parent-message",
         )).success
         assert (await adapter.send_document(
             "s14_user-1", "https://source.example/report.pdf",
-            caption="file caption", reply_to="parent-message",
+            caption="@[u1:Alice] file caption", reply_to="parent-message",
         )).success
         assert (await adapter.send_voice(
             "s14_user-1", "https://source.example/voice.amr",
-            caption="voice caption", reply_to="parent-message",
+            caption="@[u1:Alice] voice caption", reply_to="parent-message",
             duration=3,
         )).success
         assert (await adapter.send_video(
             "s14_user-1", "https://source.example/video.mp4",
-            caption="video caption", reply_to="parent-message",
+            caption="@[u1:Alice] video caption", reply_to="parent-message",
             width=1280, height=720, duration=12,
         )).success
 
@@ -532,12 +532,15 @@ async def test_outbound_media_uses_space_dm_target_and_preserves_reply_metadata_
     assert video_call.kwargs["duration"] == 12
 
     assert [call.kwargs["content"] for call in send_text.await_args_list] == [
-        "image caption", "file caption", "voice caption", "video caption",
+        "@Alice image caption", "@Alice file caption",
+        "@Alice voice caption", "@Alice video caption",
     ]
     for call in send_text.await_args_list:
         assert call.kwargs["channel_id"] == "user-1"
         assert call.kwargs["channel_type"] == ChannelType.DM
         assert call.kwargs["reply_msg_id"] == "parent-message"
+        assert call.kwargs["mention_uids"] == ["u1"]
+        assert [entity.uid for entity in call.kwargs["mention_entities"]] == ["u1"]
 
 
 @pytest.mark.asyncio
