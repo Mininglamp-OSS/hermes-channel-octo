@@ -123,6 +123,70 @@ class TestConvertContentForLLM:
         result = convert_content_for_llm(content, mention)
         assert result == "@[u1:A] @[u2:B]"
 
+    def test_entities_use_utf16_offsets_after_astral_text(self):
+        content = "😀 @Alice"
+        mention = MentionPayload(
+            entities=[MentionEntity(uid="uid1", offset=3, length=6)],
+        )
+
+        assert convert_content_for_llm(content, mention) == "😀 @[uid1:Alice]"
+
+    def test_half_surrogate_entity_range_is_ignored_without_slicing_text(self):
+        content = "😀@Alice"
+        mention = MentionPayload(
+            entities=[MentionEntity(uid="uid1", offset=1, length=6)],
+        )
+
+        assert convert_content_for_llm(content, mention) == content
+
+    def test_duplicate_v2_ranges_discard_entire_sidecar_for_fallback(self):
+        content = "@Alice @Bob"
+        mention = MentionPayload(
+            entities=[
+                MentionEntity(uid="sidecar-alice", offset=0, length=6),
+                MentionEntity(uid="sidecar-alice", offset=0, length=6),
+                MentionEntity(uid="sidecar-bob", offset=7, length=4),
+            ],
+        )
+
+        assert convert_content_for_llm(
+            content,
+            mention,
+            {"Alice": "fallback-alice", "Bob": "fallback-bob"},
+        ) == "@[fallback-alice:Alice] @[fallback-bob:Bob]"
+
+    def test_partially_overlapping_v2_ranges_discard_entire_sidecar_for_fallback(self):
+        content = "@Alice @Bob"
+        mention = MentionPayload(
+            entities=[
+                MentionEntity(uid="sidecar-alice", offset=0, length=6),
+                MentionEntity(uid="sidecar-partial", offset=0, length=5),
+                MentionEntity(uid="sidecar-bob", offset=7, length=4),
+            ],
+        )
+
+        assert convert_content_for_llm(
+            content,
+            mention,
+            {"Alice": "fallback-alice", "Bob": "fallback-bob"},
+        ) == "@[fallback-alice:Alice] @[fallback-bob:Bob]"
+
+    def test_fully_overlapping_v2_ranges_discard_entire_sidecar_for_fallback(self):
+        content = "@Alice @Bob"
+        mention = MentionPayload(
+            entities=[
+                MentionEntity(uid="sidecar-alice", offset=0, length=6),
+                MentionEntity(uid="sidecar-alice-conflict", offset=0, length=6),
+                MentionEntity(uid="sidecar-bob", offset=7, length=4),
+            ],
+        )
+
+        assert convert_content_for_llm(
+            content,
+            mention,
+            {"Alice": "fallback-alice", "Bob": "fallback-bob"},
+        ) == "@[fallback-alice:Alice] @[fallback-bob:Bob]"
+
     def test_uids_positional_pairing(self):
         content = "@Alice @Bob"
         mention = MentionPayload(uids=["uid1", "uid2"])
@@ -206,6 +270,22 @@ class TestBuildEntitiesFromFallback:
         assert entities[0].offset == 6
         assert entities[0].length == 6  # "@Alice"
         assert entities[0].uid == "uid1"
+
+    def test_entity_offset_uses_utf16_units_after_astral_prefix(self):
+        entities, _ = build_entities_from_fallback(
+            "😀 @Alice!",
+            {"Alice": "uid1"},
+        )
+
+        assert entities[0].offset == 3
+
+    def test_entity_length_uses_utf16_units_for_astral_display_name(self):
+        entities, _ = build_entities_from_fallback(
+            "@A😀!",
+            {"A😀": "uid1"},
+        )
+
+        assert entities[0].length == 4
 
     @pytest.mark.parametrize(
         "bad_content",

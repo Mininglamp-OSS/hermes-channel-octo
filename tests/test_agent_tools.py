@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -612,3 +614,222 @@ async def test_owner_claim_without_trusted_octo_session_is_denied_before_io():
 
     assert result == {"error": "action 'update-group' requires a trusted Octo session requester"}
     update_group.assert_not_awaited()
+
+
+def test_management_schema_declares_the_runtime_input_bounds():
+    properties = agent_tools.TOOL_SCHEMA["parameters"]["properties"]
+
+    assert properties["group_id"]["maxLength"] == 64
+    assert properties["target"]["maxLength"] == 192
+    assert properties["limit"]["minimum"] == 1
+    assert properties["limit"]["maximum"] == 100
+    assert properties["content"]["maxLength"] == 20_000
+    assert properties["mention_uids"]["maxItems"] == 64
+    assert properties["mention_uids"]["items"]["maxLength"] == 64
+    assert properties["members"]["minItems"] == 1
+    assert properties["members"]["maxItems"] == 100
+    assert properties["members"]["items"]["maxLength"] == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "override", "expected_error"),
+    [
+        ("group-md-update", {"content": {"unexpected": "object"}}, "invalid content"),
+        ("read-messages", {"limit": True}, "invalid limit"),
+        ("create-group", {"members": "member-1"}, "invalid members"),
+        ("create-group", {"members": ["member-1"] * 101}, "invalid members"),
+        ("create-group", {"members": ["m" * 65]}, "invalid members"),
+        ("send-message", {"mention_uids": ["m" * 65]}, "invalid mention_uids"),
+        ("update-group", {"name": "n" * 257}, "invalid name"),
+    ],
+)
+async def test_management_rejects_runtime_malformed_values_before_io(
+    action: str,
+    override: dict[str, object],
+    expected_error: str,
+):
+    session_factory = MagicMock(side_effect=AssertionError("session must not open"))
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_new_guarded_http_session", session_factory),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for(action),
+                    **override,
+                    "requester_uid": "owner-uid",
+                },
+                trusted_uid="owner-uid",
+            )
+        )
+
+    assert result == {"error": expected_error}
+    session_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_group_md_update_cannot_poison_adapter_cache():
+    adapter = _configured_adapter()
+    adapter._group_md_cache["group-1"] = {"content": "safe", "version": 3}
+    adapter._group_md_checked.add("group-1")
+    adapter._write_md_to_disk = MagicMock()
+    session_factory = MagicMock(side_effect=AssertionError("session must not open"))
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_new_guarded_http_session", session_factory),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("group-md-update"),
+                    "content": ["not", "text"],
+                    "requester_uid": "owner-uid",
+                },
+                trusted_uid="owner-uid",
+            )
+        )
+
+    assert result == {"error": "invalid content"}
+    assert adapter._group_md_cache == {"group-1": {"content": "safe", "version": 3}}
+    assert adapter._group_md_checked == {"group-1"}
+    adapter._write_md_to_disk.assert_not_called()
+    session_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_owner_mutation_does_not_require_group_membership_read():
+    update_group = AsyncMock()
+    membership_check = AsyncMock(
+        side_effect=AssertionError("owner mutation must not read group membership")
+    )
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(agent_tools, "check_permission", membership_check),
+        patch.object(agent_tools.api, "update_group", update_group),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("update-group"),
+                    "name": "Owner-authorized rename",
+                    "requester_uid": "owner-uid",
+                },
+                trusted_uid="owner-uid",
+            )
+        )
+
+    assert result["ok"] is True
+    membership_check.assert_not_awaited()
+    update_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_malformed_md_response_version_cannot_poison_adapter_cache():
+    adapter = _configured_adapter()
+    adapter._write_md_to_disk = MagicMock()
+    update_group_md = AsyncMock(return_value={"version": ["malformed"]})
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(agent_tools.api, "update_group_md", update_group_md),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("group-md-update"),
+                    "content": "new content",
+                    "requester_uid": "owner-uid",
+                },
+                trusted_uid="owner-uid",
+            )
+        )
+
+    assert result == {"ok": True, "data": {"updated": True, "version": 0}}
+    assert adapter._group_md_cache == {
+        "group-1": {"content": "new content", "version": 0}
+    }
+    adapter._write_md_to_disk.assert_called_once_with("group-1", "new content", 0)
+
+
+
+@pytest.mark.asyncio
+async def test_search_audit_omits_requester_and_raw_keyword(caplog):
+    requester = "requester-stable-id"
+    keyword = "confidential-search-keyword"
+    adapter = _configured_adapter()
+    adapter._owner_uid = requester
+    caplog.set_level(logging.INFO, logger="hermes_octo_plugin.agent_tools")
+
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(
+            agent_tools.api,
+            "search_space_members",
+            AsyncMock(return_value=[{"uid": "member-1"}]),
+        ),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("search-members"),
+                    "keyword": keyword,
+                    "requester_uid": requester,
+                },
+                trusted_uid=requester,
+            )
+        )
+
+    assert result["ok"] is True
+    record = next(record for record in caplog.records if "[AUDIT]" in record.message)
+    entry = json.loads(record.message.partition("octo-query ")[2])
+    assert entry == {
+        "action": "search-members",
+        "result": "allowed",
+        "count": 1,
+    }
+    assert requester not in caplog.text
+    assert keyword not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_read_audit_omits_requester_and_raw_target(caplog):
+    requester = "requester-stable-id"
+    target = "group:confidential-target"
+    caplog.set_level(logging.INFO, logger="hermes_octo_plugin.agent_tools")
+
+    with (
+        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
+        patch.object(
+            agent_tools.api,
+            "get_group_members",
+            AsyncMock(return_value=[GroupMember(uid=requester, name="Member")]),
+        ),
+        patch.object(agent_tools.api, "get_channel_messages", AsyncMock(return_value=[])),
+    ):
+        result = json.loads(
+            await _call_handler(
+                {
+                    **_args_for("read-messages"),
+                    "target": target,
+                    "requester_uid": requester,
+                },
+                trusted_uid=requester,
+            )
+        )
+
+    assert result["ok"] is True
+    record = next(record for record in caplog.records if "[AUDIT]" in record.message)
+    entry = json.loads(record.message.partition("octo-query ")[2])
+    assert entry == {
+        "action": "read-messages",
+        "result": "allowed",
+        "channelType": 2,
+        "count": 0,
+    }
+    assert requester not in caplog.text
+    assert target not in caplog.text

@@ -36,7 +36,6 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC
 from typing import Any
 
 import aiohttp
@@ -47,7 +46,18 @@ from .types import ChannelType
 
 logger = logging.getLogger(__name__)
 
-_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_RESOURCE_ID_CHARS = 64
+_MAX_TARGET_CHARS = 192
+_MAX_PAGE_LIMIT = 100
+_MAX_CONTENT_CHARS = 20_000
+_MAX_MESSAGE_ID_CHARS = 64
+_MAX_MENTION_UIDS = 64
+_MAX_MEMBERS = 100
+_MAX_KEYWORD_CHARS = 256
+_MAX_GROUP_NAME_CHARS = 256
+_MAX_GROUP_NOTICE_CHARS = 4_096
+_MAX_THREAD_NAME_CHARS = 256
+_RESOURCE_ID_RE = re.compile(rf"^[A-Za-z0-9_-]{{1,{_MAX_RESOURCE_ID_CHARS}}}$")
 
 
 def _new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
@@ -142,6 +152,8 @@ TOOL_SCHEMA = {
             },
             "group_id": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_RESOURCE_ID_CHARS,
                 "description": (
                     "group_no. Required for group-info, group-members, "
                     "group-md-*, update-group, add-members, "
@@ -150,6 +162,8 @@ TOOL_SCHEMA = {
             },
             "target": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_TARGET_CHARS,
                 "description": (
                     "Target channel. Accepts `user:<uid>` (DM), "
                     "`group:<group_no>` (group), or "
@@ -160,10 +174,13 @@ TOOL_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_PAGE_LIMIT,
                 "description": "Max messages for read-messages (1-100, default 20).",
             },
             "content": {
                 "type": "string",
+                "maxLength": _MAX_CONTENT_CHARS,
                 "description": (
                     "Message body for send-message; new content for "
                     "group-md-update / thread-md-update / voice-context-update."
@@ -171,6 +188,8 @@ TOOL_SCHEMA = {
             },
             "reply_to_message_id": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_MESSAGE_ID_CHARS,
                 "description": (
                     "Optional message_id to reply to. Only meaningful for "
                     "send-message."
@@ -178,7 +197,12 @@ TOOL_SCHEMA = {
             },
             "mention_uids": {
                 "type": "array",
-                "items": {"type": "string"},
+                "maxItems": _MAX_MENTION_UIDS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": _MAX_RESOURCE_ID_CHARS,
+                },
                 "description": (
                     "Optional uids to @mention. Only meaningful for "
                     "send-message in group / thread channels."
@@ -193,11 +217,18 @@ TOOL_SCHEMA = {
             },
             "keyword": {
                 "type": "string",
+                "maxLength": _MAX_KEYWORD_CHARS,
                 "description": "Fuzzy keyword for search-members.",
             },
             "members": {
                 "type": "array",
-                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": _MAX_MEMBERS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": _MAX_RESOURCE_ID_CHARS,
+                },
                 "description": (
                     "List of member uids. Required for create-group, "
                     "add-members, remove-members."
@@ -205,14 +236,18 @@ TOOL_SCHEMA = {
             },
             "name": {
                 "type": "string",
+                "maxLength": _MAX_GROUP_NAME_CHARS,
                 "description": "Group name for create-group / update-group.",
             },
             "notice": {
                 "type": "string",
+                "maxLength": _MAX_GROUP_NOTICE_CHARS,
                 "description": "Group notice / announcement for update-group.",
             },
             "creator": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_RESOURCE_ID_CHARS,
                 "description": (
                     "uid of the user who becomes the group owner. Required "
                     "for create-group."
@@ -220,10 +255,14 @@ TOOL_SCHEMA = {
             },
             "thread_name": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_THREAD_NAME_CHARS,
                 "description": "Thread name for create-thread.",
             },
             "short_id": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_RESOURCE_ID_CHARS,
                 "description": (
                     "Thread short id. Required for get-thread, "
                     "delete-thread, list-thread-members, join-thread, "
@@ -243,37 +282,21 @@ TOOL_SCHEMA = {
 
 def _audit(
     action: str,
-    requester: str | None,
-    target: str,
     channel_type: int | None = None,
     result: str = "allowed",
-    reason: str | None = None,
     count: int | None = None,
 ) -> None:
-    """Emit a structured audit-log line for cross-channel queries.
-
-    JSON-encoded so log shippers can parse without bespoke regex. We use
-    the module logger at INFO so operators can grep ``[AUDIT] octo-query``
-    to find every cross-channel read/search the agent performed.
-    """
-    try:
-        from datetime import datetime
-        ts = datetime.now(UTC).isoformat(timespec="seconds")
-    except Exception:
-        ts = ""
-    entry: dict = {
-        "ts": ts, "action": action, "requester": requester, "target": target,
-        "result": result,
-    }
+    """Emit bounded management audit context without stable identifiers."""
+    entry: dict[str, str | int] = {"action": action, "result": result}
     if channel_type is not None:
         entry["channelType"] = channel_type
-    if reason:
-        entry["reason"] = reason
     if count is not None:
         entry["count"] = count
     try:
-        logger.info("[AUDIT] octo-query %s",
-                    json.dumps(entry, ensure_ascii=False, default=str))
+        logger.info(
+            "[AUDIT] octo-query %s",
+            json.dumps(entry, ensure_ascii=False, default=str),
+        )
     except Exception:
         # Never let audit logging interrupt a tool call.
         pass
@@ -292,6 +315,75 @@ def _require(args: dict, *keys: str) -> str | None:
     if missing:
         return _err(f"missing required argument(s): {', '.join(missing)}")
     return None
+
+
+def _bounded_string(value: object, *, minimum: int, maximum: int) -> bool:
+    return isinstance(value, str) and minimum <= len(value) <= maximum
+
+
+def _validate_management_args(args: dict[str, Any]) -> str | None:
+    """Enforce the JSON-schema input shape before authorization or I/O."""
+    string_bounds = {
+        "group_id": (1, _MAX_RESOURCE_ID_CHARS),
+        "target": (1, _MAX_TARGET_CHARS),
+        "content": (0, _MAX_CONTENT_CHARS),
+        "reply_to_message_id": (1, _MAX_MESSAGE_ID_CHARS),
+        "keyword": (0, _MAX_KEYWORD_CHARS),
+        "name": (0, _MAX_GROUP_NAME_CHARS),
+        "notice": (0, _MAX_GROUP_NOTICE_CHARS),
+        "creator": (1, _MAX_RESOURCE_ID_CHARS),
+        "thread_name": (1, _MAX_THREAD_NAME_CHARS),
+        "short_id": (1, _MAX_RESOURCE_ID_CHARS),
+    }
+    for field, (minimum, maximum) in string_bounds.items():
+        if field in args and not _bounded_string(
+            args[field],
+            minimum=minimum,
+            maximum=maximum,
+        ):
+            return _err(f"invalid {field}")
+
+    if "limit" in args:
+        limit = args["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= _MAX_PAGE_LIMIT
+        ):
+            return _err("invalid limit")
+
+    if "mention_all" in args and not isinstance(args["mention_all"], bool):
+        return _err("invalid mention_all")
+
+    for field, minimum, maximum in (
+        ("mention_uids", 0, _MAX_MENTION_UIDS),
+        ("members", 1, _MAX_MEMBERS),
+    ):
+        value = args.get(field)
+        if field not in args:
+            continue
+        if (
+            not isinstance(value, list)
+            or not minimum <= len(value) <= maximum
+            or not all(
+                _bounded_string(
+                    item,
+                    minimum=1,
+                    maximum=_MAX_RESOURCE_ID_CHARS,
+                )
+                for item in value
+            )
+        ):
+            return _err(f"invalid {field}")
+    return None
+
+
+def _cache_version(result: object) -> int:
+    """Keep untrusted response metadata out of the adapter's durable cache."""
+    version = result.get("version") if isinstance(result, dict) else None
+    if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
+        return version
+    return 0
 
 
 def _require_owner(adapter, requester_uid: str | None, action: str) -> str | None:
@@ -399,20 +491,21 @@ async def _authorize_group_or_thread_read(
 
     _audit(
         action=action,
-        requester=requester_uid,
-        target=channel_id,
         channel_type=int(channel_type),
         result="denied",
-        reason=result.reason,
     )
     return _err(result.reason or "permission denied")
 
 
 async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR0911,PLR0912
     """Dispatch a octo_management call. Returns a JSON string."""
+    if not isinstance(args, dict):
+        return _err("arguments must be an object")
     action = args.get("action")
-    if action not in ACTIONS:
+    if not isinstance(action, str) or action not in ACTIONS:
         return _err(f"unknown action: {action!r} (valid: {sorted(ACTIONS)})")
+    if error := _validate_management_args(args):
+        return error
 
     adapter = _resolve_adapter()
     if adapter is None:
@@ -491,8 +584,6 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 )
                 _audit(
                     action="search-members",
-                    requester=requester_uid,
-                    target=keyword or "<all>",
                     count=len(results),
                 )
                 return _ok({"members": results})
@@ -500,17 +591,14 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
             if action == "search-shared-groups":
                 subject = (args.get("target") or "").strip() or (requester_uid or "")
                 if not subject:
-                    _audit(action="search-shared-groups", requester=requester_uid,
-                           target="<none>", result="denied", reason="missing requester_uid/target")
+                    _audit(action="search-shared-groups", result="denied")
                     return _err("search-shared-groups requires requester_uid or target")
                 owner = adapter._owner_uid or ""
                 if subject != requester_uid and (not owner or requester_uid != owner):
-                    _audit(action="search-shared-groups", requester=requester_uid,
-                           target=subject, result="denied", reason="not owner")
+                    _audit(action="search-shared-groups", result="denied")
                     return _err("only the bot owner may query someone else's shared groups")
                 groups = adapter.find_shared_groups(subject)
-                _audit(action="search-shared-groups", requester=requester_uid,
-                       target=subject, count=len(groups))
+                _audit(action="search-shared-groups", count=len(groups))
                 return _ok({"uid": subject, "groups": groups, "count": len(groups)})
 
             if action == "read-messages":
@@ -536,9 +624,9 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 )
                 if not pres.allowed:
                     _audit(
-                        action="read-messages", requester=requester_uid,
-                        target=args["target"], channel_type=int(channel_type),
-                        result="denied", reason=pres.reason,
+                        action="read-messages",
+                        channel_type=int(channel_type),
+                        result="denied",
                     )
                     return _err(pres.reason or "permission denied")
                 messages = await api.get_channel_messages(
@@ -548,8 +636,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     limit=max(1, min(limit, 100)),
                 )
                 _audit(
-                    action="read-messages", requester=requester_uid,
-                    target=args["target"], channel_type=int(channel_type),
+                    action="read-messages",
+                    channel_type=int(channel_type),
                     count=len(messages),
                 )
                 return _ok({
@@ -588,9 +676,9 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 )
                 if not pres.allowed:
                     _audit(
-                        action="send-message", requester=requester_uid,
-                        target=args["target"], channel_type=int(channel_type),
-                        result="denied", reason=pres.reason,
+                        action="send-message",
+                        channel_type=int(channel_type),
+                        result="denied",
                     )
                     return _err(pres.reason or "permission denied")
 
@@ -642,8 +730,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     on_behalf_of=adapter.on_behalf_of,
                 )
                 _audit(
-                    action="send-message", requester=requester_uid,
-                    target=args["target"], channel_type=int(channel_type),
+                    action="send-message",
+                    channel_type=int(channel_type),
                 )
                 response: dict[str, Any] = {
                     "sent": True,
@@ -668,10 +756,10 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 result = await api.update_group_md(
                     session, api_url, bot_token, group_no=group_id, content=content,
                 )
+                version = _cache_version(result)
                 # Update the live adapter's local cache so the next inbound
                 # message picks up the change immediately.
                 try:
-                    version = (result or {}).get("version", 0)
                     adapter._group_md_cache[group_id] = {
                         "content": content,
                         "version": version,
@@ -682,7 +770,7 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                         adapter._write_md_to_disk(group_id, content, version)
                 except Exception:
                     pass
-                return _ok({"updated": True, "version": (result or {}).get("version", 0)})
+                return _ok({"updated": True, "version": version})
 
             if action == "create-group":
                 if (e := _require(args, "members", "creator")):
@@ -819,11 +907,11 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     session, api_url, bot_token,
                     group_no=group_id, short_id=short_id, content=content,
                 )
+                version = _cache_version(result)
                 # Mirror the cache update we do for GROUP.md so the next
                 # inbound thread message sees the new content immediately.
                 try:
                     key = f"{group_id}____{short_id}"
-                    version = (result or {}).get("version", 0)
                     adapter._group_md_cache[key] = {
                         "content": content,
                         "version": version,
@@ -834,7 +922,7 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                         adapter._write_md_to_disk(key, content, version)
                 except Exception:
                     pass
-                return _ok({"updated": True, "version": (result or {}).get("version", 0)})
+                return _ok({"updated": True, "version": version})
 
             if action == "voice-context-read":
                 ctx = await api.get_voice_context(session, api_url, bot_token)

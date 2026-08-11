@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import socket
 from types import SimpleNamespace
+from pathlib import Path
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+import logging
+
 
 from hermes_octo_plugin import api, transport as transport_module
 from hermes_octo_plugin.adapter import OctoAdapter
@@ -54,6 +58,30 @@ class _RedirectResponse:
     async def __aexit__(self, *_args):
         return None
 
+
+class _ChunkedBody:
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self._chunks = chunks
+
+    def iter_chunked(self, _size: int):
+        async def chunks():
+            for chunk in self._chunks:
+                yield chunk
+
+        return chunks()
+
+
+class _ChunkedResponse:
+    status = 200
+
+    def __init__(self, *chunks: bytes) -> None:
+        self.content = _ChunkedBody(chunks)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
 
 def test_bearer_auth_is_limited_to_exact_configured_api_or_cdn_origins():
     adapter = make_bare_adapter()
@@ -138,6 +166,25 @@ async def test_inbound_media_rejects_private_and_metadata_urls_before_io(url: st
     assert await adapter._download_inbound_media_to_local(url, "image/png") is None
     adapter._http_session.get.assert_not_called()
 
+
+
+@pytest.mark.asyncio
+async def test_inbound_media_rejects_opposite_scheme_trusted_endpoint_before_io():
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._http_session = MagicMock()
+    adapter._http_session.transport_policy = TransportPolicy({
+        "https://api.octo.example:8443",
+    })
+
+    assert (
+        await adapter._download_inbound_media_to_local(
+            "http://api.octo.example:8443/private.png",
+            "image/png",
+        )
+        is None
+    )
+    adapter._http_session.get.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_ssrf_resolver_rejects_private_dns_answers_but_allows_trusted_origin():
@@ -362,34 +409,6 @@ async def test_guarded_resolver_allows_opted_in_ipv6_loopback_origin():
     assert records[0]["host"] == "::1"
     assert records[0]["family"] == socket.AF_INET6
 
-@pytest.mark.asyncio
-async def test_private_upload_origin_does_not_expand_shared_resolver(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
-    policy = TransportPolicy({"https://api.example"})
-    policy.trust_validated_upload_origin(
-        "http://storage.example:8080/upload"
-    )
-    resolver = _SSRFGuardResolver(policy=policy)
-    resolver._delegate.resolve = AsyncMock(
-        return_value=[
-            {
-                "hostname": "storage.example",
-                "host": "10.0.0.8",
-                "port": 8080,
-                "family": socket.AF_INET,
-                "proto": 6,
-                "flags": 0,
-            }
-        ]
-    )
-
-    try:
-        with pytest.raises(OSError, match="unsafe address"):
-            await resolver.resolve("storage.example", 8080)
-    finally:
-        await resolver.close()
 
 
 def test_transport_origin_preserves_explicit_zero_port() -> None:
@@ -534,27 +553,19 @@ async def test_guarded_websocket_socket_trusts_exact_private_origin_only_with_op
     resolver.close.assert_awaited_once()
 
 
-def test_private_host_policy_still_rejects_ipv4_mapped_link_local(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
-    policy = TransportPolicy()
-
+def test_private_host_policy_rejects_ipv4_mapped_link_local() -> None:
     with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
-        policy.trust_validated_upload_origin(
-            "http://[::ffff:169.254.169.254]/latest/meta-data/"
+        api._validate_presigned_upload_origin(
+            TransportPolicy(),
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
         )
 
 
-def test_private_host_policy_rejects_ipv4_mapped_metadata_literal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
-    policy = TransportPolicy()
-
+def test_private_host_policy_rejects_ipv4_mapped_metadata_literal() -> None:
     with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
-        policy.trust_validated_upload_origin(
-            "http://[::ffff:6464:64c8]/latest/meta-data/"
+        api._validate_presigned_upload_origin(
+            TransportPolicy(),
+            "http://[::ffff:6464:64c8]/latest/meta-data/",
         )
 
 
@@ -600,8 +611,75 @@ async def test_inbound_file_rejects_redirect_without_reading_body():
         None,
     )
 
-    assert result == "[文件: report.pdf - 下载失败 HTTP 302]"
+    assert result.content == "[文件: report.pdf - 下载失败 HTTP 302]"
     assert response.content.called is False
+
+
+@pytest.mark.parametrize(
+    ("raw_filename", "expected_filename"),
+    [
+        ("report[preview].txt", "report(preview).txt"),
+        ("report\nspoofed.txt", "未知文件"),
+        ("report\x1fspoofed.txt", "未知文件"),
+        ("report\u2066spoofed.txt", "report_spoofed.txt"),
+        ("../private-report.txt", "未知文件"),
+        (r"..\private-report.txt", "未知文件"),
+    ],
+)
+def test_inbound_file_display_name_never_serializes_unsafe_metadata(
+    raw_filename: str,
+    expected_filename: str,
+) -> None:
+    adapter = make_bare_adapter()
+
+    content = adapter._resolve_content(
+        MessagePayload(type=MessageType.File, name=raw_filename)
+    )
+
+    assert content == f"[文件: {expected_filename}]"
+    display_name = content[len("[文件: "):-1]
+    for unsafe in ("[", "]", "\n", "\x1f", "\u2066", "/", "\\"):
+        assert unsafe not in display_name
+
+
+class _RaisingRequest:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def __aenter__(self):
+        raise self._error
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_inbound_media_failure_logs_omit_signed_query_and_exception_detail(
+    caplog,
+):
+    signed_url = (
+        "https://api.octo.example/download/photo.png?"
+        "signature=signed-query-secret"
+    )
+    exception_detail = "upstream media diagnostic secret"
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._api_url = "https://api.octo.example/v1"
+    adapter._bot_token = "test-token"
+    adapter._http_session = MagicMock()
+    adapter._http_session.get.return_value = _RaisingRequest(
+        RuntimeError(exception_detail)
+    )
+    caplog.set_level(logging.WARNING, logger="hermes_octo_plugin.adapter")
+
+    assert (
+        await adapter._download_inbound_media_to_local(signed_url, "image/png")
+        is None
+    )
+
+    assert "signed-query-secret" not in caplog.text
+    assert exception_detail not in caplog.text
+    assert "inbound media download failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1042,10 +1120,50 @@ async def test_native_remote_media_uses_the_server_upload_limit(method_name: str
 
     assert result.success is True
     assert download.await_args.kwargs["max_size"] == api.MAX_OUTBOUND_MEDIA_BYTES
-    assert download.await_args.kwargs["enforce_host_safety"] is True
+    assert "enforce_host_safety" not in download.await_args.kwargs
 
 
 
+
+
+def test_local_media_uses_current_hermes_static_path_validator(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway.platforms.base import BasePlatformAdapter
+
+    source = tmp_path / "source.bin"
+    authorized = tmp_path / "authorized.bin"
+    calls: list[str] = []
+
+    def validate_media_delivery_path(path: str) -> str:
+        calls.append(path)
+        return str(authorized)
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "validate_media_delivery_path",
+        staticmethod(validate_media_delivery_path),
+        raising=False,
+    )
+
+    assert api.authorize_local_media_path(str(source)) == str(authorized)
+    assert calls == [str(source)]
+
+
+def test_local_media_fails_closed_when_hermes_014_has_no_path_validator(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway.platforms.base import BasePlatformAdapter
+
+    monkeypatch.delattr(
+        BasePlatformAdapter,
+        "validate_media_delivery_path",
+        raising=False,
+    )
+
+    assert api.authorize_local_media_path(str(tmp_path / "source.bin")) is None
 @pytest.mark.asyncio
 async def test_native_local_media_uses_hermes_authorized_path_before_read(tmp_path):
     adapter = make_bare_adapter()
@@ -1085,6 +1203,244 @@ async def test_native_local_media_rejects_hermes_denied_path_before_read(tmp_pat
             await adapter._load_outbound_media(str(requested))
 
     read_local.assert_not_called()
+
+
+def _inbound_event_adapter() -> OctoAdapter:
+    adapter = make_bare_adapter()
+    adapter.platform = SimpleNamespace(value="octo")
+    adapter._robot_id = "bot-1"
+    adapter._aes_key = b"key"
+    adapter._aes_iv = b"iv"
+    adapter._resolve_sender_name = AsyncMock(return_value="Alice")
+    adapter._send_typing_safe = AsyncMock()
+    adapter._send_read_receipt_safe = AsyncMock()
+    adapter.build_source = MagicMock(return_value=SimpleNamespace())
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+async def _deliver_inbound_payload(adapter: OctoAdapter, raw: bytes) -> object:
+    recv = SimpleNamespace(
+        message_id="message-1",
+        message_seq=1,
+        from_uid="user-1",
+        channel_id="bot-1",
+        channel_type=ChannelType.DM,
+        timestamp=1,
+        encrypted_payload=raw,
+    )
+    with patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw):
+        await adapter._handle_recv(recv)
+    return adapter.handle_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_inbound_binary_file_downloads_once_and_delivers_the_same_local_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = _inbound_event_adapter()
+    session = MagicMock()
+    session.get.return_value = _ChunkedResponse(b"%PDF")
+    adapter._http_session = session
+    monkeypatch.setattr("hermes_octo_plugin.adapter.FILE_TEMP_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_octo_plugin.adapter.MEDIA_TEMP_DIR", str(tmp_path / "media")
+    )
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        b'{"type": 8, "name": "report.pdf", '
+        b'"url": "https://files.example/report.pdf"}',
+    )
+
+    assert session.get.call_count == 1
+    assert event.media_types == ["application/octet-stream"]
+    assert len(event.media_urls) == 1
+    local_path = event.media_urls[0]
+    assert Path(local_path).read_bytes() == b"%PDF"
+    assert set(tmp_path.iterdir()) == {Path(local_path)}
+    assert local_path in event.text
+    assert "https://files.example/report.pdf" not in event.text
+
+
+@pytest.mark.asyncio
+async def test_inbound_small_text_file_inlines_from_one_request_without_media(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = _inbound_event_adapter()
+    session = MagicMock()
+    session.get.return_value = _ChunkedResponse(b"hello")
+    adapter._http_session = session
+    file_temp_dir = tmp_path / "files"
+    media_temp_dir = tmp_path / "media"
+    monkeypatch.setattr("hermes_octo_plugin.adapter.FILE_TEMP_DIR", str(file_temp_dir))
+    monkeypatch.setattr("hermes_octo_plugin.adapter.MEDIA_TEMP_DIR", str(media_temp_dir))
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        b'{"type": 8, "name": "notes.txt", '
+        b'"url": "https://files.example/notes.txt"}',
+    )
+
+    assert session.get.call_count == 1
+    assert event.text == (
+        "[文件: notes.txt]\n\n--- 文件内容 ---\nhello\n--- 文件结束 ---"
+    )
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert "https://files.example/notes.txt" not in event.text
+    assert list(file_temp_dir.iterdir()) == []
+    assert not media_temp_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "mime", "label", "url"),
+    [
+        (MessageType.Image, "image/jpeg", "[图片]", "https://public.example/photo.jpg"),
+        (
+            MessageType.GIF,
+            "image/gif",
+            "[GIF]",
+            "https://files.example/animation.gif?X-Amz-Signature=signed-secret",
+        ),
+        (
+            MessageType.Voice,
+            "audio/ogg",
+            "[语音消息]",
+            "http://169.254.169.254/latest/meta-data/token",
+        ),
+        (
+            MessageType.Video,
+            "video/mp4",
+            "[视频]",
+            "https://files.example/video.mp4?signature=another-secret",
+        ),
+    ],
+)
+async def test_inbound_media_text_never_includes_remote_url(
+    message_type, mime, label, url
+):
+    adapter = _inbound_event_adapter()
+    adapter._download_inbound_media_to_local = AsyncMock(return_value="/tmp/local-media")
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        f'{{"type": {int(message_type)}, "url": "{url}"}}'.encode(),
+    )
+
+    assert event.text == label
+    assert event.media_urls == ["/tmp/local-media"]
+    assert event.media_types == [mime]
+    assert url not in event.text
+
+
+@pytest.mark.asyncio
+async def test_inbound_rich_text_localizes_each_image_and_keeps_success_order():
+    adapter = _inbound_event_adapter()
+    adapter._download_inbound_media_to_local = AsyncMock(
+        side_effect=["/tmp/first.jpg", None, "/tmp/third.gif"]
+    )
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        b'{"type": 14, "content": ['
+        b'{"type": "image", "url": "https://files.example/first.jpg"},'
+        b'{"type": "text", "text": "between"},'
+        b'{"type": "image", "url": "https://files.example/rejected.png"},'
+        b'{"type": "image", "url": "https://files.example/third.gif"}'
+        b']}',
+    )
+
+    assert [
+        call.args
+        for call in adapter._download_inbound_media_to_local.await_args_list
+    ] == [
+        ("https://files.example/first.jpg", "image/jpeg"),
+        ("https://files.example/rejected.png", "image/png"),
+        ("https://files.example/third.gif", "image/gif"),
+    ]
+    assert event.media_urls == ["/tmp/first.jpg", "/tmp/third.gif"]
+    assert event.media_types == ["image/jpeg", "image/gif"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_file_download_failure_never_forwards_remote_url():
+    adapter = _inbound_event_adapter()
+    session = MagicMock()
+    session.get.return_value = _NotFoundResponse()
+    adapter._http_session = session
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        b'{"type": 8, "name": "rejected.pdf", '
+        b'"url": "https://files.example/rejected.pdf"}',
+    )
+
+    assert session.get.call_count == 1
+    assert event.text == "[文件: rejected.pdf - 下载失败 HTTP 404]"
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert "https://files.example/rejected.pdf" not in event.text
+
+
+
+
+def test_nested_file_previews_never_include_remote_urls():
+    adapter = make_bare_adapter()
+    adapter._api_url = "https://api.octo.example"
+    url = "https://files.example/private.pdf"
+
+    quoted = adapter._resolve_quoted_message_text(
+        {"type": 8, "name": "private.pdf", "url": url}
+    )
+    forwarded = adapter._resolve_inner_message_text(
+        {"payload": {"type": 8, "name": "private.pdf", "url": url}}
+    )
+
+    assert quoted == "[文件: private.pdf]"
+    assert forwarded == "[文件: private.pdf]"
+
+
+@pytest.mark.asyncio
+async def test_inbound_file_retry_logs_no_filename_or_raw_exception(caplog, monkeypatch):
+    adapter = make_bare_adapter()
+    filename = "payroll-2026.pdf"
+    url = "https://files.example/private.pdf?X-Amz-Signature=signed-secret"
+    adapter._http_session = MagicMock()
+    adapter._http_session.get = MagicMock(
+        side_effect=RuntimeError(f"download failed for {filename}: {url}")
+    )
+    monkeypatch.setattr("hermes_octo_plugin.adapter.asyncio.sleep", AsyncMock())
+
+    result = await adapter._resolve_inbound_file(url, filename, None)
+
+    assert result.content == f"[文件: {filename} - 下载失败]"
+    assert adapter._http_session.get.call_count == 3
+    assert filename not in caplog.text
+    assert url not in caplog.text
+    assert "RuntimeError" in caplog.text
+@pytest.mark.asyncio
+async def test_inbound_rich_text_rejected_url_never_reaches_media_urls():
+    adapter = _inbound_event_adapter()
+    adapter._download_inbound_media_to_local = AsyncMock(return_value=None)
+
+    event = await _deliver_inbound_payload(
+        adapter,
+        b'{"type": 14, "content": ['
+        b'{"type": "image", "url": "http://127.0.0.1/private.png"}'
+        b']}',
+    )
+
+    adapter._download_inbound_media_to_local.assert_awaited_once_with(
+        "http://127.0.0.1/private.png",
+        "image/png",
+    )
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert "http://127.0.0.1/private.png" not in event.text
+
+
 @pytest.mark.asyncio
 async def test_native_image_download_failure_does_not_fall_back_to_remote_url():
     adapter = make_bare_adapter()

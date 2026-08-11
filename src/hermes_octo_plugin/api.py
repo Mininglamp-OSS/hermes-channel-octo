@@ -6,6 +6,7 @@ All API calls use aiohttp with Bearer token authentication.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import ipaddress
@@ -1333,45 +1334,46 @@ async def get_upload_presign(
         result["headers"] = signed_headers
     return result
 
-def _trust_presigned_upload_origin(
+def _validate_presigned_upload_origin(
     policy: TransportPolicy | None,
     upload_url: str,
 ) -> None:
-    """Trust one authenticated server-issued private upload origin after opt-in."""
-    if policy is None:
-        try:
-            parsed = urlparse(upload_url)
-            host = canonical_url_host(upload_url)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("unsafe presigned upload URL") from exc
-        literal = _canonical_download_ip(host) if host is not None else None
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not host
-            or parsed.username is not None
-            or parsed.password is not None
-            or is_private_or_metadata_host(host)
-            or (
-                literal is not None
-                and (
-                    literal.is_loopback
-                    or literal.is_private
-                    or literal.is_link_local
-                    or literal.is_multicast
-                    or literal.is_reserved
-                    or literal.is_unspecified
-                )
-            )
-        ):
-            raise RuntimeError("unsafe presigned upload URL")
-        return
-    policy.trust_validated_upload_origin(upload_url)
-    if not policy.is_upload_url_trusted(upload_url):
-        logger.warning(
-            "Private presigned upload origin was rejected because "
-            "OCTO_ALLOW_PRIVATE_HOSTS is disabled"
-        )
+    """Allow public presigns and exact policy-configured private origins."""
+    try:
+        parsed = urlparse(upload_url)
+        host = canonical_url_host(upload_url)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("unsafe presigned upload URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
 
+    literal = _canonical_download_ip(host)
+    if host in _DOWNLOAD_METADATA_HOSTS or (
+        literal is not None
+        and (
+            literal.is_link_local
+            or literal.is_multicast
+            or literal.is_reserved
+            or literal.is_unspecified
+        )
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
+    if (
+        policy is not None
+        and policy.is_download_endpoint_trusted(upload_url)
+        and not policy.is_download_url_trusted(upload_url)
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
+
+    if is_private_or_metadata_host(host) and (
+        policy is None or not policy.is_download_url_trusted(upload_url)
+    ):
+        raise RuntimeError("unsafe presigned upload URL")
 
 
 async def upload_file_to_presigned_url(
@@ -1386,8 +1388,7 @@ async def upload_file_to_presigned_url(
     policy: TransportPolicy | None = None,
 ) -> str:
     """PUT one exact body while replaying the server-signed request headers."""
-    if policy is not None and not policy.is_upload_url_trusted(upload_url):
-        raise RuntimeError("unsafe presigned upload URL")
+    _validate_presigned_upload_origin(policy, upload_url)
     put_headers = dict(headers or ())
     if any(
         not isinstance(key, str)
@@ -1416,11 +1417,9 @@ async def upload_file_to_presigned_url(
         put_headers["Content-Disposition"] = content_disposition
 
     upload_timeout = aiohttp.ClientTimeout(total=300)
-    upload_session = session
-    owned_upload_session: aiohttp.ClientSession | None = None
-    if policy is not None:
-        owned_upload_session = new_guarded_http_session(upload_url)
-        upload_session = owned_upload_session
+    upload_policy = policy or TransportPolicy()
+    owned_upload_session = new_guarded_http_session(policy=upload_policy)
+    upload_session = owned_upload_session
     try:
         async with upload_session.put(
             upload_url,
@@ -1429,11 +1428,7 @@ async def upload_file_to_presigned_url(
             timeout=upload_timeout,
             allow_redirects=False,
         ) as resp:
-            if 300 <= resp.status < 400:
-                raise RuntimeError(
-                    f"Presigned PUT upload failed (HTTP {resp.status})"
-                )
-            if not resp.ok:
+            if not 200 <= resp.status < 300:
                 raise RuntimeError(
                     f"Presigned PUT upload failed (HTTP {resp.status})"
                 )
@@ -1461,7 +1456,7 @@ async def upload_and_get_url(
         file_size=len(file_data),
         content_type=content_type,
     )
-    _trust_presigned_upload_origin(policy, presign["uploadUrl"])
+    _validate_presigned_upload_origin(policy, presign["uploadUrl"])
     return await upload_file_to_presigned_url(
         session,
         upload_url=presign["uploadUrl"],
@@ -1502,7 +1497,6 @@ def _validate_download_url(
     url: str,
     *,
     policy: TransportPolicy | None = None,
-    enforce_host_safety: bool = True,
 ) -> str:
     """Validate one download hop before any network I/O."""
     try:
@@ -1525,8 +1519,6 @@ def _validate_download_url(
         or literal.is_unspecified
     ):
         raise RuntimeError("unsafe download URL")
-    if not enforce_host_safety:
-        return url
     trusted = policy is not None and policy.is_download_url_trusted(url)
     if (
         policy is not None
@@ -1563,7 +1555,7 @@ def _content_disposition_filename(value: str) -> str | None:
                     return decoded
         elif key.lower() == "filename":
             fallback = candidate
-    return fallback
+    return unquote(fallback) if fallback else None
 
 
 
@@ -1573,7 +1565,6 @@ async def download_file(
     max_size: int = 500 * 1024 * 1024,
     timeout_seconds: int = 300,
     *,
-    enforce_host_safety: bool = True,
     policy: TransportPolicy | None = None,
 ) -> tuple[bytes, str, str]:
     """
@@ -1581,9 +1572,7 @@ async def download_file(
 
     Args:
         url: URL to download.
-        max_size: Maximum file size in bytes.
-        timeout_seconds: Download timeout.
-        enforce_host_safety: Apply the plugin's private-host policy to each hop.
+        timeout_seconds: Total download timeout across every redirect hop.
 
     Returns:
         (file_data, content_type, filename)
@@ -1591,71 +1580,74 @@ async def download_file(
     Raises:
         RuntimeError: If file is too large or download fails.
     """
-    dl_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
     current_url = url
     trusted_policy = policy
-    for redirect_count in range(_MAX_DOWNLOAD_REDIRECTS + 1):
-        _validate_download_url(
-            current_url,
-            policy=trusted_policy,
-            enforce_host_safety=enforce_host_safety,
-        )
-        async with session.get(
-            current_url,
-            timeout=dl_timeout,
-            allow_redirects=False,
-        ) as resp:
-            if resp.status in _DOWNLOAD_REDIRECT_STATUSES:
-                location = resp.headers.get("Location")
-                if not location or redirect_count >= _MAX_DOWNLOAD_REDIRECTS:
-                    raise RuntimeError("Download failed (invalid redirect)")
-                current_url = urljoin(current_url, location)
-                _validate_download_url(
-                    current_url,
-                    policy=trusted_policy,
-                    enforce_host_safety=enforce_host_safety,
-                )
-                continue
-            if not resp.ok:
-                # Source URLs are frequently pre-signed and must not be copied into
-                # exceptions that can reach logs or SendResult.error.
-                raise RuntimeError(f"Download failed (HTTP {resp.status})")
-
-            content_type = resp.headers.get("Content-Type", "application/octet-stream")
-
-            # Prefer RFC 5987 ``filename*=UTF-8''...`` and retain the legacy
-            # quoted filename fallback. URL paths remain the final fallback.
-            cd_filename = _content_disposition_filename(
-                resp.headers.get("Content-Disposition", "")
+    async with asyncio.timeout(timeout_seconds):
+        for redirect_count in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Download failed (timeout)")
+            _validate_download_url(
+                current_url,
+                policy=trusted_policy,
             )
-            if cd_filename:
-                filename = cd_filename
-            else:
-                path = urlparse(current_url).path
-                filename = unquote(path.split("/")[-1]) or "file"
-
-            cl = resp.headers.get("Content-Length")
-            if cl:
-                try:
-                    content_length = int(cl)
-                except (TypeError, ValueError):
-                    raise RuntimeError(
-                        "Download failed (invalid Content-Length)"
-                    ) from None
-                if content_length < 0:
-                    raise RuntimeError("Download failed (invalid Content-Length)")
-                if content_length > max_size:
-                    raise RuntimeError(
-                        f"File too large ({content_length} bytes, max {max_size})"
+            hop_timeout = aiohttp.ClientTimeout(total=remaining)
+            async with session.get(
+                current_url,
+                timeout=hop_timeout,
+                allow_redirects=False,
+            ) as resp:
+                if resp.status in _DOWNLOAD_REDIRECT_STATUSES:
+                    location = resp.headers.get("Location")
+                    if not location or redirect_count >= _MAX_DOWNLOAD_REDIRECTS:
+                        raise RuntimeError("Download failed (invalid redirect)")
+                    current_url = urljoin(current_url, location)
+                    _validate_download_url(
+                        current_url,
+                        policy=trusted_policy,
                     )
+                    continue
+                if not 200 <= resp.status < 300:
+                    # Source URLs are frequently pre-signed and must not be copied into
+                    # exceptions that can reach logs or SendResult.error.
+                    raise RuntimeError(f"Download failed (HTTP {resp.status})")
 
-            data = bytearray()
-            async for chunk in resp.content.iter_any():
-                data.extend(chunk)
-                if len(data) > max_size:
-                    raise RuntimeError(f"File too large (>{max_size} bytes)")
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
-            return bytes(data), content_type, filename
+                # Prefer a safe RFC 5987 filename, then a safe URL basename.
+                cd_filename = safe_media_filename(
+                    _content_disposition_filename(
+                        resp.headers.get("Content-Disposition", "")
+                    )
+                )
+                url_filename = safe_media_filename(
+                    unquote(urlparse(current_url).path.split("/")[-1])
+                )
+                filename = cd_filename or url_filename or "file"
+
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    try:
+                        content_length = int(cl)
+                    except (TypeError, ValueError):
+                        raise RuntimeError(
+                            "Download failed (invalid Content-Length)"
+                        ) from None
+                    if content_length < 0:
+                        raise RuntimeError("Download failed (invalid Content-Length)")
+                    if content_length > max_size:
+                        raise RuntimeError(
+                            f"File too large ({content_length} bytes, max {max_size})"
+                        )
+
+                data = bytearray()
+                async for chunk in resp.content.iter_any():
+                    data.extend(chunk)
+                    if len(data) > max_size:
+                        raise RuntimeError(f"File too large (>{max_size} bytes)")
+
+                return bytes(data), content_type, filename
 
     raise RuntimeError("Download failed (too many redirects)")
 
@@ -1865,7 +1857,7 @@ async def fetch_user_info(
             if resp.status == 404:
                 return None
             if not 200 <= resp.status < 300:
-                logger.error("octo: fetchUserInfo(%s) failed: %d", uid, resp.status)
+                logger.error("octo: fetch_user_info failed (HTTP %d)", resp.status)
                 return None
             data = await resp.json()
             if data and data.get("name"):
@@ -1875,8 +1867,8 @@ async def fetch_user_info(
                     "avatar": data.get("avatar", ""),
                 }
             return None
-    except Exception as e:
-        logger.error("octo: fetchUserInfo(%s) error: %s", uid, e)
+    except Exception as exc:
+        logger.error("octo: fetch_user_info failed (%s)", type(exc).__name__)
         return None
 
 

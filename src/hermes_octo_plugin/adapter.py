@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -11,6 +12,8 @@ import random
 import re
 import time
 import uuid
+import unicodedata
+
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -44,6 +47,7 @@ from .mention import (
 from .transport import (
     SSRFGuardConnector as _SSRFGuardConnector,
     SSRFGuardResolver as _SSRFGuardResolver,
+    TransportPolicy as _TransportPolicy,
     _METADATA_HOSTS,
     is_private_or_metadata_host as _is_private_or_metadata_host,
     new_guarded_http_session as _new_guarded_http_session,
@@ -207,6 +211,29 @@ def _validated_media_filename(value: object) -> str:
     return filename
 
 
+_INBOUND_FILE_FALLBACK_NAME = "未知文件"
+
+
+def _inbound_file_display_name(value: object) -> str:
+    """Return one bounded basename that is safe inside LLM-facing labels."""
+    filename = api.safe_media_filename(value)
+    if filename is None:
+        return _INBOUND_FILE_FALLBACK_NAME
+
+    display: list[str] = []
+    for char in filename:
+        if unicodedata.category(char) in {"Cc", "Cf"}:
+            display.append("_")
+        elif char == "[":
+            display.append("(")
+        elif char == "]":
+            display.append(")")
+        else:
+            display.append(char)
+    return "".join(display)
+
+
+
 def redact_log(s: str) -> str:
     # Always pass force=True: octo is a safety boundary that must never
     # leak secrets into error returns / logs regardless of the user's
@@ -251,9 +278,9 @@ FILE_INLINE_MAX_BYTES = 20 * 1024  # 20 KB — small enough not to blow up
 FILE_DOWNLOAD_MAX_BYTES = 500 * 1024 * 1024  # 500 MB hard cap
 FILE_TEMP_DIR = "/tmp/octo-files"
 FILE_TEMP_RETENTION_S = 60 * 60  # 1 hour
-# Extensions worth attempting to inline as text. Anything outside this set
-# (.png, .zip, .pdf, ...) falls through to the regular "[文件: name]\nurl"
-# placeholder — the LLM gets a URL but doesn't see content.
+# Extensions worth attempting to inline as text. Other files are streamed to a
+# local path, so the LLM receives a status and Hermes receives local media
+# rather than a remote URL.
 _TEXT_FILE_EXTS = frozenset({
     ".txt",
     ".md",
@@ -319,10 +346,17 @@ _TEXT_FILE_EXTS = frozenset({
     ".diff",
     ".patch",
 })
-# Inbound media (Image/GIF/Voice/Video) gets streamed to a local temp file
-# before being handed to hermes-core so vision/audio pipelines don't hang on
-# slow remote URLs. Capped at 20 MB — anything larger falls back to the
-# remote URL with a log warning.
+
+
+@dataclass(frozen=True, slots=True)
+class _InboundFileResolution:
+    content: str
+    local_path: str | None = None
+
+
+# Inbound media (Image/GIF/Voice/Video) is streamed to a local temp file
+# before being handed to hermes-core so vision/audio pipelines do not fetch
+# remote URLs. Capped at 20 MB; rejected or failed downloads are dropped.
 MEDIA_TEMP_DIR = "/tmp/octo-media"
 MEDIA_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 MEDIA_DOWNLOAD_TIMEOUT_S = 120.0
@@ -1177,12 +1211,7 @@ class OctoAdapter(BasePlatformAdapter):
             )
             self._robot_id = self._registration.robot_id
             self._owner_uid = self._registration.owner_uid or ""
-            logger.info(
-                "[%s] Bot registered: robot_id=%s owner=%s",
-                self.name,
-                self._robot_id,
-                self._owner_uid or "<none>",
-            )
+            logger.info("[%s] Bot registered", self.name)
         except Exception as e:
             logger.error(
                 "[%s] Bot registration failed: %s", self.name, redact_log(str(e))
@@ -1194,7 +1223,7 @@ class OctoAdapter(BasePlatformAdapter):
         guarded_socket = None
         try:
             guarded_socket = await _open_guarded_websocket_socket(ws_url)
-            self._ws = await websockets.connect(
+            websocket = await websockets.connect(
                 ws_url,
                 proxy=None,
                 sock=guarded_socket,
@@ -1204,12 +1233,17 @@ class OctoAdapter(BasePlatformAdapter):
                 ping_interval=20,
                 ping_timeout=20,
             )
-        except Exception as e:
+            self._ws = websocket
+            guarded_socket = None
+        except BaseException as exc:
             if guarded_socket is not None:
                 guarded_socket.close()
-            logger.error(
-                "[%s] WebSocket connection failed: %s", self.name, redact_log(str(e))
-            )
+            if isinstance(exc, Exception):
+                logger.error(
+                    "[%s] WebSocket connection failed: %s",
+                    self.name,
+                    redact_log(str(exc)),
+                )
             raise
 
         self._temp_buffer = bytearray()
@@ -1554,6 +1588,13 @@ class OctoAdapter(BasePlatformAdapter):
             return False
         if scheme not in {"http", "https"} or not hostname:
             return False
+        policy = getattr(self._http_session, "transport_policy", None)
+        if (
+            isinstance(policy, _TransportPolicy)
+            and policy.is_download_endpoint_trusted(url)
+            and not policy.is_download_url_trusted(url)
+        ):
+            return False
         if not _is_private_or_metadata_host(hostname):
             return True
         if hostname in _METADATA_HOSTS:
@@ -1789,22 +1830,33 @@ class OctoAdapter(BasePlatformAdapter):
         while len(entries) > self._history_limit:
             entries.pop(0)
 
-    def _resolve_api_message_placeholder(
-        self, msg_type: int | None, name: str | None = None
-    ) -> str:
-        """Return a text placeholder for non-text API history messages."""
+    def _render_url_free_media_placeholder(
+        self, msg_type: int | None, name: object = None
+    ) -> str | None:
+        """Return the safe label for media rendered in history or forwards."""
         t = OctoMessageType
-        mapping = {
+        if msg_type == t.File:
+            return f"[文件: {_inbound_file_display_name(name)}]"
+        return {
             t.Image: "[图片]",
             t.GIF: "[GIF]",
             t.Voice: "[语音消息]",
             t.Video: "[视频]",
+        }.get(msg_type)
+
+    def _resolve_api_message_placeholder(
+        self, msg_type: int | None, name: str | None = None
+    ) -> str:
+        """Return a text placeholder for non-text API history messages."""
+        media_placeholder = self._render_url_free_media_placeholder(msg_type, name)
+        if media_placeholder is not None:
+            return media_placeholder
+        t = OctoMessageType
+        mapping: dict[int, str] = {
             t.Location: "[位置信息]",
             t.Card: "[名片]",
             t.MultipleForward: "[合并转发]",
         }
-        if msg_type == t.File:
-            return f"[文件: {name or '未知文件'}]"
         return mapping.get(msg_type, "[消息]") if msg_type is not None else "[消息]"
 
     def _build_member_list_prefix(self, group_no: str) -> str:
@@ -1874,19 +1926,17 @@ class OctoAdapter(BasePlatformAdapter):
                     if m.get("from_uid") == bot_uid:
                         continue
                     msg_type = m.get("type")
-                    body = m.get("content") or self._resolve_api_message_placeholder(
+                    media_placeholder = self._render_url_free_media_placeholder(
                         msg_type, m.get("name")
                     )
-                    # For media types, resolve and append full URL
-                    if msg_type in (
-                        OctoMessageType.Image,
-                        OctoMessageType.File,
-                        OctoMessageType.Voice,
-                        OctoMessageType.Video,
-                    ) and m.get("url"):
-                        full_url = self._build_media_url(m["url"])
-                        if full_url:
-                            body = f"{body}\n{full_url}".strip()
+                    body = (
+                        media_placeholder
+                        if media_placeholder is not None
+                        else m.get("content")
+                        or self._resolve_api_message_placeholder(
+                            msg_type, m.get("name")
+                        )
+                    )
                     api_entries.append({
                         "sender": m.get("from_uid", "unknown"),
                         "body": body,
@@ -2410,27 +2460,34 @@ class OctoAdapter(BasePlatformAdapter):
                 )
             )
 
-        # Resolve content
-        content = self._resolve_content(payload)
+        file_name = (
+            _inbound_file_display_name(payload.name)
+            if payload.type == OctoMessageType.File
+            else None
+        )
+        content = (
+            f"[文件: {file_name}]"
+            if file_name is not None
+            else self._resolve_content(payload)
+        )
         if not content:
             return
 
-        # File messages: try to inline text content or download to local temp.
-        # Replaces the bare "[文件: name]\n<url>" with either the file's
-        # body (small text) or a local path the agent can read (anything else).
-        # Failures fall back to the original placeholder gracefully.
+        # File messages may expose content or a local path, but never the
+        # remote attachment URL when guarded resolution rejects it.
+        inbound_file: _InboundFileResolution | None = None
         if payload.type == OctoMessageType.File:
             file_url = self._build_media_url(payload.url)
-            file_name = payload.name or "未知文件"
-            known_size = payload.extra.get("size") if payload.extra else None
+            file_name = file_name or _INBOUND_FILE_FALLBACK_NAME
+            content = f"[文件: {file_name}]"
             if file_url:
-                resolved = await self._resolve_inbound_file(
+                known_size = payload.extra.get("size") if payload.extra else None
+                inbound_file = await self._resolve_inbound_file(
                     file_url,
                     file_name,
                     known_size if isinstance(known_size, int) else None,
                 )
-                if resolved:
-                    content = resolved
+                content = inbound_file.content
 
         # Refresh group member cache
         if is_group and msg.channel_id:
@@ -2655,22 +2712,21 @@ class OctoAdapter(BasePlatformAdapter):
                 media_types.append("video/mp4")
         elif payload.type == OctoMessageType.File:
             hermes_msg_type = MessageType.DOCUMENT
-            url = self._build_media_url(payload.url)
-            if url:
-                media_urls.append(url)
+            if inbound_file and inbound_file.local_path:
+                media_urls.append(inbound_file.local_path)
                 media_types.append("application/octet-stream")
         elif payload.type == OctoMessageType.RichText:
             # RichText(=14): one payload can carry N images interleaved
-            # with text. Collect ALL image URLs (in block order) and treat
-            # the event as PHOTO when any image is present; else TEXT.
-            # We deliberately don't stream RichText images to /tmp — a
-            # single message may carry many, and pre-download would
-            # multiply latency; agents can fetch on demand via URL.
+            # with text. Every image follows the same guarded-localization
+            # path as standalone media; failed downloads are dropped.
             _, rt_urls = self._resolve_rich_text_content(payload)
-            for u in rt_urls:
-                media_urls.append(u)
-                media_types.append(_infer_image_mime(u))
-            if rt_urls:
+            for url in rt_urls:
+                mime = _infer_image_mime(url)
+                u = await _local_or_remote(url, mime)
+                if u:
+                    media_urls.append(u)
+                    media_types.append(mime)
+            if media_urls:
                 hermes_msg_type = MessageType.PHOTO
 
         # Send typing indicator (fire-and-forget)
@@ -2823,9 +2879,11 @@ class OctoAdapter(BasePlatformAdapter):
                 channel_type=ChannelType(channel_type),
                 limit=max(1, min(int(limit), 100)),
             )
-        except Exception as e:
-            logger.error("[%s] read_channel_messages failed: %s", self.name, e)
-            return {"ok": False, "error": f"API call failed: {e}"}
+        except Exception as exc:
+            logger.error(
+                "octo: read_channel_messages failed (%s)", type(exc).__name__
+            )
+            return {"ok": False, "error": "API call failed"}
 
         return {
             "ok": True,
@@ -2859,24 +2917,20 @@ class OctoAdapter(BasePlatformAdapter):
 
     async def _resolve_inbound_file(
         self, url: str, filename: str, known_size: int | None
-    ) -> str | None:
-        """Try to inline a small text file or download a large one to temp.
+    ) -> _InboundFileResolution:
+        """Inline small text or stream one download to a temporary local path.
 
-        Returns the replacement message body (str) on success, or ``None`` if
-        the caller should fall through to the regular "[文件: name]\\n<url>"
-        placeholder (non-text extensions, or download errors after retries).
-
-        - Text-like extensions ≤ FILE_INLINE_MAX_BYTES → inline content
-        - Larger / non-text → stream-download to /tmp/octo-files/ and
-          return ``[文件: name (size) - 已下载到本地: /tmp/...]``
-        - 4xx errors → don't retry; return None
-        - 5xx / timeout → retry up to 3x with backoff
+        The resolution contains LLM-visible content and, for downloadable
+        documents, the exact local path that Hermes must receive. It never
+        contains the remote attachment URL.
         """
+        filename = _inbound_file_display_name(filename)
+
         if not self._http_session or not url:
-            return None
+            return _InboundFileResolution(f"[文件: {filename} - 下载失败]")
         if not self._inbound_media_url_allowed(url):
             logger.warning("[%s] blocked unsafe inbound file URL", self.name)
-            return None
+            return _InboundFileResolution(f"[文件: {filename} - 下载失败]")
         import os as _os
         from pathlib import PurePosixPath
 
@@ -2885,7 +2939,7 @@ class OctoAdapter(BasePlatformAdapter):
         # Hard size cap — never download files above the limit even if we
         # cannot inline (saves disk + network on huge attachments).
         if known_size is not None and known_size > FILE_DOWNLOAD_MAX_BYTES:
-            return (
+            return _InboundFileResolution(
                 f"[文件: {filename} ({_format_size(known_size)}) — "
                 f"超过最大下载限制 ({_format_size(FILE_DOWNLOAD_MAX_BYTES)})]"
             )
@@ -2918,18 +2972,20 @@ class OctoAdapter(BasePlatformAdapter):
                         # Redirects are not success: following them without
                         # per-hop origin validation would weaken SSRF/auth
                         # boundaries, while accepting them yields empty files.
-                        return f"[文件: {filename} - 下载失败 HTTP {resp.status}]"
+                        return _InboundFileResolution(
+                            f"[文件: {filename} - 下载失败 HTTP {resp.status}]"
+                        )
                     if not 200 <= resp.status < 300:
                         raise RuntimeError(f"HTTP {resp.status}")
 
-                    # Decide inline vs download path
+                    # Decide inline vs download path. If an unknown-size text
+                    # file exceeds the inline budget, retain the consumed
+                    # prefix and append the rest to the same local stream.
+                    inline_prefix: bytearray | None = None
                     inline_eligible = ext in _TEXT_FILE_EXTS and (
                         known_size is None or known_size <= FILE_INLINE_MAX_BYTES
                     )
                     if inline_eligible:
-                        # Stream up to FILE_INLINE_MAX_BYTES, if exceeded fall
-                        # through to disk download (one HTTP request — costs
-                        # a re-fetch but keeps the simple path simple).
                         buf = bytearray()
                         async for chunk in resp.content.iter_chunked(8192):
                             buf.extend(chunk)
@@ -2940,14 +2996,13 @@ class OctoAdapter(BasePlatformAdapter):
                                 text = buf.decode("utf-8")
                             except UnicodeDecodeError:
                                 text = buf.decode("utf-8", errors="replace")
-                            return (
+                            return _InboundFileResolution(
                                 f"[文件: {filename}]\n\n--- 文件内容 ---\n"
                                 f"{text}\n--- 文件结束 ---"
                             )
-                        # Exceeded inline budget mid-stream; treat as large file
-                        # — fall through to download path.
+                        inline_prefix = buf
 
-                    # Download to temp file
+                    # Stream the remote response once into the temporary file.
                     import uuid as _uuid
 
                     safe_name = (
@@ -2961,6 +3016,9 @@ class OctoAdapter(BasePlatformAdapter):
                     tmp_path = _os.path.join(FILE_TEMP_DIR, tmp_name)
                     total = 0
                     with open(tmp_path, "wb") as f:
+                        if inline_prefix:
+                            total = len(inline_prefix)
+                            f.write(inline_prefix)
                         async for chunk in resp.content.iter_chunked(64 * 1024):
                             total += len(chunk)
                             if total > FILE_DOWNLOAD_MAX_BYTES:
@@ -2968,34 +3026,40 @@ class OctoAdapter(BasePlatformAdapter):
                                     _os.unlink(tmp_path)
                                 except Exception:
                                     pass
-                                return (
+                                return _InboundFileResolution(
                                     f"[文件: {filename} ({_format_size(total)}+) — "
-                                    f"超过最大下载限制 ({_format_size(FILE_DOWNLOAD_MAX_BYTES)})]"
+                                    f"超过最大下载限制 "
+                                    f"({_format_size(FILE_DOWNLOAD_MAX_BYTES)})]"
                                 )
                             f.write(chunk)
                     size_label = f" ({_format_size(total)})"
-                    return f"[文件: {filename}{size_label} - 已下载到本地: {tmp_path}]"
+                    return _InboundFileResolution(
+                        f"[文件: {filename}{size_label} - 已下载到本地: {tmp_path}]",
+                        local_path=tmp_path,
+                    )
 
-            except TimeoutError as e:
-                last_err = f"下载超时 (attempt {attempt}/{max_retries})"
+            except TimeoutError:
+                last_err = "下载超时"
                 logger.warning(
-                    "[%s] file download timeout for %s: %s", self.name, filename, e
-                )
-            except Exception as e:
-                last_err = str(e)
-                logger.warning(
-                    "[%s] file download error for %s (attempt %d/%d): %s",
-                    self.name,
-                    filename,
+                    "octo: inbound_file_download failed (attempt %d/%d; TimeoutError)",
                     attempt,
                     max_retries,
-                    e,
+                )
+            except Exception as exc:
+                last_err = "下载失败"
+                logger.warning(
+                    "octo: inbound_file_download failed (attempt %d/%d; %s)",
+                    attempt,
+                    max_retries,
+                    type(exc).__name__,
                 )
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
 
         size_info = f" ({_format_size(known_size)})" if known_size else ""
-        return f"[文件: {filename}{size_info} - {last_err or '下载失败'}]"
+        return _InboundFileResolution(
+            f"[文件: {filename}{size_info} - {last_err or '下载失败'}]"
+        )
 
     async def _download_inbound_media_to_local(
         self, url: str, mime: str | None
@@ -3047,10 +3111,9 @@ class OctoAdapter(BasePlatformAdapter):
             ) as resp:
                 if not 200 <= resp.status < 300:
                     logger.warning(
-                        "[%s] inbound media download HTTP %d for %s",
+                        "[%s] inbound media download rejected (HTTP %d)",
                         self.name,
                         resp.status,
-                        url,
                     )
                     return None
                 total = 0
@@ -3071,9 +3134,11 @@ class OctoAdapter(BasePlatformAdapter):
                             return None
                         f.write(chunk)
             return tmp_path
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                "[%s] inbound media download failed for %s: %s", self.name, url, e
+                "[%s] inbound media download failed (%s)",
+                self.name,
+                type(exc).__name__,
             )
             try:
                 _os.unlink(tmp_path)
@@ -3100,27 +3165,19 @@ class OctoAdapter(BasePlatformAdapter):
         payload = inner.get("payload") or {}
         msg_type = payload.get("type")
         content = payload.get("content")
-        url = self._build_media_url(payload.get("url"))
+        media_placeholder = self._render_url_free_media_placeholder(
+            msg_type, payload.get("name")
+        )
         t = OctoMessageType
 
+        if media_placeholder is not None:
+            return media_placeholder
         if msg_type == t.Text:
             return content or ""
-        if msg_type == t.Image:
-            return f"[图片]\n{url}".strip() if url else "[图片]"
-        if msg_type == t.GIF:
-            return f"[GIF]\n{url}".strip() if url else "[GIF]"
-        if msg_type == t.Voice:
-            return f"[语音]\n{url}".strip() if url else "[语音]"
-        if msg_type == t.Video:
-            return f"[视频]\n{url}".strip() if url else "[视频]"
         if msg_type == t.Location:
             return _format_location_text(payload)
         if msg_type == t.Card:
             return _format_card_text(payload, "[名片]")
-        if msg_type == t.File:
-            name = payload.get("name")
-            label = f"[文件: {name}]" if name else "[文件]"
-            return f"{label}\n{url}".strip() if url else label
         if msg_type == t.InteractiveCard:
             plain = payload.get("plain")
             return plain if isinstance(plain, str) and plain else "[卡片]"
@@ -3310,25 +3367,14 @@ class OctoAdapter(BasePlatformAdapter):
         autocorrect. The leading space defeats hermes' strict
         ``text.startswith("/")`` slash detection, so we trim it back.
         """
+        media_placeholder = self._render_url_free_media_placeholder(
+            payload.type, payload.name
+        )
+        if media_placeholder is not None:
+            return media_placeholder
         if payload.type == OctoMessageType.Text:
             raw = payload.content or ""
             return raw.lstrip() if raw else ""
-        elif payload.type == OctoMessageType.Image:
-            url = self._build_media_url(payload.url) or ""
-            return f"[图片]\n{url}".strip()
-        elif payload.type == OctoMessageType.GIF:
-            url = self._build_media_url(payload.url) or ""
-            return f"[GIF]\n{url}".strip()
-        elif payload.type == OctoMessageType.Voice:
-            url = self._build_media_url(payload.url) or ""
-            return f"[语音消息]\n{url}".strip()
-        elif payload.type == OctoMessageType.Video:
-            url = self._build_media_url(payload.url) or ""
-            return f"[视频]\n{url}".strip()
-        elif payload.type == OctoMessageType.File:
-            name = payload.name or "未知文件"
-            url = self._build_media_url(payload.url) or ""
-            return f"[文件: {name}]\n{url}".strip()
         elif payload.type == OctoMessageType.Location:
             return _format_location_text(payload.extra)
         elif payload.type == OctoMessageType.Card:
@@ -4061,7 +4107,6 @@ class OctoAdapter(BasePlatformAdapter):
                     download_session,
                     source,
                     max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
-                    enforce_host_safety=True,
                     policy=getattr(
                         download_session,
                         "transport_policy",

@@ -138,26 +138,25 @@ class TestResolveContent:
         payload = MessagePayload(type=MessageType.Image, url="https://example.com/img.png")
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
-        assert "[图片]" in result
-        assert "https://example.com/img.png" in result
+        assert result == "[图片]"
 
     def test_voice_message(self):
         payload = MessagePayload(type=MessageType.Voice, url="https://example.com/voice.ogg")
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
-        assert "[语音消息]" in result
+        assert result == "[语音消息]"
 
     def test_file_message(self):
         payload = MessagePayload(type=MessageType.File, name="doc.pdf", url="https://example.com/doc.pdf")
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
-        assert "[文件: doc.pdf]" in result
+        assert result == "[文件: doc.pdf]"
 
     def test_video_message(self):
         payload = MessagePayload(type=MessageType.Video, url="https://example.com/video.mp4")
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
-        assert "[视频]" in result
+        assert result == "[视频]"
 
     def test_location_message(self):
         payload = MessagePayload(type=MessageType.Location)
@@ -355,6 +354,90 @@ class TestHistoryRecording:
         assert len(adapter._group_histories["group1"]) == 3
         # Should keep the last 3
         assert adapter._group_histories["group1"][0]["body"] == "msg7"
+
+    @pytest.mark.asyncio
+    async def test_api_media_history_never_includes_remote_urls(self, monkeypatch):
+        adapter = make_bare_adapter()
+        adapter._history_limit = 10
+        adapter._http_session = MagicMock()
+        urls = [
+            "https://files.example/report.pdf?X-Amz-Signature=signed-secret",
+            "https://public.example/photo.jpg",
+            "http://169.254.169.254/latest/meta-data/token",
+            "https://files.example/video.mp4?signature=another-secret",
+        ]
+        messages = [
+            {
+                "from_uid": "u1",
+                "type": int(MessageType.File),
+                "name": "report.pdf",
+                "content": urls[0],
+                "url": urls[0],
+                "payload": {},
+            },
+            {
+                "from_uid": "u2",
+                "type": int(MessageType.Image),
+                "content": urls[1],
+                "url": urls[1],
+                "payload": {},
+            },
+            {
+                "from_uid": "u3",
+                "type": int(MessageType.Voice),
+                "content": urls[2],
+                "url": urls[2],
+                "payload": {},
+            },
+            {
+                "from_uid": "u4",
+                "type": int(MessageType.Video),
+                "content": urls[3],
+                "url": urls[3],
+                "payload": {},
+            },
+        ]
+        monkeypatch.setattr(
+            "hermes_octo_plugin.adapter.api.get_channel_messages",
+            AsyncMock(return_value=messages),
+        )
+
+        context = await adapter._build_history_context("group-1", "bot-1")
+
+        assert "[文件: report.pdf]" in context
+        assert "[图片]" in context
+        assert "[语音消息]" in context
+        assert "[视频]" in context
+        assert all(url not in context for url in urls)
+
+    @pytest.mark.asyncio
+    async def test_read_channel_failure_uses_generic_error_and_safe_log(
+        self, caplog, monkeypatch
+    ):
+        adapter = make_bare_adapter()
+        adapter._http_session = MagicMock()
+        secret_url = "https://files.example/history?X-Amz-Signature=signed-secret"
+        adapter.check_read_permission = AsyncMock(
+            return_value=(
+                SimpleNamespace(allowed=True),
+                "group-1",
+                int(ChannelType.Group),
+            )
+        )
+        monkeypatch.setattr(
+            "hermes_octo_plugin.adapter.api.get_channel_messages",
+            AsyncMock(side_effect=RuntimeError(f"history fetch failed: {secret_url}")),
+        )
+
+        result = await adapter.read_channel_messages(
+            requester_uid="person&admin=true#private",
+            target="group-1",
+        )
+
+        assert result == {"ok": False, "error": "API call failed"}
+        assert secret_url not in caplog.text
+        assert "person&admin=true#private" not in caplog.text
+        assert "read_channel_messages failed (RuntimeError)" in caplog.text
 
 
 class TestGroupMdHandling:

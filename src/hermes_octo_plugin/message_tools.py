@@ -540,6 +540,7 @@ async def octo_edit_card_handler(args: dict[str, Any], **_kwargs: Any) -> str:
     raw_blocks = args.get("blocks")
     if not isinstance(raw_blocks, list):
         return _error("blocks must be a controlled display block array")
+    final = bool(args.get("final", True))
     registry = adapter._card_sessions
     card_seq = registry.claim_edit(
         message_id=message_id,
@@ -573,8 +574,7 @@ async def octo_edit_card_handler(args: dict[str, Any], **_kwargs: Any) -> str:
                 card=rendered.card,
                 card_seq=card_seq,
                 plain=rendered.plain,
-                transient=not bool(args.get("final", True)),
-                profile=CARD_PROFILE_V1,
+                transient=not final,
             )
     except (cards.CardLimitError, TypeError, ValueError) as exc:
         registry.release(message_id, claim_id)
@@ -583,7 +583,10 @@ async def octo_edit_card_handler(args: dict[str, Any], **_kwargs: Any) -> str:
         registry.release(message_id, claim_id)
         logger.error("Octo edit-card tool failed (%s)", type(exc).__name__)
         return _error("Octo card edit failed")
-    registry.complete(message_id, claim_id)
+    if final:
+        registry.complete(message_id, claim_id)
+    else:
+        registry.release_edit(message_id, card_seq)
     return _ok(edited=True, message_id=message_id, card_seq=card_seq)
 
 

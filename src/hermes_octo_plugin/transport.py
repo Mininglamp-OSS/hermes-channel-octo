@@ -38,6 +38,10 @@ def is_private_or_metadata_host(hostname: str) -> bool:
         ip = ipaddress.ip_address(normalized)
     except ValueError:
         return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if str(ip) in _METADATA_HOSTS:
+        return True
     return (
         ip.is_loopback
         or ip.is_private
@@ -144,7 +148,6 @@ class TransportPolicy:
             for value in (trusted_origins or set())
             if (origin := _safe_private_trust_origin(value)) is not None
         }
-        self._trusted_upload_origins: set[TransportOrigin] = set()
         self._trusted_connection_endpoints = {
             (host, port) for _, host, port in self._trusted_download_origins
         }
@@ -178,33 +181,7 @@ class TransportPolicy:
         with self._lock:
             return frozenset(self._trusted_connection_endpoints)
 
-    def is_upload_url_trusted(self, url: str) -> bool:
-        origin = _canonical_origin(url)
-        if origin is None:
-            return False
-        with self._lock:
-            return origin in self._trusted_upload_origins
 
-    def trust_validated_upload_origin(self, url: str) -> None:
-        origin = _safe_private_trust_origin(url)
-        if origin is None:
-            raise RuntimeError("unsafe presigned upload URL")
-        _, host, _ = origin
-        literal = _canonical_literal_ip(host)
-        literal_ip = ipaddress.ip_address(literal) if literal is not None else None
-        requires_private_opt_in = is_private_or_metadata_host(host) or (
-            literal_ip is not None
-            and (literal_ip.is_loopback or literal_ip.is_private)
-        )
-        allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        if requires_private_opt_in and not allow_private:
-            return
-        with self._lock:
-            self._trusted_upload_origins.add(origin)
 
 class SSRFGuardResolver(AbstractResolver):
     def __init__(
@@ -338,11 +315,15 @@ class SSRFGuardConnector(aiohttp.TCPConnector):
                     self._resolver_closed = True
 
 
-def new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
-    trusted_origins: set[str] = set()
-    if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}:
-        trusted_origins.update(url for url in configured_urls if url)
-    policy = TransportPolicy(trusted_origins)
+def new_guarded_http_session(
+    *configured_urls: str,
+    policy: TransportPolicy | None = None,
+) -> aiohttp.ClientSession:
+    if policy is None:
+        trusted_origins: set[str] = set()
+        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}:
+            trusted_origins.update(url for url in configured_urls if url)
+        policy = TransportPolicy(trusted_origins)
     resolver = SSRFGuardResolver(policy=policy)
     connector = SSRFGuardConnector(resolver=resolver, policy=policy)
     session = aiohttp.ClientSession(connector=connector)

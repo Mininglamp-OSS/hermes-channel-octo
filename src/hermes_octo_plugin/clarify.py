@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 
-_NATIVE_CLARIFY_MIN = "0.20"
-_NATIVE_CLARIFY_MAX_EXCLUSIVE = "0.21"
+_NATIVE_CLARIFY_RELEASE = (0, 20)
+_native_clarify_gate_log: set[tuple[str, bool]] = set()
 
 
 def native_clarify_supported() -> bool:
@@ -46,11 +46,22 @@ def native_clarify_supported() -> bool:
             exc_info=exc,
         )
         return False
-    return (
-        Version(_NATIVE_CLARIFY_MIN)
-        <= installed
-        < Version(_NATIVE_CLARIFY_MAX_EXCLUSIVE)
+    enabled = (
+        installed.release[:2] == _NATIVE_CLARIFY_RELEASE
+        and installed.pre is None
+        and installed.dev is None
+        and installed.post is None
+        and installed.local is None
     )
+    decision = (str(installed), enabled)
+    if decision not in _native_clarify_gate_log:
+        _native_clarify_gate_log.add(decision)
+        logger.info(
+            "[Octo] native clarify %s for hermes-agent %s; requires stable 0.20.x",
+            "enabled" if enabled else "disabled",
+            installed,
+        )
+    return enabled
 
 
 def registered_clarify_entry(clarify_id: str) -> Any | None:
@@ -107,7 +118,7 @@ def _entry_matches_session(
     clarify: ClarifySession,
 ) -> bool:
     return bool(
-        entry is not None
+        entry is clarify.entry
         and entry.session_key == session.session_key
         and entry.question == clarify.question
         and tuple(entry.choices or ()) == clarify.choices
@@ -289,7 +300,7 @@ async def deliver(
 
     if len(choices) > 4 or len(set(choices)) != len(choices):
         return await fallback_with_deadline(entry)
-    multi_select = bool(entry.multi_select)
+    multi_select = bool(getattr(entry, "multi_select", False))
 
     try:
         manifest = adapter._card_profile_cache.get()
@@ -451,6 +462,7 @@ async def deliver(
                 max_inputs_bytes=capabilities.max_inputs_bytes,
                 clarify=ClarifySession(
                     clarify_id=clarify_id,
+                    entry=entry,
                     multi_select=bool(multi_select),
                     question=question,
                     choices=tuple(choices),

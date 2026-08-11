@@ -245,6 +245,73 @@ async def test_progress_lifecycle_sends_then_edits_transient_and_final() -> None
     assert controller.state_count == 0
 
 
+@pytest.mark.asyncio
+async def test_progress_client_message_id_is_stable_per_state_and_unique_after_reuse():
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(
+        side_effect=[
+            SendMessageResult(message_id="progress-1"),
+            SendMessageResult(message_id="progress-2"),
+        ]
+    )
+    edit = AsyncMock(return_value={})
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+        patch.object(card_progress.api, "edit_card_message", edit),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/first.py"},
+        )
+        await adapter.run_next()
+        first_state = next(iter(controller._states.values()))
+        first_id = first_state.client_msg_no
+        assert first_id == first_state.client_msg_no
+
+        controller.complete(session_id="session-1", turn_id="turn-1")
+        await adapter.run_next()
+        assert controller.state_count == 0
+
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-2",
+            tool_name="read",
+            args={"path": "/tmp/second.py"},
+        )
+        second_state = next(iter(controller._states.values()))
+        second_id = second_state.client_msg_no
+        assert second_id == second_state.client_msg_no
+        await adapter.run_next()
+
+    assert first_id != second_id
+    assert [call.kwargs["client_msg_no"] for call in send.await_args_list] == [
+        first_id,
+        second_id,
+    ]
+
+
 
 
 @pytest.mark.asyncio
@@ -314,12 +381,11 @@ async def test_follow_up_rolls_old_card_to_stopped_and_sends_new_card_at_bottom(
         await adapter.run_next()
 
     assert send.await_count == 2
-    assert [
+    client_msg_nos = [
         call.kwargs["client_msg_no"] for call in send.await_args_list
-    ] == [
-        "card-progress:turn-1:0",
-        "card-progress:turn-1:1",
     ]
+    assert len(set(client_msg_nos)) == 2
+    assert all(value.startswith("card-progress:") for value in client_msg_nos)
     old_final = edit.await_args_list[0].kwargs
     assert old_final["message_id"] == "progress-1"
     assert old_final["transient"] is False
@@ -374,7 +440,7 @@ async def test_follow_up_drops_an_old_card_that_was_never_sent() -> None:
         await adapter.run_next()
 
     send.assert_awaited_once()
-    assert send.await_args.kwargs["client_msg_no"] == "card-progress:turn-1:1"
+    assert send.await_args.kwargs["client_msg_no"].startswith("card-progress:")
     assert "运行命令" in send.await_args.kwargs["plain"]
     assert "读取文件" not in send.await_args.kwargs["plain"]
 
@@ -645,7 +711,7 @@ async def test_progress_turns_are_isolated_and_session_cancel_drops_pending_work
         await adapter.run_next()
 
     assert send.await_count == 1
-    assert send.await_args.kwargs["client_msg_no"] == "card-progress:turn-2:0"
+    assert send.await_args.kwargs["client_msg_no"].startswith("card-progress:")
 
 
 @pytest.mark.asyncio

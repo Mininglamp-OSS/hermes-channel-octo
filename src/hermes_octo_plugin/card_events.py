@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,19 @@ _MAX_EVENT_ENVELOPE_BYTES = 64 << 10
 _ACK_ATTEMPTS = 3
 _ACK_RETRY_SECONDS = 0.1
 _MAX_PENDING_ACK_FLUSH_FAILURES = 3
+_MAX_REJECTION_LOG_KEYS = 256
+_MAX_REJECTION_LOGS = 10
+_REJECTION_STATUSES = frozenset(
+    {
+        "dead_letter",
+        "expired",
+        "failed",
+        "ignored",
+        "invalid",
+        "missing",
+        "unsupported",
+    }
+)
 
 logger = logging.getLogger(__name__)
 _OWNER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -793,6 +807,10 @@ class EventPoller:
         self._pending_ack_flush_failures = 0
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._logged_rejections: OrderedDict[tuple[int, str, str, str], None] = (
+            OrderedDict()
+        )
+        self._rejection_logs_remaining = 0
 
     @property
     def cursor(self) -> int:
@@ -816,6 +834,43 @@ class EventPoller:
                 and safe_pending_ack_event_id <= self._cursor
             )
             else None
+        )
+
+    def _warn_rejection(
+        self,
+        *,
+        event: Mapping[str, object],
+        event_id: int,
+        action: CardAction | None,
+        reason: str,
+    ) -> None:
+        raw = event.get("event_data")
+        if action is not None:
+            message_id = action.message_id
+            action_id = action.action_id
+        elif isinstance(raw, Mapping):
+            message_id = _bounded_string(raw.get("message_id")) or "<invalid>"
+            action_id = (
+                _bounded_string(raw.get("action_id"), max_chars=64) or "<invalid>"
+            )
+        else:
+            message_id = "<invalid>"
+            action_id = "<invalid>"
+        key = (event_id, message_id, action_id, reason)
+        if key in self._logged_rejections:
+            return
+        if self._rejection_logs_remaining <= 0:
+            return
+        self._rejection_logs_remaining -= 1
+        self._logged_rejections[key] = None
+        if len(self._logged_rejections) > _MAX_REJECTION_LOG_KEYS:
+            self._logged_rejections.popitem(last=False)
+        logger.warning(
+            "Octo card action rejected event_id=%d message_id=%s action_id=%s reason=%s",
+            event_id,
+            message_id,
+            action_id,
+            reason,
         )
 
     async def _ack(self, event_id: int) -> bool:
@@ -868,6 +923,7 @@ class EventPoller:
         return True
 
     async def poll_once(self) -> float:
+        self._rejection_logs_remaining = _MAX_REJECTION_LOGS
         started_at = self._clock()
         try:
             if not await self._flush_pending_ack():
@@ -901,6 +957,27 @@ class EventPoller:
                     if action is not None
                     else None
                 )
+                if action is None:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=None,
+                        reason="parse_invalid",
+                    )
+                elif status in _REJECTION_STATUSES:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=action,
+                        reason=status,
+                    )
+                elif status is None:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=action,
+                        reason="unhandled",
+                    )
                 should_ack = status in {
                     "completed",
                     "awaiting_text",

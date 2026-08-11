@@ -28,6 +28,8 @@ dependencies = [
   # ceiling = next major (SemVer-respecting libraries).
   "websockets>=15.0,<16",
   "aiohttp>=3.13,<4",
+  # Keep the 46.x floor for supported older runtimes; Hermes 0.20 is verified
+  # with 48.0.1. Hold <49 until that next major has compatibility evidence.
   "cryptography>=46.0,<49",
   # Required by ``websockets`` when the runtime declares a SOCKS proxy via
   # ALL_PROXY / HTTPS_PROXY env vars; without it ``websockets.connect``

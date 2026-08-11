@@ -62,7 +62,13 @@ $HERMES plugins enable octo
 $PIP install 'websockets>=15.0,<16' 'aiohttp>=3.13,<4' \
              'cryptography>=46.0,<49' 'python-socks>=2.8,<3' \
              'packaging>=24,<27'
+
 ```
+
+The `cryptography>=46,<49` range intentionally supports cryptography 46.x and
+48.x: 46.x remains compatible with supported older runtimes, while Hermes 0.20
+is verified with cryptography 48.0.1. Version 49 is excluded pending a
+dedicated compatibility check.
 
 `hermes plugins install` clones into `$HERMES_HOME/plugins/octo/` (the
 directory name comes from `plugin.yaml`'s `name:` field, not the repo
@@ -105,9 +111,15 @@ exposed to the model. These tools derive the destination and requester from
 Hermes' task-local Octo session, and their schemas accept no channel or identity
 overrides. Outbound local media must first pass the installed Hermes runtime's
 native media-delivery authorization, then uses inode/no-symlink and 100 MiB
-checks before upload. HTTP(S) media retains the guarded download flow. Adapter-
-native Hermes media delivery also accepts `data:` URLs; the model-facing tools
-accept HTTP(S), `file://`, and authorized local paths.
+checks before upload. On Hermes 0.14, a missing or rejecting local-media
+validator fails closed: the plugin never substitutes its own authorization
+decision. HTTP(S) media retains the guarded download flow. Adapter-native Hermes
+media delivery also accepts `data:` URLs; the model-facing tools accept HTTP(S),
+`file://`, and authorized local paths.
+
+For inbound commands, the plugin removes only a leading self-mention immediately
+followed by a slash command so Hermes can route that command. Other self-mentions
+and every non-command mention remain part of the message text.
 
 Interactive card actions are accepted only while the originating in-process
 card session remains registered and only when message, channel, operator,
@@ -116,17 +128,18 @@ persisted before acknowledgement. These paths are covered by local automated
 tests; production-server card/action/media interoperability still requires the
 separately authorized live acceptance checks.
 
-On Hermes `>=0.20.0`, bounded clarifies with choices use the same trusted
-current-conversation route and Type-17 session binding. Native delivery has one
-12-second deadline, waits at most 5 seconds for an active progress card's first
-send, and rechecks the same pending clarify before every POST. Single-select
-prompts render one submit action per choice; multi-select prompts render
-`Input.ChoiceSet` plus Submit; both include an **Other** action that switches
-the existing clarify to Hermes text capture. Choice clicks call Hermes'
-clarify resolution primitive directly and never become a new model turn.
-Card/profile/render failures use the base text fallback. Ambiguous POST
-failures retry once with the same `client_msg_no` and never send a second
-prompt. This version gate is automatic and has no configuration switch.
+On stable Hermes 0.20.x only, bounded clarifies with choices use the same
+trusted current-conversation route and Type-17 session binding. Prerelease,
+development, and 0.21+ Hermes versions use the base text fallback. Native
+delivery has one 12-second deadline, waits at most 5 seconds for an active
+progress card's first send, and rechecks the same pending clarify before every
+POST. Single-select prompts render one submit action per choice; multi-select
+prompts render `Input.ChoiceSet` plus Submit; both include an **Other** action
+that switches the existing clarify to Hermes text capture. Choice clicks call
+Hermes' clarify resolution primitive directly and never become a new model turn.
+Card/profile/render failures use the base text fallback. Ambiguous POST failures
+retry once with the same `client_msg_no` and never send a second prompt. This
+version gate is automatic and has no configuration switch.
 
 ## Start / Verify
 

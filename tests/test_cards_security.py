@@ -27,7 +27,6 @@ def test_card_text_preserves_embedded_urls_and_content() -> None:
         "dsn user:p4ss@db.private.example.com/prod",
         "hook //hooks.private.example.com/services/K9x7",
         "hook hooks.private.example.com/services/K9x7",
-        "click [here](javascript:alert(1))",
         "xapp-1-A1234567890-B1234567890-C1234567890",
         "npm_123456789012345678901234567890123456",
         "shpat_" + "12345678901234567890123456789012",
@@ -39,6 +38,26 @@ def test_visible_text_preserves_content_without_dlp_guessing(text: str) -> None:
         blocks=[{"type": "text", "text": text}]
     )
     assert rendered.card["body"][0]["text"] == text
+    assert rendered.plain == text
+
+
+def test_visible_text_renders_markdown_links_as_literal_prose() -> None:
+    text = "click [here](javascript:alert(1))"
+
+    rendered = cards.build_display_card(blocks=[{"type": "text", "text": text}])
+
+    assert rendered.card["body"][0]["text"] == r"click \[here](javascript:alert(1))"
+    assert rendered.plain == text
+
+
+def test_visible_text_renders_markdown_images_as_literal_prose() -> None:
+    text = "preview ![report](https://cdn.example/report.png)"
+
+    rendered = cards.build_display_card(blocks=[{"type": "text", "text": text}])
+
+    assert rendered.card["body"][0]["text"] == (
+        r"preview !\[report](https://cdn.example/report.png)"
+    )
     assert rendered.plain == text
 
 
@@ -88,6 +107,51 @@ def test_action_url_rejects_dangerous_or_ambiguous_targets(url: str) -> None:
     with pytest.raises(ValueError, match="safe http"):
         cards.sanitize_action_url(url)
 
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://10.0.0.8/report.png",
+        "https://metadata.google.internal/computeMetadata/v1/",
+        "https://user:password@cdn.example/report.png",
+        "file:///var/tmp/report.png",
+    ],
+)
+def test_automatically_fetched_card_images_reject_unsafe_urls(url: str) -> None:
+    with pytest.raises(ValueError, match="safe http"):
+        cards.build_display_card(
+            blocks=[{"type": "image", "url": url, "alt": "Report"}]
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://[fe80::1]/status",
+    ],
+)
+def test_open_url_rejects_metadata_and_unconditionally_unsafe_addresses(
+    url: str,
+) -> None:
+    with pytest.raises(ValueError, match="safe http"):
+        cards.sanitize_action_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://10.24.8.12:8080/reports/today",
+        "https://files.internal.example/download/42",
+        "http://localhost:3000/status",
+    ],
+)
+def test_open_url_preserves_legitimate_intranet_and_self_hosted_destinations(
+    url: str,
+) -> None:
+    assert cards.sanitize_action_url(url) == url
 
 
 @pytest.mark.parametrize(

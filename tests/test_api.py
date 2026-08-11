@@ -321,35 +321,52 @@ class TestApiFailureTruth:
     async def test_presigned_upload_error_never_exposes_response_body_or_url(self):
         upload_url = "https://storage.example/upload?signature=secret"
         session = _FailedApiSession()
-        with pytest.raises(RuntimeError, match="HTTP 503") as exc_info:
-            await upload_file_to_presigned_url(
-                session,
-                upload_url=upload_url,
-                download_url="https://cdn.example/file",
-                file_data=b"payload",
-                content_type="application/octet-stream",
-            )
+        guarded_session = MagicMock()
+        guarded_session.put = MagicMock(return_value=_FailedApiResponse())
+        guarded_session.close = AsyncMock()
+        with patch.object(
+            api,
+            "new_guarded_http_session",
+            return_value=guarded_session,
+        ):
+            with pytest.raises(RuntimeError, match="HTTP 503") as exc_info:
+                await upload_file_to_presigned_url(
+                    session,
+                    upload_url=upload_url,
+                    download_url="https://cdn.example/file",
+                    file_data=b"payload",
+                    content_type="application/octet-stream",
+                )
 
         assert "secret-token-from-backend" not in str(exc_info.value)
         assert upload_url not in str(exc_info.value)
         assert "signature=secret" not in str(exc_info.value)
-        assert session.put.call_args.kwargs["allow_redirects"] is False
+        assert guarded_session.put.call_args.kwargs["allow_redirects"] is False
+        guarded_session.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_presigned_upload_rejects_redirect_without_following_it(self):
         session = MagicMock()
-        session.put = MagicMock(return_value=_RedirectResponse())
+        guarded_session = MagicMock()
+        guarded_session.put = MagicMock(return_value=_RedirectResponse())
+        guarded_session.close = AsyncMock()
 
-        with pytest.raises(RuntimeError, match="HTTP 302"):
-            await upload_file_to_presigned_url(
-                session,
-                upload_url="https://storage.example/upload",
-                download_url="https://cdn.example/file",
-                file_data=b"payload",
-                content_type="application/octet-stream",
-            )
+        with patch.object(
+            api,
+            "new_guarded_http_session",
+            return_value=guarded_session,
+        ):
+            with pytest.raises(RuntimeError, match="HTTP 302"):
+                await upload_file_to_presigned_url(
+                    session,
+                    upload_url="https://storage.example/upload",
+                    download_url="https://cdn.example/file",
+                    file_data=b"payload",
+                    content_type="application/octet-stream",
+                )
 
-        assert session.put.call_args.kwargs["allow_redirects"] is False
+        assert guarded_session.put.call_args.kwargs["allow_redirects"] is False
+        guarded_session.close.assert_awaited_once()
 
     def test_read_local_media_rejects_symlink_before_open(self, tmp_path):
         target = tmp_path / "secret.txt"
@@ -370,6 +387,78 @@ class TestApiFailureTruth:
         assert signed_url not in str(exc_info.value)
         assert "signed-secret" not in str(exc_info.value)
 
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [300, 304])
+    async def test_download_rejects_every_non_2xx_status_before_body_read(
+        self,
+        status: int,
+    ):
+        class UnexpectedBody:
+            def __init__(self):
+                self.read = False
+
+            async def iter_any(self):
+                self.read = True
+                raise AssertionError("non-2xx response body must not be consumed")
+                yield b""
+
+        class NonSuccessResponse:
+            ok = True
+            headers = {"Content-Type": "application/octet-stream"}
+
+            def __init__(self, response_status: int):
+                self.status = response_status
+                self.content = UnexpectedBody()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        response = NonSuccessResponse(status)
+        session = MagicMock()
+        session.get = MagicMock(return_value=response)
+
+        with pytest.raises(RuntimeError, match=rf"Download failed \(HTTP {status}\)"):
+            await download_file(session, "https://files.example.invalid/report")
+
+        assert response.content.read is False
+
+
+    @pytest.mark.asyncio
+    async def test_download_redirects_share_one_total_deadline(self):
+        redirect = _RedirectResponse()
+        redirect.headers = {"Location": "/next"}
+        clock = {"value": 100.0}
+        responses = iter([redirect, _SuccessfulDownloadResponse()])
+
+        def get(*_args, **_kwargs):
+            response = next(responses)
+            if response is redirect:
+                clock["value"] = 102.0
+            return response
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=get)
+
+        with patch.object(
+            api.time,
+            "monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            data, _, _ = await download_file(
+                session,
+                "https://files.example.invalid/report",
+                timeout_seconds=10,
+            )
+
+        assert data == b""
+        assert [
+            request.kwargs["timeout"].total
+            for request in session.get.call_args_list
+        ] == [10.0, 8.0]
     @pytest.mark.asyncio
     async def test_download_rejects_malformed_content_length_without_echoing_it(self):
         response = _SuccessfulDownloadResponse()
@@ -537,14 +626,16 @@ class TestApiFailureTruth:
         session.get.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_outbound_download_policy_accepts_private_media_sources(self):
+    async def test_outbound_download_policy_accepts_exact_private_media_origin(self):
         session = MagicMock()
         session.get = MagicMock(return_value=_SuccessfulDownloadResponse())
+        from hermes_octo_plugin.transport import TransportPolicy
 
+        policy = TransportPolicy({"http://10.0.0.8"})
         data, content_type, filename = await download_file(
             session,
             "http://10.0.0.8/report.bin",
-            enforce_host_safety=False,
+            policy=policy,
         )
 
         assert data == b""
@@ -569,11 +660,7 @@ class TestApiFailureTruth:
         session = MagicMock()
 
         with pytest.raises(RuntimeError, match="unsafe download URL"):
-            await download_file(
-                session,
-                url,
-                enforce_host_safety=False,
-            )
+            await download_file(session, url)
 
         session.get.assert_not_called()
 
@@ -589,6 +676,21 @@ class TestApiFailureTruth:
         args, kwargs = session.get.call_args
         assert args == ("https://octo.test/v1/bot/user/info",)
         assert kwargs["params"] == {"uid": uid}
+
+    @pytest.mark.asyncio
+    async def test_fetch_user_info_log_omits_uid_and_raw_exception(self, caplog):
+        uid = "person&admin=true#private"
+        raw_url = "https://files.example/avatar?X-Amz-Signature=signed-secret"
+        session = MagicMock()
+        session.get = MagicMock(
+            side_effect=RuntimeError(f"request failed for {uid}: {raw_url}")
+        )
+
+        assert await fetch_user_info(session, "https://octo.test", "token", uid) is None
+
+        assert uid not in caplog.text
+        assert raw_url not in caplog.text
+        assert "octo: fetch_user_info failed (RuntimeError)" in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

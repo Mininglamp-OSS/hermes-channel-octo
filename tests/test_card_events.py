@@ -168,16 +168,17 @@ def test_card_action_parser_is_total_and_rejects_oversized_or_noncanonical_value
 ) -> None:
     assert card_events.parse_card_action(raw) is None
 
-def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
+def test_registry_claims_only_ordinary_interactive_card_edits() -> None:
     registry = card_events.CardSessionRegistry()
-    registry.register(_session())
     exact = {
-        "message_id": "message-1",
         "session_key": "session-1",
         "channel_id": "group-1",
         "channel_type": ChannelType.Group,
         "requester_uid": "user-1",
     }
+    registry.register(_session())
+    registry.register(_session(message_id="clarify-1", clarify=object()))
+    registry.register(_session(message_id="reasoning-1", kind="reasoning"))
 
     for field, forged in (
         ("session_key", "other-session"),
@@ -185,13 +186,47 @@ def test_registry_claims_card_edits_only_for_the_exact_live_session() -> None:
         ("channel_type", ChannelType.DM),
         ("requester_uid", "other-user"),
     ):
-        assert registry.claim_edit(**{**exact, field: forged}) is None
+        assert registry.claim_edit(
+            message_id="message-1",
+            **{**exact, field: forged},
+        ) is None
 
-    assert registry.claim_edit(**exact) == 1
-    assert registry.claim("message-1", 99).status == "duplicate"
-    registry.complete("message-1", -1)
-    assert registry.claim_edit(**exact) is None
+    assert registry.claim_edit(message_id="clarify-1", **exact) is None
+    assert registry.claim_edit(message_id="reasoning-1", **exact) is None
+    assert registry.claim_edit(message_id="message-1", **exact) == 1
+    registry.release_edit("message-1", 1)
+    assert registry.claim_edit(message_id="message-1", **exact) == 2
+    registry.complete("message-1", -2)
+    assert registry.claim_edit(message_id="message-1", **exact) is None
 
+
+def test_registry_registration_rejects_invalid_ids_and_unsafe_capacity_eviction() -> None:
+    registry = card_events.CardSessionRegistry(max_sessions=1)
+
+    with pytest.raises(ValueError, match="message_id"):
+        registry.register(_session(message_id=""))
+
+    registry.register(_session())
+    with pytest.raises(ValueError, match="capacity"):
+        registry.register(_session(message_id="message-2"))
+    assert registry.peek("message-1") == _session()
+
+    assert registry.claim("message-1", 1).status == "claimed"
+    registry.complete("message-1", 1)
+    registry.register(_session(message_id="message-2"))
+    assert registry.peek("message-1") is None
+    assert registry.peek("message-2") == _session(message_id="message-2")
+
+
+
+def test_registry_reregistration_preserves_an_active_claim() -> None:
+    registry = card_events.CardSessionRegistry()
+    registry.register(_session())
+
+    assert registry.claim("message-1", 99).status == "claimed"
+    registry.register(_session(plain="Updated"))
+
+    assert registry.claim("message-1", 100).status == "duplicate"
 
 def test_default_card_session_ttl_covers_the_default_clarify_window() -> None:
     with patch(
@@ -242,6 +277,97 @@ async def test_poller_does_not_ack_unowned_card_actions() -> None:
     assert cursor.saved == [11, 12, 13, 13, 14, 14, 15, 15]
     assert cursor.pending_saved == [None, None, 13, None, 14, None, 15, None]
     assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14, 15]
+
+
+@pytest.mark.asyncio
+async def test_poller_logs_each_parse_rejection_once_without_event_payload_values(
+    caplog,
+) -> None:
+    warning_counts_at_cursor_advance: list[int] = []
+
+    class _Cursor(_MemoryCursor):
+        async def save(self, event_id, *, pending_ack_event_id=None) -> None:
+            warning_counts_at_cursor_advance.append(
+                sum(
+                    record.getMessage().startswith("Octo card action rejected")
+                    for record in caplog.records
+                )
+            )
+            await super().save(
+                event_id,
+                pending_ack_event_id=pending_ack_event_id,
+            )
+
+    cursor = _Cursor(10)
+    rejected = _event(11)
+    rejected["event_type"] = "unexpected"
+    rejected["event_data"]["operator_uid"] = "operator-secret"
+    rejected["event_data"]["inputs"] = {"note": "input-secret"}
+    with (
+        caplog.at_level(logging.WARNING, logger="hermes_octo_plugin.card_events"),
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(return_value=[rejected, rejected]),
+        ),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=AsyncMock(),
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Octo card action rejected")
+    ] == [
+        "Octo card action rejected "
+        "event_id=11 message_id=message-1 action_id=approve reason=parse_invalid"
+    ]
+    assert cursor.saved == [11, 11]
+    assert warning_counts_at_cursor_advance == [1, 1]
+    assert "operator-secret" not in caplog.text
+    assert "input-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poller_bounds_unique_rejection_warnings_per_batch(caplog) -> None:
+    cursor = _MemoryCursor(10)
+    rejected = []
+    for event_id in range(11, 11 + card_events._MAX_REJECTION_LOGS + 1):
+        event = _event(event_id)
+        event["event_type"] = "unexpected"
+        rejected.append(event)
+    with (
+        caplog.at_level(logging.WARNING, logger="hermes_octo_plugin.card_events"),
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(return_value=rejected),
+        ),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=AsyncMock(),
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    assert sum(
+        record.getMessage().startswith("Octo card action rejected")
+        for record in caplog.records
+    ) == card_events._MAX_REJECTION_LOGS
+    assert cursor.saved == list(range(11, 11 + card_events._MAX_REJECTION_LOGS + 1))
 
 
 @pytest.mark.asyncio

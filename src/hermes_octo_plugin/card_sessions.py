@@ -25,6 +25,7 @@ def _valid_sequence(value: object) -> bool:
 @dataclass(frozen=True)
 class ClarifySession:
     clarify_id: str
+    entry: object
     multi_select: bool
     question: str
     choices: tuple[str, ...]
@@ -88,12 +89,28 @@ class CardSessionRegistry:
 
     def register(self, session: CardSession) -> None:
         if not _bounded_message_id(session.message_id):
-            return
+            raise ValueError("invalid card session message_id")
         with self._lock:
             self._prune_locked()
+            existing = self._entries.get(session.message_id)
+            if existing is not None and existing.state != "completed":
+                existing.session = session
+                existing.expires_at = time.monotonic() + self._ttl_seconds
+                self._entries.move_to_end(session.message_id)
+                return
             self._entries.pop(session.message_id, None)
             while len(self._entries) >= self._max_sessions:
-                self._entries.popitem(last=False)
+                completed_message_id = next(
+                    (
+                        message_id
+                        for message_id, entry in self._entries.items()
+                        if entry.state == "completed"
+                    ),
+                    None,
+                )
+                if completed_message_id is None:
+                    raise ValueError("card session registry capacity exhausted")
+                self._entries.pop(completed_message_id)
             self._entries[session.message_id] = _CardSessionEntry(
                 session=session,
                 expires_at=time.monotonic() + self._ttl_seconds,
@@ -123,6 +140,8 @@ class CardSessionRegistry:
             if entry is None or entry.state != "pending":
                 return None
             session = entry.session
+            if session.kind != "interactive" or session.clarify is not None:
+                return None
             if (
                 session.session_key != session_key
                 or session.channel_id != channel_id

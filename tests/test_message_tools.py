@@ -11,6 +11,7 @@ from uuid import UUID
 import pytest
 
 from hermes_octo_plugin import message_tools
+from hermes_octo_plugin.card_sessions import CardSession, CardSessionRegistry
 from hermes_octo_plugin.card_tools import TrustedOctoRoute
 from hermes_octo_plugin.types import (
     CardProfileManifest,
@@ -47,11 +48,30 @@ _ADAPTER = SimpleNamespace(
         side_effect=lambda content, *_args, **_kwargs: (content, None, None)
     ),
 )
-_CARD_SESSIONS = MagicMock()
-_CARD_SESSIONS.claim_edit.return_value = 1
-_CARD_SESSIONS.release_edit.return_value = None
-_CARD_SESSIONS.complete.return_value = None
-_ADAPTER._card_sessions = _CARD_SESSIONS
+def _editable_session(
+    message_id: str = "card-1",
+    *,
+    kind: str = "interactive",
+    clarify: object | None = None,
+) -> CardSession:
+    return CardSession(
+        message_id=message_id,
+        binding_id="binding-1",
+        session_key=_ROUTE.session_key,
+        chat_id=_ROUTE.chat_id,
+        channel_id=_ROUTE.channel_id,
+        channel_type=_ROUTE.channel_type,
+        requester_uid=_ROUTE.requester_uid,
+        card={},
+        plain="Editable",
+        action_labels={},
+        input_ids=(),
+        clarify=clarify,
+        kind=kind,
+    )
+
+
+_ADAPTER._card_sessions = CardSessionRegistry()
 _MANIFEST = CardProfileManifest(
     available=True,
     enabled=True,
@@ -630,55 +650,123 @@ async def test_media_tool_converts_caption_mentions_for_current_route():
 
 
 @pytest.mark.asyncio
-async def test_edit_card_tool_updates_registered_current_session_card():
+async def test_edit_card_tool_releases_transient_edits_and_completes_final_edit():
+    adapter = SimpleNamespace(
+        _api_url="https://octo.invalid",
+        _bot_token="test-token",
+        _card_profile_cache=message_tools.cards.CardProfileCache(),
+        _card_sessions=CardSessionRegistry(),
+    )
+    adapter._card_sessions.register(_editable_session())
     edit = AsyncMock()
-    _CARD_SESSIONS.reset_mock()
-    _CARD_SESSIONS.claim_edit.return_value = 7
     with (
-        _tool_context(),
-        patch.object(message_tools.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        _tool_context(adapter),
+        patch.object(
+            message_tools.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
         patch.object(message_tools.api, "edit_card_message", edit),
     ):
-        result = json.loads(
+        transient = json.loads(
             await message_tools.octo_edit_card_handler(
                 {
                     "message_id": "card-1",
                     "title": "Updated",
-                    "blocks": [{"type": "text", "text": "Done"}],
+                    "blocks": [{"type": "text", "text": "First"}],
+                    "final": False,
+                }
+            )
+        )
+        final = json.loads(
+            await message_tools.octo_edit_card_handler(
+                {
+                    "message_id": "card-1",
+                    "title": "Updated",
+                    "blocks": [{"type": "text", "text": "Final"}],
+                    "final": True,
+                }
+            )
+        )
+        after_final = json.loads(
+            await message_tools.octo_edit_card_handler(
+                {
+                    "message_id": "card-1",
+                    "blocks": [{"type": "text", "text": "Forged"}],
+                }
+            )
+        )
+
+    assert transient == {
+        "ok": True,
+        "data": {"edited": True, "message_id": "card-1", "card_seq": 1},
+    }
+    assert final == {
+        "ok": True,
+        "data": {"edited": True, "message_id": "card-1", "card_seq": 2},
+    }
+    assert after_final == {
+        "error": "card edit does not match a live trusted card session"
+    }
+    assert [
+        (call.kwargs["card_seq"], call.kwargs["transient"], call.kwargs["plain"])
+        for call in edit.await_args_list
+    ] == [
+        (1, True, "Updated\nFirst"),
+        (2, False, "Updated\nFinal"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_card_tool_releases_failed_edit_claim_for_a_later_edit():
+    adapter = SimpleNamespace(
+        _api_url="https://octo.invalid",
+        _bot_token="test-token",
+        _card_profile_cache=message_tools.cards.CardProfileCache(),
+        _card_sessions=CardSessionRegistry(),
+    )
+    adapter._card_sessions.register(_editable_session())
+    edit = AsyncMock(side_effect=[RuntimeError("network down"), None])
+    with (
+        _tool_context(adapter),
+        patch.object(
+            message_tools.api,
+            "get_card_profile",
+            AsyncMock(return_value=_MANIFEST),
+        ),
+        patch.object(message_tools.api, "edit_card_message", edit),
+    ):
+        failed = json.loads(
+            await message_tools.octo_edit_card_handler(
+                {
+                    "message_id": "card-1",
+                    "blocks": [{"type": "text", "text": "First"}],
+                }
+            )
+        )
+        retried = json.loads(
+            await message_tools.octo_edit_card_handler(
+                {
+                    "message_id": "card-1",
+                    "blocks": [{"type": "text", "text": "Second"}],
                     "final": True,
                 }
             )
         )
 
-    assert result == {
+    assert failed == {"error": "Octo card edit failed"}
+    assert retried == {
         "ok": True,
-        "data": {"edited": True, "message_id": "card-1", "card_seq": 7},
+        "data": {"edited": True, "message_id": "card-1", "card_seq": 2},
     }
-    kwargs = edit.await_args.kwargs
-    assert kwargs["channel_id"] == "group-1"
-    assert kwargs["channel_type"] == ChannelType.Group
-    assert kwargs["message_id"] == "card-1"
-    assert kwargs["card_seq"] == 7
-    assert kwargs["transient"] is False
-    assert kwargs["plain"] == "Updated\nDone"
-    _CARD_SESSIONS.claim_edit.assert_called_once_with(
-        message_id="card-1",
-        session_key="octo:group-1:user-1",
-        channel_id="group-1",
-        channel_type=ChannelType.Group,
-        requester_uid="user-1",
-    )
-    _CARD_SESSIONS.complete.assert_called_once_with("card-1", -7)
-
+    assert [call.kwargs["card_seq"] for call in edit.await_args_list] == [1, 2]
 
 @pytest.mark.asyncio
 async def test_edit_card_tool_fails_closed_without_a_matching_registered_session():
-    sessions = MagicMock()
-    sessions.claim_edit.return_value = None
     adapter = SimpleNamespace(
         _api_url="https://octo.invalid",
         _bot_token="test-token",
-        _card_sessions=sessions,
+        _card_sessions=CardSessionRegistry(),
     )
     edit = AsyncMock()
     with (

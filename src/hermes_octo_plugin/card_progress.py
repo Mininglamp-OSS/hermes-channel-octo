@@ -7,6 +7,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from concurrent.futures import Future
 from collections.abc import Mapping
@@ -70,6 +71,9 @@ class _ProgressTurn:
     session_id: str
     turn_id: str
     segment_no: int
+    client_msg_no: str = field(
+        default_factory=lambda: f"card-progress:{uuid.uuid4().hex}"
+    )
     tools: OrderedDict[str, _ProgressTool] = field(default_factory=OrderedDict)
     fallback_ids: dict[str, list[str]] = field(default_factory=dict)
     revision: int = 0
@@ -670,9 +674,7 @@ class CardProgressController:
                             template_ref=template_ref,
                             state=str(wire_data["state"]),
                             data=wire_data,
-                            client_msg_no=(
-                                f"card-progress:{state.turn_id}:{state.segment_no}"
-                            )[:128],
+                            client_msg_no=state.client_msg_no,
                         )
                     else:
                         rendered = cards.build_agent_progress_card(
@@ -691,9 +693,7 @@ class CardProgressController:
                             channel_type=state.route.channel_type,
                             card=rendered.card,
                             plain=rendered.plain,
-                            client_msg_no=(
-                                f"card-progress:{state.turn_id}:{state.segment_no}"
-                            )[:128],
+                            client_msg_no=state.client_msg_no,
                             profile=CARD_PROFILE_V1,
                         )
                     with self._lock:

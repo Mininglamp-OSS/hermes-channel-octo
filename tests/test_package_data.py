@@ -16,7 +16,13 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import tomllib
 from pathlib import Path
+
+from packaging.requirements import Requirement
+from packaging.version import Version
+
+
 
 import pytest
 
@@ -83,3 +89,21 @@ def test_data_files_ship_in_wheel(tmp_path):
     )
     assert "Requires-Dist: hermes-agent<0.21,>=0.14" in metadata
     assert "Requires-Dist: cryptography<49,>=46.0" in metadata
+
+
+def test_cryptography_dependency_covers_46_and_48_with_documented_rationale():
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    cryptography = next(
+        dependency
+        for dependency in project["project"]["dependencies"]
+        if dependency.startswith("cryptography")
+    )
+    requirement = Requirement(cryptography)
+
+    assert Version("46.0") in requirement.specifier
+    assert Version("48.0.1") in requirement.specifier
+    assert Version("49.0") not in requirement.specifier
+    readme = (REPO_ROOT / "README.md").read_text()
+    assert "cryptography 46.x" in readme
+    assert "48.x:" in readme
+    assert "cryptography 48.0.1" in readme

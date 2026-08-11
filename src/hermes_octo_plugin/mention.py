@@ -123,6 +123,37 @@ def _utf16_length(text: str) -> int:
     return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
 
 
+def _utf16_range_to_python_slice(
+    text: str,
+    offset: int,
+    length: int,
+) -> tuple[int, int] | None:
+    """Map a UTF-16 code-unit range to whole Python code point boundaries."""
+    if offset < 0 or length <= 0:
+        return None
+    end_offset = offset + length
+    code_units = 0
+    start: int | None = None
+    end: int | None = None
+    for index, char in enumerate(text):
+        if code_units == offset:
+            start = index
+        if code_units == end_offset:
+            end = index
+        if start is not None and end is not None:
+            return start, end
+        code_units += 2 if ord(char) > 0xFFFF else 1
+        if code_units > end_offset:
+            return None
+    if code_units == offset:
+        start = len(text)
+    if code_units == end_offset:
+        end = len(text)
+    if start is None or end is None:
+        return None
+    return start, end
+
+
 def convert_structured_mentions(
     text: str,
     mentions: list[StructuredMention],
@@ -253,36 +284,53 @@ def convert_content_for_llm(
     if not mention:
         return content
 
-    # Try entities (v2) — precise offset-based replacement
+    # Try entities (v2) — precise offset-based replacement.  The sidecar is
+    # atomic: a malformed, non-mention, or overlapping range makes all of it
+    # untrusted, so the v1 fallback can resolve the original text instead.
     if mention.entities:
-        valid_entities = [
-            e
-            for e in mention.entities
-            if (
-                isinstance(e, MentionEntity)
-                and e.uid
-                and isinstance(e.offset, int)
-                and isinstance(e.length, int)
-                and e.offset >= 0
-                and e.length > 0
-                and e.offset + e.length <= len(content)
+        mention_ranges = {
+            (match.start(), match.end())
+            for match in MENTION_PATTERN.finditer(content)
+        }
+        entity_ranges: list[tuple[MentionEntity, int, int]] = []
+        sidecar_valid = True
+        for entity in mention.entities:
+            if not (
+                isinstance(entity, MentionEntity)
+                and entity.uid
+                and isinstance(entity.offset, int)
+                and not isinstance(entity.offset, bool)
+                and isinstance(entity.length, int)
+                and not isinstance(entity.length, bool)
+            ):
+                sidecar_valid = False
+                break
+            slice_indices = _utf16_range_to_python_slice(
+                content,
+                entity.offset,
+                entity.length,
             )
-        ]
+            if slice_indices is None or slice_indices not in mention_ranges:
+                sidecar_valid = False
+                break
+            entity_ranges.append((entity, *slice_indices))
 
-        if valid_entities:
-            sorted_entities = sorted(valid_entities, key=lambda e: e.offset, reverse=True)
+        sorted_entities = sorted(entity_ranges, key=lambda item: item[1])
+        if any(
+            start < previous_end
+            for (_, _, previous_end), (_, start, _) in zip(
+                sorted_entities,
+                sorted_entities[1:],
+            )
+        ):
+            sidecar_valid = False
+
+        if sidecar_valid:
             result = content
-            for entity in sorted_entities:
-                original = result[entity.offset : entity.offset + entity.length]
-                if not original.startswith("@"):
-                    continue
-                name = original[1:]
+            for entity, start, end in reversed(sorted_entities):
+                name = content[start + 1:end]
                 replacement = f"@[{entity.uid}:{name}]"
-                result = (
-                    result[: entity.offset]
-                    + replacement
-                    + result[entity.offset + entity.length :]
-                )
+                result = result[:start] + replacement + result[end:]
             return result
 
     # Fallback (v1): member_map lookup or uids positional pairing
@@ -397,7 +445,11 @@ def build_entities_from_fallback(
             continue
 
         at_name = f"@{matched_name}"
-        entities.append(MentionEntity(uid=uid, offset=match.start(), length=len(at_name)))
+        entities.append(MentionEntity(
+            uid=uid,
+            offset=_utf16_length(content[:match.start()]),
+            length=_utf16_length(at_name),
+        ))
         uids.append(uid)
 
     return entities, uids

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +15,7 @@ from hermes_octo_plugin.adapter import (
     RECONNECT_STAGGER_MAX_S,
     TOKEN_REFRESH_COOLDOWN_S,
 )
+from hermes_octo_plugin.protocol import PacketType
 from tests.conftest import make_bare_adapter
 
 
@@ -503,6 +506,147 @@ async def test_do_connect_prefers_configured_websocket_url():
     assert connect.await_args.kwargs["sock"] is guarded_socket
     assert connect.await_args.kwargs["proxy"] is None
     guarded_socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_registration_info_log_omits_robot_and_owner_ids(caplog):
+    adapter = _make_adapter()
+    robot_id = "stable-robot-id"
+    owner_id = "stable-owner-id"
+    registration = MagicMock(
+        robot_id=robot_id,
+        owner_uid=owner_id,
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    caplog.set_level(logging.INFO, logger="hermes_octo_plugin.adapter")
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            AsyncMock(return_value=MagicMock()),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.websockets.connect",
+            AsyncMock(side_effect=RuntimeError("stop after registration")),
+        ),
+        pytest.raises(RuntimeError, match="stop after registration"),
+    ):
+        await adapter._do_connect()
+
+    assert "Bot registered" in caplog.text
+    assert robot_id not in caplog.text
+    assert owner_id not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_guarded_socket_closes_when_cancellation_precedes_websocket_handoff():
+    adapter = _make_adapter()
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    opened = asyncio.Event()
+
+    async def open_socket(_url: str):
+        asyncio.get_running_loop().call_soon(opened.set)
+        return guarded_socket
+
+    async def pre_handoff_connect(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            open_socket,
+        ),
+        patch("hermes_octo_plugin.adapter.websockets.connect", pre_handoff_connect),
+    ):
+        task = asyncio.create_task(adapter._do_connect())
+        await opened.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert adapter._ws is None
+    guarded_socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_websocket_handoff_does_not_close_guarded_socket():
+    adapter = _make_adapter()
+    adapter._cache_cleanup_task = MagicMock()
+    adapter._prefetch_task = MagicMock()
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    websocket = MagicMock()
+    websocket.send = AsyncMock()
+    websocket.recv = AsyncMock(return_value=b"connack")
+    connack = MagicMock(
+        reason_code=1,
+        server_key="c2VydmVyLXB1YmxpYy1rZXk=",
+        salt="0123456789abcdef",
+        server_version=4,
+    )
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            AsyncMock(return_value=guarded_socket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.websockets.connect",
+            AsyncMock(return_value=websocket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.generate_keypair",
+            return_value=(MagicMock(), b"client-public-key"),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.compute_shared_secret",
+            return_value=b"shared-secret",
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.derive_aes_key",
+            return_value=b"derived-aes-key",
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.try_unpack_one",
+            return_value=(b"connack", bytearray()),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.decode_packet",
+            return_value=(PacketType.CONNACK, connack),
+        ),
+        patch.object(adapter, "_start_heartbeat_task", AsyncMock()),
+        patch.object(adapter, "_start_receive_task", AsyncMock()),
+        patch.object(adapter, "_start_card_event_poller"),
+        patch.object(adapter, "_mark_connected"),
+    ):
+        assert await adapter._do_connect() is True
+
+    assert adapter._ws is websocket
+    guarded_socket.close.assert_not_called()
 
 
 # ─── Token refresh cooldown ──────────────────────────────────────────────────

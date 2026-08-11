@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
@@ -12,8 +13,9 @@ from itertools import islice
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qsl, unquote_plus, urlsplit
+from urllib.parse import SplitResult, parse_qsl, unquote_plus, urlsplit
 
+from .transport import canonical_url_host, is_private_or_metadata_host
 from .types import (
     CARD_PROFILE_V1,
     CARD_PROFILE_V2,
@@ -27,6 +29,15 @@ ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
 DEFAULT_MAX_CARD_NODES = 200
 DEFAULT_MAX_CARD_DEPTH = 16
 DEFAULT_MAX_CARD_PAYLOAD_BYTES = 512 << 10
+
+_CARD_METADATA_HOSTS = frozenset({
+    "169.254.169.254",
+    "fd00:ec2::254",
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "100.100.100.200",
+})
 DEFAULT_MAX_VISIBLE_TEXT_BYTES = 64 << 10
 DEFAULT_MAX_ACTION_DATA_BYTES = 16 << 10
 DEFAULT_MAX_ACTION_DATA_VALUE_BYTES = 512
@@ -738,23 +749,75 @@ def sanitize_error_text(error: object) -> str:
     return summary
 
 
-def sanitize_action_url(url: str) -> str:
-    """Return a usable HTTP(S) action target or reject an invalid URL."""
-    clean = url.strip()
+def _literal_card_text(text: str) -> str:
+    """Escape Markdown link/image openers in untrusted Adaptive Card prose."""
+    return text.replace("[", r"\[")
+
+
+def _literal_card_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def _card_url_is_unconditionally_unsafe(host: str) -> bool:
+    if host in _CARD_METADATA_HOSTS:
+        return True
+    address = _literal_card_ip(host)
+    if address is None:
+        return False
+    return (
+        str(address) in _CARD_METADATA_HOSTS
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _classify_card_url(
+    value: object,
+    *,
+    automatically_fetched: bool,
+    field: str,
+) -> tuple[str, SplitResult]:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a safe http URL")
+    clean = value.strip()
     if not clean or any(character.isspace() for character in clean):
-        raise ValueError("card action URL must be a safe http URL")
+        raise ValueError(f"{field} must be a safe http URL")
     try:
         parsed = urlsplit(clean)
-        host = parsed.hostname
-    except ValueError as exc:
-        raise ValueError("card action URL must be a safe http URL") from exc
+        host = canonical_url_host(clean)
+        _ = parsed.port
+    except (TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a safe http URL") from exc
     if (
         parsed.scheme.lower() not in {"http", "https"}
         or not host
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise ValueError("card action URL must be a safe http URL")
+        raise ValueError(f"{field} must be a safe http URL")
+    if automatically_fetched:
+        if is_private_or_metadata_host(host) or _card_url_is_unconditionally_unsafe(host):
+            raise ValueError(f"{field} must be a safe http URL")
+    elif _card_url_is_unconditionally_unsafe(host):
+        raise ValueError(f"{field} must be a safe http URL")
+    return clean, parsed
+
+
+def sanitize_action_url(url: str) -> str:
+    """Return a safe user-clicked HTTP(S) action target."""
+    clean, parsed = _classify_card_url(
+        url,
+        automatically_fetched=False,
+        field="card action URL",
+    )
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
         normalized_key = _normalize_sensitive_query_key(key)
         visibly_redacted = value.strip().lower() in {
@@ -921,7 +984,7 @@ def validate_card_limits(
 def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
     element: dict[str, Any] = {
         "type": "TextBlock",
-        "text": text,
+        "text": _literal_card_text(text),
         "wrap": True,
     }
     if bold:
@@ -959,22 +1022,14 @@ def _require_element(
 
 
 def _display_resource_url(value: object) -> str:
-    if not isinstance(value, str) or any(character.isspace() for character in value):
+    clean, parsed = _classify_card_url(
+        value,
+        automatically_fetched=True,
+        field="display image URL",
+    )
+    if parsed.query or parsed.fragment:
         raise ValueError("display image URL must be a safe http URL")
-    try:
-        parsed = urlsplit(value)
-    except ValueError as exc:
-        raise ValueError("display image URL must be a safe http URL") from exc
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("display image URL must be a safe http URL")
-    return value
+    return clean
 
 
 def build_display_card(
@@ -1055,7 +1110,10 @@ def build_display_card(
                 clean_value = sanitize_visible_text(value)
                 if clean_label is None or clean_value is None:
                     continue
-                facts.append({"title": clean_label, "value": clean_value})
+                facts.append({
+                    "title": _literal_card_text(clean_label),
+                    "value": _literal_card_text(clean_value),
+                })
                 lines.append(f"{clean_label}: {clean_value}")
             if not facts:
                 continue
@@ -1082,7 +1140,7 @@ def build_display_card(
                 body.append({
                     "type": "Image",
                     "url": resource_url,
-                    "altText": clean_alt,
+                    "altText": _literal_card_text(clean_alt),
                 })
             else:
                 _require_element(capabilities, "TextBlock")
@@ -1289,7 +1347,7 @@ def build_interactive_card(
     body: list[dict[str, Any]] = [
         {
             "type": "TextBlock",
-            "text": clean_title,
+            "text": _literal_card_text(clean_title),
             "weight": "Bolder",
             "size": "Medium",
             "wrap": True,
@@ -1304,7 +1362,7 @@ def build_interactive_card(
         )
         body.append({
             "type": "TextBlock",
-            "text": clean_text,
+            "text": _literal_card_text(clean_text),
             "wrap": True,
             "spacing": "Small",
         })
@@ -2066,7 +2124,12 @@ def _reasoning_text_block(
     text: str,
     **extra: object,
 ) -> dict[str, object]:
-    return {"type": "TextBlock", "text": text, "wrap": True, **extra}
+    return {
+        "type": "TextBlock",
+        "text": _literal_card_text(text),
+        "wrap": True,
+        **extra,
+    }
 
 
 def _reasoning_action_row(

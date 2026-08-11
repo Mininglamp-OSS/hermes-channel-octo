@@ -66,14 +66,17 @@ def _card_nodes(value: object, node_type: str) -> list[dict[str, object]]:
         ("0.19.7", False),
         ("0.20.0", True),
         ("0.20.4", True),
+        ("0.20.1.dev2", False),
+        ("0.20.4rc1", False),
+        ("0.21.0rc1", False),
+        ("0.21.0.dev1", False),
         ("0.21.0", False),
         ("0.22.0", False),
         ("1.0.0", False),
         ("not-a-version", False),
-        ("0.21.0rc1", True),
     ],
 )
-def test_constructor_enables_native_clarify_from_hermes_020(
+def test_constructor_enables_native_clarify_only_for_stable_hermes_020(
     version: str,
     expected: bool,
 ) -> None:
@@ -81,6 +84,21 @@ def test_constructor_enables_native_clarify_from_hermes_020(
         actual = clarify.native_clarify_supported()
 
     assert actual is expected
+
+
+def test_unstable_native_clarify_gate_logs_its_decision_once(caplog) -> None:
+    version = "0.20.999.dev999"
+    with (
+        patch.object(clarify, "package_version", return_value=version),
+        caplog.at_level("INFO"),
+    ):
+        assert clarify.native_clarify_supported() is False
+        assert clarify.native_clarify_supported() is False
+
+    assert sum(
+        version in record.message and "native clarify disabled" in record.message
+        for record in caplog.records
+    ) == 1
 
 
 def test_missing_packaging_only_disables_native_clarify() -> None:
@@ -676,13 +694,16 @@ def test_clarify_card_uses_localized_status_without_internal_identity(
     assert _ROUTE.requester_uid not in rendered.plain
     assert "已选择" not in rendered.plain
 
+
 def _clarify_session(
     *,
     clarify_id: str,
+    entry: object | None = None,
     multi_select: bool = False,
 ) -> card_events.CardSession:
     clarify = card_events.ClarifySession(
         clarify_id=clarify_id,
+        entry=entry if entry is not None else object(),
         multi_select=multi_select,
         question="Choose several" if multi_select else "Choose",
         choices=("A", "B", "C"),
@@ -762,7 +783,7 @@ async def test_single_clarify_action_resolves_gateway_primitive_without_message_
     )
     try:
         status = await card_events.dispatch_clarify_action(
-            _clarify_session(clarify_id=clarify_id),
+            _clarify_session(clarify_id=clarify_id, entry=entry),
             _clarify_action("clarify_choice_1"),
         )
         assert status == "completed"
@@ -783,7 +804,11 @@ async def test_multi_clarify_action_resolves_canonical_json_in_choice_order() ->
     entry.multi_select = True
     try:
         status = await card_events.dispatch_clarify_action(
-            _clarify_session(clarify_id=clarify_id, multi_select=True),
+            _clarify_session(
+                clarify_id=clarify_id,
+                entry=entry,
+                multi_select=True,
+            ),
             _clarify_action(
                 "clarify_confirm",
                 inputs={"clarify_choices": "clarify_choice_2,clarify_choice_0"},
@@ -807,7 +832,11 @@ async def test_invalid_multi_submit_keeps_card_retryable_for_a_later_valid_actio
     )
     entry.multi_select = True
     registry.register(
-        _clarify_session(clarify_id=clarify_id, multi_select=True)
+        _clarify_session(
+            clarify_id=clarify_id,
+            entry=entry,
+            multi_select=True,
+        )
     )
     updates: list[tuple[str, bool, cards.CardRenderResult]] = []
 
@@ -870,7 +899,7 @@ async def test_clarify_other_switches_same_request_to_text_capture() -> None:
     entry.multi_select = False
     try:
         status = await card_events.dispatch_clarify_action(
-            _clarify_session(clarify_id=clarify_id),
+            _clarify_session(clarify_id=clarify_id, entry=entry),
             _clarify_action("clarify_other"),
         )
         assert status == "awaiting_text"
@@ -889,33 +918,33 @@ async def test_stale_clarify_click_is_consumed_as_expired() -> None:
     assert status == "expired"
 
 
-
 @pytest.mark.asyncio
-async def test_reused_clarify_id_cannot_resolve_a_replacement_entry() -> None:
+async def test_reused_clarify_id_cannot_resolve_a_same_signature_replacement() -> None:
     clarify_id = "clarify-reused-id"
-    clarify_gateway.register(
+    original = clarify_gateway.register(
         clarify_id,
         _ROUTE.session_key,
         "Choose",
         ["A", "B", "C"],
     )
+    original.multi_select = False
+    old_card = _clarify_session(clarify_id=clarify_id, entry=original)
     clarify_gateway.clear_session(_ROUTE.session_key)
-    replacement_session = f"{_ROUTE.session_key}:replacement"
     replacement = clarify_gateway.register(
         clarify_id,
-        replacement_session,
-        "Different question",
-        ["X", "Y"],
+        _ROUTE.session_key,
+        "Choose",
+        ["A", "B", "C"],
     )
     replacement.multi_select = False
     try:
         status = await card_events.dispatch_clarify_action(
-            _clarify_session(clarify_id=clarify_id),
+            old_card,
             _clarify_action("clarify_choice_0"),
         )
         response = replacement.response
     finally:
-        clarify_gateway.clear_session(replacement_session)
+        clarify_gateway.clear_session(_ROUTE.session_key)
 
     assert status == "expired"
     assert response is None
@@ -966,7 +995,7 @@ async def test_reused_clarify_id_gets_a_new_delivery_id_per_occurrence() -> None
 @pytest.mark.asyncio
 async def test_reused_clarify_id_cannot_race_between_validation_and_resolution() -> None:
     clarify_id = "clarify-reused-during-dispatch"
-    clarify_gateway.register(
+    entry = clarify_gateway.register(
         clarify_id,
         _ROUTE.session_key,
         "Choose",
@@ -1006,7 +1035,7 @@ async def test_reused_clarify_id_cannot_race_between_validation_and_resolution()
     try:
         with patch.object(clarify_gateway, "_lock", ReplaceOnRelease()):
             status = await card_events.dispatch_clarify_action(
-                _clarify_session(clarify_id=clarify_id),
+                _clarify_session(clarify_id=clarify_id, entry=entry),
                 _clarify_action("clarify_choice_1"),
             )
         replacement = replacement_box[0]
@@ -1161,7 +1190,7 @@ async def test_clarify_action_adapter_path_never_injects_message_event() -> None
         ["A", "B", "C"],
     )
     entry.multi_select = False
-    session = _clarify_session(clarify_id=clarify_id)
+    session = _clarify_session(clarify_id=clarify_id, entry=entry)
     adapter._card_sessions.register(session)
     action = _clarify_action("clarify_choice_0")
     normal_dispatch = AsyncMock(return_value=True)
@@ -1191,7 +1220,7 @@ async def test_clarify_action_replay_does_not_resolve_twice() -> None:
         ["A", "B", "C"],
     )
     entry.multi_select = False
-    registry.register(_clarify_session(clarify_id=clarify_id))
+    registry.register(_clarify_session(clarify_id=clarify_id, entry=entry))
     action = _clarify_action("clarify_choice_0")
     try:
         first = await card_events.handle_card_action(
