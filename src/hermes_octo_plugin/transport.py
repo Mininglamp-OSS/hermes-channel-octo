@@ -58,6 +58,8 @@ def _unconditionally_unsafe_address(address: str) -> bool:
         ip = ip.ipv4_mapped
     if str(ip) in _METADATA_HOSTS:
         return True
+    if ip.is_loopback:
+        return False
     return ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
 
 
@@ -79,7 +81,7 @@ def _canonical_trust_host(host: str) -> str:
 
 TransportOrigin = tuple[str, str, int]
 TransportEndpoint = tuple[str, int]
-_DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
+_DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
 def _canonical_origin(url: str) -> TransportOrigin | None:
@@ -220,6 +222,58 @@ class SSRFGuardResolver(AbstractResolver):
 
     async def close(self) -> None:
         await self._delegate.close()
+
+
+async def open_guarded_websocket_socket(
+    url: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> socket.socket:
+    """Resolve, validate, and connect one WebSocket TCP socket without DNS rebinding."""
+    origin = _canonical_origin(url)
+    if origin is None or origin[0] not in {"ws", "wss"}:
+        raise ValueError("WebSocket URL must use ws or wss")
+    _, host, port = origin
+    trusted_origins = (
+        {url}
+        if os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower()
+        in {"1", "true", "yes"}
+        else set()
+    )
+    policy = TransportPolicy(trusted_origins)
+    resolver = SSRFGuardResolver(policy=policy)
+    last_error: OSError | None = None
+    async with asyncio.timeout(timeout_seconds):
+        try:
+            records = await resolver.resolve(
+                host,
+                port,
+                family=socket.AF_UNSPEC,
+            )
+        finally:
+            await resolver.close()
+
+        loop = asyncio.get_running_loop()
+        for record in records:
+            family = record["family"]
+            proto = record["proto"]
+            address = str(record["host"])
+            connected = socket.socket(family, socket.SOCK_STREAM, proto)
+            connected.setblocking(False)
+            try:
+                await loop.sock_connect(connected, (address, port))
+            except OSError as exc:
+                connected.close()
+                last_error = exc
+                continue
+            except BaseException:
+                connected.close()
+                raise
+            return connected
+
+    if last_error is not None:
+        raise OSError("WebSocket connection failed") from last_error
+    raise OSError("WebSocket DNS resolution returned no addresses")
 
 
 class SSRFGuardConnector(aiohttp.TCPConnector):

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import pytest
 
-from hermes_octo_plugin import api
+from hermes_octo_plugin import api, transport as transport_module
 from hermes_octo_plugin.adapter import OctoAdapter
 from hermes_octo_plugin.transport import (
     SSRFGuardConnector as _SSRFGuardConnector,
@@ -316,6 +316,32 @@ async def test_guarded_connector_allows_opted_in_private_literal_origin():
     assert records[0]["family"] in {socket.AF_UNSPEC, socket.AF_INET}
 
 
+
+@pytest.mark.asyncio
+async def test_guarded_resolver_allows_opted_in_ipv6_loopback_origin():
+    resolver = _SSRFGuardResolver(
+        trusted_origins={"ws://[::1]:9000"}
+    )
+    resolver._delegate.resolve = AsyncMock(
+        return_value=[
+            {
+                "hostname": "::1",
+                "host": "::1",
+                "port": 9000,
+                "family": socket.AF_INET6,
+                "proto": socket.IPPROTO_TCP,
+                "flags": 0,
+            }
+        ]
+    )
+    try:
+        records = await resolver.resolve("::1", 9000, family=socket.AF_UNSPEC)
+    finally:
+        await resolver.close()
+
+    assert records[0]["host"] == "::1"
+    assert records[0]["family"] == socket.AF_INET6
+
 @pytest.mark.asyncio
 async def test_private_upload_origin_does_not_expand_shared_resolver(
     monkeypatch: pytest.MonkeyPatch,
@@ -352,6 +378,140 @@ def test_transport_origin_preserves_explicit_zero_port() -> None:
     assert policy.is_download_url_trusted("http://10.0.0.8/file") is True
     assert policy.is_download_url_trusted("http://10.0.0.8:80/file") is True
     assert policy.is_download_url_trusted("http://10.0.0.8:0/file") is False
+
+
+@pytest.mark.asyncio
+async def test_guarded_websocket_socket_connects_only_validated_numeric_address(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(
+        return_value=[
+            {
+                "hostname": "socket.example",
+                "host": "93.184.216.34",
+                "port": 443,
+                "family": socket.AF_INET,
+                "proto": socket.IPPROTO_TCP,
+                "flags": 0,
+            }
+        ]
+    )
+    resolver.close = AsyncMock()
+    resolver_factory = MagicMock(return_value=resolver)
+    guarded_socket = MagicMock()
+    socket_factory = MagicMock(return_value=guarded_socket)
+    loop = MagicMock()
+    loop.sock_connect = AsyncMock()
+
+    assert hasattr(transport_module, "open_guarded_websocket_socket")
+    with (
+        patch.object(transport_module, "SSRFGuardResolver", resolver_factory),
+        patch.object(transport_module.socket, "socket", socket_factory),
+        patch.object(transport_module.asyncio, "get_running_loop", return_value=loop),
+    ):
+        result = await transport_module.open_guarded_websocket_socket(
+            "wss://socket.example/ws"
+        )
+
+    assert result is guarded_socket
+    policy = resolver_factory.call_args.kwargs["policy"]
+    assert policy.trusted_download_origins() == frozenset()
+    resolver.resolve.assert_awaited_once_with(
+        "socket.example",
+        443,
+        family=socket.AF_UNSPEC,
+    )
+    resolver.close.assert_awaited_once()
+    socket_factory.assert_called_once_with(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+    )
+    guarded_socket.setblocking.assert_called_once_with(False)
+    loop.sock_connect.assert_awaited_once_with(
+        guarded_socket,
+        ("93.184.216.34", 443),
+    )
+
+
+@pytest.mark.asyncio
+async def test_guarded_websocket_socket_stops_on_unsafe_dns_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+    timeout_active = False
+
+    class _TimeoutMarker:
+        async def __aenter__(self):
+            nonlocal timeout_active
+            timeout_active = True
+
+        async def __aexit__(self, *_args):
+            nonlocal timeout_active
+            timeout_active = False
+
+    async def reject_unsafe_dns(*_args, **_kwargs):
+        assert timeout_active is True
+        raise OSError("unsafe address")
+
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(side_effect=reject_unsafe_dns)
+    resolver.close = AsyncMock()
+    socket_factory = MagicMock()
+
+    assert hasattr(transport_module, "open_guarded_websocket_socket")
+    with (
+        patch.object(
+            transport_module,
+            "SSRFGuardResolver",
+            return_value=resolver,
+        ),
+        patch.object(transport_module.socket, "socket", socket_factory),
+        pytest.raises(OSError, match="unsafe address"),
+        patch.object(
+            transport_module.asyncio,
+            "timeout",
+            return_value=_TimeoutMarker(),
+        ),
+    ):
+        await transport_module.open_guarded_websocket_socket(
+            "wss://socket.example/ws"
+        )
+
+    resolver.close.assert_awaited_once()
+    socket_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guarded_websocket_socket_trusts_exact_private_origin_only_with_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "1")
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(side_effect=OSError("stop after policy capture"))
+    resolver.close = AsyncMock()
+    resolver_factory = MagicMock(return_value=resolver)
+
+    with (
+        patch.object(transport_module, "SSRFGuardResolver", resolver_factory),
+        pytest.raises(OSError, match="policy capture"),
+    ):
+        await transport_module.open_guarded_websocket_socket(
+            "wss://socket.internal:9443/ws"
+        )
+
+    policy = resolver_factory.call_args.kwargs["policy"]
+    assert policy.trusted_download_origins() == frozenset({
+        ("wss", "socket.internal", 9443),
+    })
+    resolver.resolve.assert_awaited_once_with(
+        "socket.internal",
+        9443,
+        family=socket.AF_UNSPEC,
+    )
+    resolver.close.assert_awaited_once()
 
 
 def test_private_host_policy_still_rejects_ipv4_mapped_link_local(
@@ -726,6 +886,47 @@ async def test_native_document_rejects_unsafe_source_derived_filename() -> None:
         result = await adapter.send_document(
             "group-1",
             "https://source.example/report.pdf",
+        )
+
+    assert result.success is False
+    assert result.error == "media filename is invalid"
+    upload.assert_not_awaited()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["send_image", "send_voice", "send_video"],
+)
+async def test_native_media_rejects_unsafe_source_derived_filename(
+    method_name: str,
+) -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    upload = AsyncMock(return_value="https://cdn.example/uploaded")
+    send = AsyncMock()
+
+    with (
+        patch.object(
+            adapter,
+            "_load_outbound_media",
+            AsyncMock(
+                return_value=(
+                    b"remote media",
+                    "application/octet-stream",
+                    "../derived.bin",
+                )
+            ),
+        ),
+        patch.object(api, "upload_and_get_url", upload),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await getattr(adapter, method_name)(
+            "group-1",
+            "https://source.example/media.bin",
         )
 
     assert result.success is False

@@ -3,6 +3,7 @@ Tests for hermes_octo_plugin.api — API function signatures and parameter check
 """
 
 import pytest
+import inspect
 import asyncio
 import json
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -728,31 +729,11 @@ class TestSendIdentity:
         }
         assert "finalize" not in body
 
-    @pytest.mark.asyncio
-    async def test_native_text_edit_serializes_mention_entities(self):
-        entity = MentionEntity(uid="user-1", offset=6, length=4)
-        with patch.object(api, "post_json", AsyncMock(return_value=None)) as post_json:
-            await api.edit_message(
-                MagicMock(),
-                "https://api.example.invalid",
-                "test-token",
-                channel_id="group-1",
-                channel_type=ChannelType.Group,
-                message_id="message-1",
-                content="hello @董振兴",
-                mention_uids=["user-1"],
-                mention_entities=[entity],
-            )
-
-        frame = json.loads(post_json.await_args.args[4]["content_edit"])
-        assert frame == {
-            "type": 1,
-            "content": "hello @董振兴",
-            "mention": {
-                "uids": ["user-1"],
-                "entities": [{"uid": "user-1", "offset": 6, "length": 4}],
-            },
-        }
+    def test_native_text_edit_does_not_advertise_unconsumed_mention_fields(self):
+        parameters = inspect.signature(api.edit_message).parameters
+        assert "mention_uids" not in parameters
+        assert "mention_entities" not in parameters
+        assert "mention_all" not in parameters
 
 
 class TestHeartbeatApi:

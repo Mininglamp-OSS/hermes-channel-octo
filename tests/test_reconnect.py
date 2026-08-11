@@ -472,6 +472,8 @@ async def test_do_connect_prefers_configured_websocket_url():
         im_token="token",
         ws_url="wss://server.example/socket",
     )
+    guarded_socket = MagicMock()
+    open_socket = AsyncMock(return_value=guarded_socket)
     connect = AsyncMock(side_effect=RuntimeError("stop after URL selection"))
 
     with (
@@ -479,12 +481,21 @@ async def test_do_connect_prefers_configured_websocket_url():
             "hermes_octo_plugin.adapter.api.register_bot",
             AsyncMock(return_value=registration),
         ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            open_socket,
+            create=True,
+        ),
         patch("hermes_octo_plugin.adapter.websockets.connect", connect),
     ):
         with pytest.raises(RuntimeError, match="URL selection"):
             await adapter._do_connect()
 
     assert connect.await_args.args[0] == "wss://override.example/socket"
+    open_socket.assert_awaited_once_with("wss://override.example/socket")
+    assert connect.await_args.kwargs["sock"] is guarded_socket
+    assert connect.await_args.kwargs["proxy"] is None
+    guarded_socket.close.assert_called_once()
 
 
 # ─── Token refresh cooldown ──────────────────────────────────────────────────

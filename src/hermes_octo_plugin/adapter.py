@@ -47,6 +47,7 @@ from .transport import (
     _METADATA_HOSTS,
     is_private_or_metadata_host as _is_private_or_metadata_host,
     new_guarded_http_session as _new_guarded_http_session,
+    open_guarded_websocket_socket as _open_guarded_websocket_socket,
 )
 from .protocol import (
     PROTO_VERSION,
@@ -196,6 +197,14 @@ def _merged_media_metadata(kwargs: dict[str, Any]) -> dict[str, Any] | None:
             raise ValueError(f"conflicting media metadata for {field}")
         metadata[field] = value
     return metadata or None
+
+
+def _validated_media_filename(value: object) -> str:
+    """Return one safe Octo media basename or fail before upload/delivery."""
+    filename = api.safe_media_filename(value)
+    if filename is None:
+        raise ValueError("media filename is invalid")
+    return filename
 
 
 def redact_log(s: str) -> str:
@@ -1182,9 +1191,13 @@ class OctoAdapter(BasePlatformAdapter):
 
         ws_url = self._ws_url or self._registration.ws_url
         _validate_octo_ws_url(ws_url)
+        guarded_socket = None
         try:
+            guarded_socket = await _open_guarded_websocket_socket(ws_url)
             self._ws = await websockets.connect(
                 ws_url,
+                proxy=None,
+                sock=guarded_socket,
                 max_size=8
                 * 1024
                 * 1024,  # 8 MiB cap — defends against malformed/malicious frames
@@ -1192,6 +1205,8 @@ class OctoAdapter(BasePlatformAdapter):
                 ping_timeout=20,
             )
         except Exception as e:
+            if guarded_socket is not None:
+                guarded_socket.close()
             logger.error(
                 "[%s] WebSocket connection failed: %s", self.name, redact_log(str(e))
             )
@@ -4084,6 +4099,7 @@ class OctoAdapter(BasePlatformAdapter):
             file_data, content_type, filename = await self._load_outbound_media(
                 image_url
             )
+            filename = _validated_media_filename(filename)
             dims = api.parse_image_dimensions(file_data, content_type)
             if dims:
                 parsed_width, parsed_height = dims
@@ -4200,10 +4216,7 @@ class OctoAdapter(BasePlatformAdapter):
             )
 
             selected_filename = file_name if file_name is not None else filename
-            safe_filename = api.safe_media_filename(selected_filename)
-            if safe_filename is None:
-                raise ValueError("media filename is invalid")
-            filename = safe_filename
+            filename = _validated_media_filename(selected_filename)
 
             uploaded_url = await api.upload_and_get_url(
                 self._http_session,
@@ -4280,6 +4293,7 @@ class OctoAdapter(BasePlatformAdapter):
             file_data, content_type, filename = await self._load_outbound_media(
                 audio_path
             )
+            filename = _validated_media_filename(filename)
             uploaded_url = await api.upload_and_get_url(
                 self._http_session,
                 self._api_url,
@@ -4357,6 +4371,7 @@ class OctoAdapter(BasePlatformAdapter):
             file_data, content_type, filename = await self._load_outbound_media(
                 video_path
             )
+            filename = _validated_media_filename(filename)
             uploaded_url = await api.upload_and_get_url(
                 self._http_session,
                 self._api_url,

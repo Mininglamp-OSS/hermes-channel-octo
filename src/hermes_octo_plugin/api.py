@@ -955,8 +955,6 @@ async def edit_message(
     message_id: str,
     content: str,
     finalize: bool = False,
-    mention_uids: list[str] | None = None,
-    mention_entities: list[MentionEntity] | None = None,
     on_behalf_of: str | None = None,
 ) -> Any | None:
     """Edit a text message using Octo's native edit envelope.
@@ -967,16 +965,6 @@ async def edit_message(
     """
     del finalize
     frame: dict[str, Any] = {"type": MessageType.Text, "content": content}
-    if mention_uids or mention_entities:
-        mention: dict[str, Any] = {}
-        if mention_uids:
-            mention["uids"] = mention_uids
-        if mention_entities:
-            mention["entities"] = [
-                {"uid": item.uid, "offset": item.offset, "length": item.length}
-                for item in mention_entities
-            ]
-        frame["mention"] = mention
     body: dict[str, Any] = {
         "message_id": str(message_id),
         "channel_id": channel_id,
