@@ -1390,3 +1390,27 @@ class TestThreadApi:
         )
 
         assert members == [{"uid": "u1", "name": "董振兴"}]
+
+
+class TestSetCommands:
+    @pytest.mark.asyncio
+    async def test_posts_complete_command_menu(self):
+        commands = [
+            {"command": "/new", "description": "Start a new session"},
+            {"command": "/octo-doctor", "description": "Inspect Octo health"},
+        ]
+        with patch.object(api, "post_json", AsyncMock(return_value=None)) as post_json:
+            await api.set_commands(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                commands,
+            )
+
+        post_json.assert_awaited_once_with(
+            ANY,
+            "https://api.example.invalid",
+            "test-token",
+            "/v1/bot/setCommands",
+            {"commands": commands},
+        )

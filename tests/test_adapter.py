@@ -41,6 +41,20 @@ def test_constructor_reads_transport_and_event_poll_overrides():
     assert adapter._event_poll_limit == 80
     assert adapter.progress_card_renderer == "registry"
 
+def test_constructor_reads_command_menu_budget_without_rejecting_runtime_value(
+    monkeypatch,
+):
+    monkeypatch.setenv("OCTO_COMMAND_MENU_MAX_CHARS", "2000")
+    from_env = OctoAdapter(SimpleNamespace(extra={}))
+    from_platform = OctoAdapter(
+        SimpleNamespace(extra={"command_menu_max_chars": "750"})
+    )
+    invalid = OctoAdapter(SimpleNamespace(extra={"command_menu_max_chars": "bad"}))
+
+    assert from_env._command_menu_max_chars_config == "2000"
+    assert from_platform._command_menu_max_chars_config == "750"
+    assert invalid._command_menu_max_chars_config == "bad"
+
 
 def test_constructor_defaults_progress_cards_to_local_renderer():
     adapter = OctoAdapter(SimpleNamespace(extra={}))

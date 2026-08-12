@@ -52,6 +52,10 @@ optional_env:
     description: "Progress-card renderer: local (default) or registry"
     prompt: "Progress card renderer (optional)"
     password: false
+  - name: OCTO_COMMAND_MENU_MAX_CHARS
+    description: "Maximum stored command-menu JSON characters; 0 publishes the complete menu"
+    prompt: "Command menu character budget (0 or >=2)"
+    password: false
   - name: OCTO_ALLOWED_USERS
     description: "Comma-separated Octo user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"

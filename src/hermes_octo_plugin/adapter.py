@@ -15,7 +15,7 @@ import uuid
 import unicodedata
 
 from collections import OrderedDict
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -289,6 +289,31 @@ RECONNECT_STAGGER_MAX_S = 5.0
 # don't accumulate state forever.
 CACHE_MAX_AGE_S = 4 * 60 * 60
 CACHE_CLEANUP_INTERVAL_S = 30 * 60
+# Command menus are deployment metadata rather than a connection heartbeat.
+# Poll once per minute so skill/plugin changes converge without making inbound
+# command handling depend on publication success.
+COMMAND_MENU_SYNC_INTERVAL_S = 60.0
+DEFAULT_COMMAND_MENU_MAX_CHARS = 1000
+
+def _parse_command_menu_max_chars(value: object) -> int:
+    """Parse a deferred menu budget without making the adapter fail to connect."""
+    if isinstance(value, bool):
+        raise ValueError(
+            "command_menu_max_chars must be 0 or an integer of at least 2"
+        )
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        parsed = int(value.strip())
+    else:
+        raise ValueError(
+            "command_menu_max_chars must be 0 or an integer of at least 2"
+        )
+    if parsed < 0 or parsed == 1:
+        raise ValueError(
+            "command_menu_max_chars must be 0 or an integer of at least 2"
+        )
+    return parsed
 # Inbound file handling.
 # Text files smaller than this get their content inlined into the LLM
 # message body verbatim. Above this we still download large files to a
@@ -801,6 +826,13 @@ class OctoAdapter(BasePlatformAdapter):
         # — lets the agent fetch media from a public-read CDN without
         # routing every download through the bot API server.
         self._cdn_url: str = extra.get("cdn_url") or os.getenv("OCTO_CDN_URL", "")
+        configured_menu_max_chars = extra.get("command_menu_max_chars")
+        if configured_menu_max_chars is None:
+            configured_menu_max_chars = os.getenv(
+                "OCTO_COMMAND_MENU_MAX_CHARS",
+                str(DEFAULT_COMMAND_MENU_MAX_CHARS),
+            )
+        self._command_menu_max_chars_config = configured_menu_max_chars
 
         if self._api_url:
             _validate_octo_url(self._api_url, "OCTO_API_URL")
@@ -827,6 +859,10 @@ class OctoAdapter(BasePlatformAdapter):
         self._cache_cleanup_task: asyncio.Task | None = None
         self._prefetch_task: asyncio.Task[Any] | None = None
         self._reconnect_task: asyncio.Task[Any] | None = None
+        self._command_menu_task: asyncio.Task[Any] | None = None
+        self._command_menu_force_event = asyncio.Event()
+        self._command_menu_force_pending = False
+        self._command_menu_published_digest: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._gateway_loop: asyncio.AbstractEventLoop | None = None
         self._progress_tasks: set[asyncio.Task[Any]] = set()
@@ -1362,6 +1398,7 @@ class OctoAdapter(BasePlatformAdapter):
             self._prefetch_task = asyncio.create_task(
                 self._prefetch_groups_and_members()
             )
+        self._wake_command_menu_sync()
         self._mark_connected()
         return True
 
@@ -1394,6 +1431,115 @@ class OctoAdapter(BasePlatformAdapter):
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._http_heartbeat_task = asyncio.create_task(self._http_heartbeat_loop())
 
+    def _live_quick_commands(self) -> Mapping[str, object]:
+        """Read quick commands from the live GatewayRunner on Hermes 0.14+."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            from gateway import run as gateway_run
+
+            runner = gateway_run._gateway_runner_ref()
+        if runner is None:
+            raise RuntimeError("live GatewayRunner is unavailable")
+
+        config = runner.config
+        if isinstance(config, Mapping):
+            quick_commands = config.get("quick_commands", {})
+        else:
+            quick_commands = getattr(config, "quick_commands", {})
+        if not isinstance(quick_commands, Mapping):
+            raise RuntimeError("live GatewayRunner quick_commands is not a mapping")
+        return quick_commands
+
+    def _wake_command_menu_sync(self) -> None:
+        """Force the singleton menu loop after initial connect or reconnect."""
+        self._command_menu_force_event.set()
+        if self._command_menu_task is None or self._command_menu_task.done():
+            self._command_menu_task = asyncio.create_task(
+                self._command_menu_sync_loop()
+            )
+
+    async def _wait_for_command_menu_sync(self) -> bool:
+        """Return true for a forced wakeup, false for the periodic poll."""
+        try:
+            await asyncio.wait_for(
+                self._command_menu_force_event.wait(),
+                timeout=COMMAND_MENU_SYNC_INTERVAL_S,
+            )
+        except TimeoutError:
+            return False
+        self._command_menu_force_event.clear()
+        return True
+
+    async def _reconcile_command_menu(self, *, force: bool = False) -> bool:
+        """Publish a complete runtime command snapshot when it has changed."""
+        if force:
+            self._command_menu_force_pending = True
+        if self._http_session is None:
+            return False
+        try:
+            from .command_menu import collect_runtime_command_menu
+
+            max_chars = _parse_command_menu_max_chars(
+                self._command_menu_max_chars_config
+            )
+            manifest = collect_runtime_command_menu(
+                self._live_quick_commands(),
+                max_chars=max_chars,
+            )
+            if (
+                not self._command_menu_force_pending
+                and manifest.digest == self._command_menu_published_digest
+            ):
+                return False
+            await api.set_commands(
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                list(manifest.commands),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failure_type = type(exc).__name__
+            if isinstance(exc, api.OctoApiError) and isinstance(exc.status, int):
+                failure_type = f"{failure_type} (HTTP {exc.status})"
+            logger.warning(
+                "[%s] command menu reconciliation failed: %s",
+                self.name,
+                failure_type,
+            )
+            return False
+
+        self._command_menu_published_digest = manifest.digest
+        self._command_menu_force_pending = False
+        logger.info(
+            "[%s] published %d/%d Octo command-menu entries "
+            "(omitted=%d, payload_chars=%d, max_chars=%d; %s)",
+            self.name,
+            len(manifest.commands),
+            manifest.collected_count,
+            manifest.omitted_count,
+            manifest.payload_chars,
+            manifest.max_chars,
+            ", ".join(
+                f"{source}={count}"
+                for source, count in manifest.source_counts.items()
+            ),
+        )
+        return True
+
+    async def _command_menu_sync_loop(self) -> None:
+        """Eventually reconcile runtime command changes without blocking chat."""
+        try:
+            while True:
+                force = await self._wait_for_command_menu_sync()
+                if force:
+                    await self._reconcile_command_menu(force=True)
+                else:
+                    await self._reconcile_command_menu()
+        except asyncio.CancelledError:
+            raise
+
     async def _finalize_disconnect_resources(self) -> None:
         """Cancel owned tasks and close transports exactly once."""
         current_task = asyncio.current_task()
@@ -1411,6 +1557,7 @@ class OctoAdapter(BasePlatformAdapter):
             self._recv_task,
             self._cache_cleanup_task,
             self._prefetch_task,
+            self._command_menu_task,
             event_task,
             *self._progress_tasks,
         ]
@@ -1427,6 +1574,9 @@ class OctoAdapter(BasePlatformAdapter):
         self._recv_task = None
         self._cache_cleanup_task = None
         self._prefetch_task = None
+        self._command_menu_task = None
+        self._command_menu_force_event.clear()
+        self._command_menu_force_pending = False
         self._event_task = None
         self._progress_tasks.clear()
         ws, self._ws = self._ws, None

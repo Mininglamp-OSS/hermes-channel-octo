@@ -98,6 +98,7 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_EVENT_POLL_WAIT_S` | no | Event long-poll hold in seconds (default `25`, `0` disables, capped at `30`) |
 | `OCTO_EVENT_POLL_LIMIT` | no | Events requested per batch (default `50`, clamped to `1..100`) |
 | `OCTO_PROGRESS_CARD_RENDERER` | no | Progress-card renderer: `local` (default, Chinese Type-17 execution trace) or `registry` (server `ai.reasoning-process` template when advertised, otherwise local fallback) |
+| `OCTO_COMMAND_MENU_MAX_CHARS` | no | Maximum stored JSON characters for the Bot-global command menu; defaults to `1000`, `0` publishes the complete menu, and values `>=2` publish a name-only priority projection that fits the server field |
 
 ## Current-conversation tools
 
@@ -126,6 +127,22 @@ and content into gateway logs.
 For inbound commands, the plugin removes only a leading self-mention immediately
 followed by a slash command so Hermes can route that command. Other self-mentions
 and every non-command mention remain part of the message text.
+
+After each successful Octo connection, the plugin publishes Octo plugin
+commands, the curated Gateway commands `/new`, `/stop`, and `/commands`,
+configured quick commands, executable skill bundles, and slash-invocable skills
+to the Bot's DM slash-command menu. Other Gateway commands remain available by
+manual input and through `/commands`; their names still reserve dispatch
+precedence so lower-priority sources cannot publish misleading collisions. The
+list is reconciled every minute and after reconnects. Octo's menu is Bot-global,
+so command visibility does not imply authorization; Hermes still performs the
+normal dispatch, owner, pairing, and disabled-skill checks when a user sends the
+selected command. If the deployed Octo Server still uses the legacy
+`robot.bot_commands VARCHAR(1000)` schema, keep
+`OCTO_COMMAND_MENU_MAX_CHARS=1000` until that column is migrated to `TEXT`/JSON.
+Bounded mode publishes empty descriptions and fills the budget in this order:
+Octo plugin commands, the three curated Gateway commands, slash skills by usage,
+quick commands, other plugin commands, then bundles.
 
 Interactive card actions are accepted only while the originating in-process
 card session remains registered and only when message, channel, operator,

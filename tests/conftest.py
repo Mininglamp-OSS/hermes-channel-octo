@@ -95,6 +95,11 @@ def make_bare_adapter():
     a._cache_cleanup_task = None
     a._reconnect_task = None
     a._prefetch_task = None
+    a._command_menu_task = None
+    a._command_menu_force_event = asyncio.Event()
+    a._command_menu_force_pending = False
+    a._command_menu_published_digest = None
+    a._command_menu_max_chars_config = 1000
     a._lifecycle_lock = asyncio.Lock()
     # Identity / config (callers override as needed)
     a._api_url = ""

@@ -562,6 +562,22 @@ async def ack_bot_event(
     )
 
 
+async def set_commands(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    bot_token: str,
+    commands: list[dict[str, str]],
+) -> None:
+    """Replace the Bot's Octo command menu with a complete snapshot."""
+    await post_json(
+        session,
+        api_url,
+        bot_token,
+        "/v1/bot/setCommands",
+        {"commands": commands},
+    )
+
+
 # ─── Bot Registration ────────────────────────────────────────────────────────
 
 
