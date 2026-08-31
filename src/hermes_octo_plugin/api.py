@@ -70,7 +70,8 @@ class OctoApiError(RuntimeError):
 
     Response bodies can contain implementation details and should never be
     copied into agent-tool output.  Callers that need compatibility handling
-    can inspect ``status`` without parsing a response body.
+    can inspect ``status`` -- or the machine-readable ``code`` -- without
+    parsing a response body.
     """
 
     def __init__(
@@ -79,17 +80,101 @@ class OctoApiError(RuntimeError):
         *,
         status: int | None = None,
         reason: str | None = None,
+        code: str | None = None,
     ) -> None:
         self.path = path
         self.status = status
+        self.code = code
         suffix = f" (HTTP {status})" if status is not None else ""
         detail = f": {reason}" if reason else ""
         super().__init__(f"Octo API request failed{suffix}{detail}")
 
 
-def _response_error(path: str, response: aiohttp.ClientResponse) -> OctoApiError:
+# The server reports its own condition in ``error.code`` (e.g.
+# ``err.server.bot_api.not_group_member``) while the HTTP status stays a
+# generic 400, so status alone cannot distinguish an expected refusal from a
+# real fault.  Only identifiers matching this pattern are lifted out of the
+# body -- it admits nothing but dotted ASCII identifiers, so no free-form
+# server text, user content, or secret can ride along.
+_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+# Upper bound on how much of a 4xx/5xx body is read to find the error code.
+# The real envelope is a few hundred bytes; anything larger is either a
+# different kind of response or an attempt to make us buffer it.
+_ERROR_BODY_READ_LIMIT = 64 * 1024
+
+# Emitted when the bot is asked to act on a group it has not joined.  This is
+# an expected refusal, not a fault, so callers may treat it as benign.
+ERR_NOT_GROUP_MEMBER = "err.server.bot_api.not_group_member"
+
+
+def _extract_error_code(body: str) -> str | None:
+    """Pull the machine-readable ``error.code`` out of an error body.
+
+    Returns ``None`` unless the value is a well-formed identifier, so a
+    malformed or hostile body can never widen what this leaks.
+    """
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, str) and _ERROR_CODE_RE.fullmatch(code):
+        return code
+    return None
+
+
+async def _read_capped_body(response: aiohttp.ClientResponse) -> bytes:
+    """Read a response body up to ``_ERROR_BODY_READ_LIMIT`` bytes.
+
+    ``StreamReader.read(n)`` is ``read``, not ``readexactly``: it waits for
+    *some* data and then returns whatever is currently buffered, up to ``n``.
+    A body split across TCP segments (ordinary for any non-trivial envelope,
+    and guaranteed for chunked transfer encoding) therefore comes back as a
+    truncated prefix from a single call, ``json.loads`` fails on it, and the
+    error code is silently lost.  Loop until EOF or the cap so the parse sees
+    the whole envelope, while still refusing to buffer an unbounded body.
+    """
+    chunks: list[bytes] = []
+    remaining = _ERROR_BODY_READ_LIMIT
+    while remaining > 0:
+        chunk = await response.content.read(remaining)
+        if not chunk:  # EOF: the body is complete.
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+async def _response_error(
+    path: str, response: aiohttp.ClientResponse
+) -> OctoApiError:
     """Create a secret-free error for a non-success HTTP response."""
-    return OctoApiError(path, status=response.status)
+    code: str | None = None
+    # A redirect body must never be read: following or even draining a
+    # redirect target is how an SSRF probe gets its answer back, and the
+    # surrounding helpers deliberately refuse redirects without touching the
+    # body.  Only genuine 4xx/5xx error payloads are inspected.
+    if 400 <= response.status < 600:
+        try:
+            # Size-capped read, not response.text().  text() buffers and
+            # decompresses the whole body, so a gzip-bombed error response
+            # would be amplified in memory; the 30s total timeout caps
+            # elapsed time, not bytes.  An error code is a short dotted
+            # identifier near the front of the envelope, so 64 KiB is far
+            # more than the real payload needs.
+            raw = await _read_capped_body(response)
+            code = _extract_error_code(raw.decode("utf-8", "replace"))
+        except Exception:
+            # Reading the body is best-effort: a transport failure while
+            # draining an already-failed response must not mask the status.
+            code = None
+    return OctoApiError(path, status=response.status, code=code)
 
 
 # ─── MIME Type Helpers ───────────────────────────────────────────────────────
@@ -361,7 +446,7 @@ async def post_json(
         allow_redirects=False,
     ) as resp:
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         text = await resp.text()
         if not text:
             return None
@@ -389,7 +474,7 @@ async def get_json(
         allow_redirects=False,
     ) as resp:
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         text = await resp.text()
         if not text:
             return None
@@ -1308,7 +1393,7 @@ async def get_upload_presign(
         allow_redirects=False,
     ) as resp:
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         data = await resp.json()
 
     if not isinstance(data, dict):
@@ -1949,7 +2034,7 @@ async def get_group_md(
         if resp.status == 404:
             return None
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         return await resp.json()
 
 
@@ -2003,7 +2088,7 @@ async def delete_json(
         kwargs["data"] = json.dumps(payload)
     async with session.delete(url, **kwargs) as resp:
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None
 
@@ -2029,7 +2114,7 @@ async def put_json(
         allow_redirects=False,
     ) as resp:
         if not 200 <= resp.status < 300:
-            raise _response_error(path, resp)
+            raise await _response_error(path, resp)
         text = await resp.text()
         return json.loads(text) if text else None
 

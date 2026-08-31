@@ -2094,7 +2094,24 @@ class OctoAdapter(BasePlatformAdapter):
                         channel_id,
                     )
             except Exception as e:
-                logger.error("[%s] [HISTORY] API fetch failed: %s", self.name, e)
+                # A bot @mentioned in a group it has not joined gets a
+                # deliberate server refusal here.  That is an expected,
+                # benign condition -- not a fault -- yet it recurs on every
+                # such mention and floods the log at ERROR.  The server marks
+                # it in ``error.code``; the HTTP status stays a generic 400,
+                # so status alone cannot tell it apart from a real failure.
+                # Downgrade only this one code; everything else stays ERROR.
+                if (
+                    isinstance(e, api.OctoApiError)
+                    and e.code == api.ERR_NOT_GROUP_MEMBER
+                ):
+                    logger.debug(
+                        "[%s] [HISTORY] skipped: bot is not a member of %s",
+                        self.name,
+                        channel_id,
+                    )
+                else:
+                    logger.error("[%s] [HISTORY] API fetch failed: %s", self.name, e)
 
         if not entries:
             return ""
@@ -3038,9 +3055,22 @@ class OctoAdapter(BasePlatformAdapter):
                 limit=max(1, min(int(limit), 100)),
             )
         except Exception as exc:
-            logger.error(
-                "octo: read_channel_messages failed (%s)", type(exc).__name__
-            )
+            # Same refusal, same treatment as the HISTORY path: a bot asked to
+            # read a group it never joined is a configuration fact, not a
+            # failure worth an ERROR line.  Everything else stays at ERROR.
+            if (
+                isinstance(exc, api.OctoApiError)
+                and exc.code == api.ERR_NOT_GROUP_MEMBER
+            ):
+                logger.debug(
+                    "octo: read_channel_messages refused, bot is not a member "
+                    "of channel %s",
+                    channel_id,
+                )
+            else:
+                logger.error(
+                    "octo: read_channel_messages failed (%s)", type(exc).__name__
+                )
             return {"ok": False, "error": "API call failed"}
 
         return {
