@@ -23,11 +23,54 @@ def pytest_configure(config):
         pass
 
 
+def make_bare_octo_adapter(runtime=None, *, runtimes=None):
+    """Build an ``OctoAdapter`` bypassing ``__init__``, in single-identity mode.
+
+    Only the fields the adapter needs to orchestrate identities and answer
+    Hermes are seeded.  Pass ``runtimes`` to exercise the multi-identity paths;
+    the default keeps the historical single-token fast path where no route
+    lookup happens and no identity state is written to disk.
+    """
+    from types import SimpleNamespace
+
+    from hermes_octo_plugin.adapter import OctoAdapter, SharedOctoConfig, _octo_platform
+
+    owned = tuple(runtimes) if runtimes is not None else (
+        () if runtime is None else (runtime,)
+    )
+    adapter = object.__new__(OctoAdapter)
+    adapter.config = SimpleNamespace(extra={})
+    adapter.platform = _octo_platform()
+    adapter._message_handler = None
+    adapter._running = False
+    adapter._fatal_error_code = None
+    adapter._fatal_error_message = None
+    adapter._fatal_error_retryable = True
+    adapter._shared = SharedOctoConfig()
+    adapter._api_url = ""
+    adapter._bot_tokens = tuple("token" for _ in owned) or ("token",)
+    adapter._state_base_dir = None
+    adapter._runtimes = owned
+    adapter._runtimes_by_robot_id = {}
+    adapter._sole_identity_mode = len(owned) <= 1
+    adapter._startup = None
+    adapter._legacy_plan = ()
+    adapter._gateway_loop = None
+    adapter._disconnecting = False
+    adapter._route_flush_tasks = set()
+    return adapter
+
+
 def make_bare_adapter():
-    """Build an ``OctoAdapter`` bypassing ``__init__`` and seed the in-memory
-    state fields **currently exercised by the test suite** — not a faithful
-    mirror of ``__init__`` (crypto handles, async tasks, registration, CDN
-    config, etc. are intentionally omitted).
+    """Build a bare ``IdentityRuntime`` (plus its owning ``OctoAdapter``) and
+    seed the in-memory state fields **currently exercised by the test suite** —
+    not a faithful mirror of ``__init__`` (crypto handles, async tasks,
+    registration, CDN config, etc. are intentionally omitted).
+
+    One Octo identity owns the connection, caches, inbound handling and the
+    send implementations, so a bare runtime is what most tests want.  It is
+    wired to a bare ``OctoAdapter`` in single-identity mode, which is the
+    historical behaviour: no route lookup, no identity state on disk.
 
     Tests historically used ``object.__new__(OctoAdapter)`` plus ad-hoc attr
     assignment, which (a) drifted as new fields were added to ``__init__`` and
@@ -39,6 +82,7 @@ def make_bare_adapter():
         DEFAULT_HISTORY_LIMIT,
         DEFAULT_HISTORY_PROMPT_TEMPLATE,
         HEARTBEAT_INTERVAL,
+        IdentityRuntime,
         LRUCache,
         NAME_CACHE_MAX_SIZE,
         OctoAdapter,
@@ -48,7 +92,10 @@ def make_bare_adapter():
     from hermes_octo_plugin import cards
     from hermes_octo_plugin.card_events import CardSessionRegistry
 
-    a = object.__new__(OctoAdapter)
+    a = object.__new__(IdentityRuntime)
+    a._adapter = make_bare_octo_adapter(a)
+    a._state_base_dir = None
+    a._card_store_robot_id = ""
     # Name resolution / membership maps
     a._uid_to_name = {}
     a._base_uid_to_name = {}

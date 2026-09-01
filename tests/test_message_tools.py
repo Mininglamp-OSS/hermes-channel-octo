@@ -90,7 +90,7 @@ def _tool_context(
     session: _Session | None = None,
 ):
     with (
-        patch.object(message_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(message_tools, "_resolve_runtime", return_value=adapter),
         patch.object(message_tools, "_trusted_route", return_value=_ROUTE),
         patch.object(
             message_tools,
@@ -518,7 +518,7 @@ async def test_remote_media_uses_guarded_session_and_keeps_host_safety_enabled()
     upload = AsyncMock(return_value="https://cdn.octo.invalid/a.bin")
     send = AsyncMock(return_value=SendMessageResult(message_id="media-safe"))
     with (
-        patch.object(message_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(message_tools, "_resolve_runtime", return_value=adapter),
         patch.object(message_tools, "_trusted_route", return_value=_ROUTE),
         patch.object(message_tools, "_new_guarded_http_session", session_factory),
         patch.object(message_tools.api, "download_file", download),
@@ -770,7 +770,7 @@ async def test_edit_card_tool_fails_closed_without_a_matching_registered_session
     )
     edit = AsyncMock()
     with (
-        patch.object(message_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(message_tools, "_resolve_runtime", return_value=adapter),
         patch.object(message_tools, "_trusted_route", return_value=_ROUTE),
         patch.object(
             message_tools,

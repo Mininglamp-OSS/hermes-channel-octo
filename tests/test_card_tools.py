@@ -10,6 +10,7 @@ import pytest
 
 from hermes_octo_plugin import card_tools, cards
 from hermes_octo_plugin.types import CardProfileManifest, ChannelType, SendMessageResult
+from hermes_octo_plugin.identity import IdentityRouteRegistry, scoped_dm_chat_id
 
 
 class _Session:
@@ -25,9 +26,14 @@ class _Adapter:
     _bot_token = "test-token"
     on_behalf_of: str | None = None
     _robot_id = "bot-1"
-    def __init__(self) -> None:
+    def __init__(self, *, parent=None) -> None:
+        self.adapter = parent
         self.sessions = []
         self._card_profile_cache = cards.CardProfileCache()
+
+    @property
+    def robot_id(self) -> str:
+        return self._robot_id
 
     def _register_card_session(self, session) -> None:
         self.sessions.append(session)
@@ -80,7 +86,7 @@ async def test_display_tool_sends_negotiated_card_only_to_trusted_conversation()
         elements=("TextBlock",),
     )
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=_Adapter()),
+        patch.object(card_tools, "_resolve_runtime", return_value=_Adapter()),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(card_tools.api, "get_card_profile", AsyncMock(return_value=manifest)),
@@ -125,7 +131,7 @@ async def test_display_tool_falls_back_to_plain_text_in_same_conversation(
 ) -> None:
     monkeypatch.delenv("OCTO_CARD_MESSAGE_ENABLED", raising=False)
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=_Adapter()),
+        patch.object(card_tools, "_resolve_runtime", return_value=_Adapter()),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(
@@ -165,7 +171,7 @@ async def test_display_tool_uses_plain_on_behalf_of_delivery() -> None:
     )
     get_profile = AsyncMock()
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(card_tools, "_resolve_runtime", return_value=adapter),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(card_tools.api, "get_card_profile", get_profile),
@@ -205,7 +211,7 @@ async def test_interactive_tool_binds_submit_to_trusted_session() -> None:
     )
     adapter = _Adapter()
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(card_tools, "_resolve_runtime", return_value=adapter),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(card_tools.api, "get_card_profile", AsyncMock(return_value=manifest)),
@@ -272,7 +278,7 @@ async def test_interactive_tool_retires_card_when_session_binding_fails() -> Non
     )
     edit_card = AsyncMock()
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(card_tools, "_resolve_runtime", return_value=adapter),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(card_tools.api, "get_card_profile", AsyncMock(return_value=manifest)),
@@ -312,7 +318,7 @@ async def test_interactive_tool_falls_back_when_v2_manifest_is_unavailable(
     send_card = AsyncMock(return_value=SendMessageResult(message_id="card-legacy"))
     send_text = AsyncMock(return_value=SendMessageResult(message_id="text-2"))
     with (
-        patch.object(card_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(card_tools, "_resolve_runtime", return_value=adapter),
         patch.object(card_tools, "_new_guarded_http_session", return_value=_Session()),
         patch("gateway.session_context.get_session_env", side_effect=_session_value),
         patch.object(
@@ -356,7 +362,7 @@ async def test_interactive_tool_falls_back_when_v2_manifest_is_unavailable(
     ],
 )
 async def test_card_tools_reject_model_controlled_route_or_identity(handler, args) -> None:
-    with patch.object(card_tools, "_resolve_adapter", return_value=_Adapter()):
+    with patch.object(card_tools, "_resolve_runtime", return_value=_Adapter()):
         result = json.loads(await handler(args))
 
     assert result == {"ok": False, "error": "trusted session fields cannot be supplied"}
@@ -395,6 +401,63 @@ async def test_gateway_background_worker_preserves_trusted_card_route() -> None:
         requester_uid="user-1",
         session_key="octo:group-1:user-1",
     )
+
+def test_trusted_route_restores_a_persisted_opaque_dm_target(tmp_path) -> None:
+    routes = IdentityRouteRegistry(path=tmp_path / "routes.json")
+    internal_chat_id = scoped_dm_chat_id("bot-1", "wire-peer")
+    routes.bind(
+        robot_id="bot-1",
+        session_key="agent:main:octo:dm:opaque",
+        chat_type="dm",
+        chat_id=internal_chat_id,
+        channel_type=int(ChannelType.DM),
+        wire_chat_id="wire-peer",
+    )
+    adapter = _Adapter(parent=MagicMock(routes=routes))
+
+    values = {
+        "HERMES_SESSION_PLATFORM": "octo",
+        "HERMES_SESSION_CHAT_ID": internal_chat_id,
+        "HERMES_SESSION_USER_ID": "wire-peer",
+        "HERMES_SESSION_KEY": "agent:main:octo:dm:opaque",
+    }
+    with patch(
+        "gateway.session_context.get_session_env",
+        side_effect=lambda name, default="": values.get(name, default),
+    ):
+        route = card_tools._trusted_route(
+            adapter,
+            require_session_key=True,
+        )
+
+    assert route == card_tools.TrustedOctoRoute(
+        channel_id="wire-peer",
+        chat_id=internal_chat_id,
+        channel_type=ChannelType.DM,
+        requester_uid="wire-peer",
+        session_key="agent:main:octo:dm:opaque",
+    )
+
+
+def test_trusted_route_rejects_a_foreign_persisted_target(tmp_path) -> None:
+    routes = IdentityRouteRegistry(path=tmp_path / "routes.json")
+    routes.bind(
+        robot_id="bot-2",
+        session_key="agent:main:octo:group:foreign",
+        chat_type="group",
+        chat_id="group-1",
+        channel_type=int(ChannelType.Group),
+    )
+    adapter = _Adapter(parent=MagicMock(routes=routes))
+
+    with patch(
+        "gateway.session_context.get_session_env",
+        side_effect=_session_value,
+    ):
+        assert card_tools._trusted_route(
+            adapter,
+            require_session_key=True,
+        ) is None
 
 
 def test_card_tool_schemas_expose_no_destination_or_identity_fields() -> None:

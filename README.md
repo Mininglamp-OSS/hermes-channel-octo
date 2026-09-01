@@ -84,7 +84,7 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | Variable | Required | Purpose |
 |---|---|---|
 | `OCTO_API_URL` | yes | Octo bot API base URL (e.g. `https://api.botgate.cn`) |
-| `OCTO_BOT_TOKEN` | yes | Octo bot authentication token |
+| `OCTO_BOT_TOKEN` | yes | Octo bot authentication token; several tokens may be given, separated by `;` (see [Multiple bot identities](#multiple-bot-identities)) |
 | `OCTO_CDN_URL` | no | CDN prefix for media acceleration |
 | `OCTO_WS_URL` | no | WuKongIM `ws://`/`wss://` override; defaults to the URL returned by bot registration |
 | `OCTO_ALLOW_PRIVATE_HOSTS` | no | Set to `true` only for trusted self-hosted API/CDN/WebSocket origins that resolve to private IPs; metadata endpoints remain blocked |
@@ -99,6 +99,91 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_EVENT_POLL_LIMIT` | no | Events requested per batch (default `50`, clamped to `1..100`) |
 | `OCTO_PROGRESS_CARD_RENDERER` | no | Progress-card renderer: `local` (default, Chinese Type-17 execution trace) or `registry` (server `ai.reasoning-process` template when advertised, otherwise local fallback) |
 | `OCTO_COMMAND_MENU_MAX_CHARS` | no | Maximum stored JSON characters for the Bot-global command menu; defaults to `1000`, `0` publishes the complete menu, and values `>=2` publish a name-only priority projection that fits the server field |
+
+## Multiple bot identities
+
+Octo issues a separate bot token per Space. One `octo` platform can hold
+several of them:
+
+```dotenv
+OCTO_BOT_TOKEN="bf_space_one;bf_space_two"
+```
+
+Before enabling a semicolon-separated token list, start this plugin successfully
+once with the profile's existing token alone. That one-token start durably
+records the bot's stable `robot_id`; startup refuses to guess legacy ownership
+without it. Then add the other tokens, keeping that existing token first for the
+one-time migration. A rotated replacement is also valid if it registers as the
+same `robot_id`. After migration reaches `phase=migrated`, token order no longer
+matters.
+
+Each token registers on its own, keeps its own WebSocket, heartbeat, event
+cursor, caches and card bindings, and reconnects independently. Empty and
+repeated entries are configuration errors and are reported without echoing
+any token.
+
+Configure at most one token from any one Octo Space in the same profile. A
+Space-prefixed DM id is scoped to its Space, not to an individual bot, so two
+identities from the same Space can derive the same Hermes SessionKey. Same-Space
+multi-token profiles are unsupported; use separate Hermes profiles for them.
+
+All identities share one Hermes profile: the same model, persona, memory,
+`session_list`, tools and filesystem. Nothing identity-specific reaches the
+model — tool schemas expose no token, Space or bot field. Existing legacy
+primary and group SessionKeys stay unchanged. If Octo supplies the same bare DM
+uid in several Spaces, non-primary identities receive an opaque internal DM
+scope derived from the stable `robot_id`; the route separately persists the
+bare wire uid, and no token or raw `robot_id` enters the SessionKey.
+
+Routing is durable, not guessed. The first message of a conversation binds
+that conversation to the identity that received it, keyed by the bot's stable
+`robot_id`; every later reply, progress update, card, tool message and media
+send goes back through the same identity. Consequences:
+
+- rotating a token keeps every existing private chat, group and session, because
+  the replacement token registers as the same `robot_id`;
+- after the first migration, reordering `OCTO_BOT_TOKEN` changes nothing;
+- an identity that is offline or no longer configured makes its conversations
+  fail with an explicit error instead of silently answering as another bot;
+- proactive cron/notification delivery requires an established route; a newly
+  added group or peer must send one trusted inbound message before the bot can
+  speak first, and a migrated DM whose wire peer is not yet known follows the
+  same fail-closed rule;
+- a profile that already ran a single token migrates its existing sessions to
+  that bot once, on the first multi-token start.
+
+The platform is online while at least one identity is connected; `/octo_doctor`
+reports per-identity status. Routing state lives in
+`$HERMES_HOME/workspace/octo/identity/`, and per-identity card bindings and
+event cursors in `$HERMES_HOME/workspace/octo/<robot_id>/`. Neither stores a
+token or a token hash.
+
+The durable registry holds at most 4096 target routes. `/octo_doctor` reports
+the configured capacity, remaining slots, and exhaustion state. At capacity,
+new conversations are refused without evicting established ownership. Within
+the supported one-token-per-Space configuration, the bot owner may reclaim one
+confirmed-stale, unconflicted DM route with
+`/octo-route-forget dm <chat_id>`. Releasing a group route removes its linked
+SessionRoutes but does not delete the Hermes session or transcript. A later
+inbound handled by another Octo identity can therefore claim that same
+unscoped group SessionKey and inherit its existing transcript. Group release
+requires explicit acknowledgement:
+`/octo-route-forget group <chat_id> --confirm-transcript-inheritance`.
+Successful output is returned only after the route snapshot is durable.
+
+The identity state directory must be writable even for a one-token profile:
+startup records a sentinel before accepting inbound traffic so a later
+multi-token migration cannot guess ownership.
+
+If startup reports unusable/pending identity state, or a route conflict remains
+after fixing the token configuration, stop the gateway before recovery. First
+restore the token list that created the pending migration, with the original
+token first. If that is impossible, back up and then remove both
+`$HERMES_HOME/workspace/octo/identity/` and the affected
+`$HERMES_HOME/workspace/octo/<robot_id>/card-sessions.json` shards. Restart once
+with the original token alone before adding other tokens again. This destructive
+reset discards pending card actions and durable route ownership; conversations
+bind again only from new trusted inbound messages.
 
 ## Current-conversation tools
 

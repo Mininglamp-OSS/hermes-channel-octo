@@ -31,15 +31,18 @@ Event-loop hygiene
 ------------------
 We avoid touching ``adapter._http_session`` directly — the same
 worker-thread-loop trap that bit ``octo_management`` applies. Read-only
-commands stay sync; the one async command (``/octo_refresh``) opens a
-fresh ``aiohttp.ClientSession`` in the current loop.
+commands stay synchronous. Async handlers keep loop ownership explicit, and
+blocking durable filesystem work is moved to a worker thread.
 """
 
 from __future__ import annotations
+import asyncio
 
 import json
 import logging
 import os
+
+from .identity import IdentityStateError
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,41 @@ def _no_adapter() -> str:
     )
 
 
+def _resolve_runtime():
+    """Return the identity runtime that owns the calling conversation."""
+    adapter = _resolve_adapter()
+    if adapter is None:
+        return None
+    try:
+        return adapter.resolve_trusted_runtime()
+    except Exception:
+        return None
+
+
+def _no_identity() -> str:
+    return (
+        "❌ This conversation has no established Octo identity route, so no "
+        "bot identity may answer for it. Send a message from the target Octo "
+        "conversation first."
+    )
+
+
+def _runtime_snapshot(runtime) -> dict:
+    return {
+        "robot_id": getattr(runtime, "_robot_id", ""),
+        "owner_uid": getattr(runtime, "_owner_uid", ""),
+        "connected": getattr(runtime, "_connected", False),
+        "need_reconnect": getattr(runtime, "_need_reconnect", False),
+        "reconnect_attempts": getattr(runtime, "_reconnect_attempts", 0),
+        "reconnect_in_progress": getattr(runtime, "_reconnect_in_progress", False),
+        "known_groups": len(getattr(runtime, "_known_group_ids", set())),
+        "cached_member_names": len(getattr(runtime, "_uid_to_name", {})),
+        "cached_group_md": len(getattr(runtime, "_group_md_cache", {})),
+        "cached_chat_kinds": len(getattr(runtime, "_chat_kind", {})),
+        "cache_activity_entries": len(getattr(runtime, "_cache_activity", {})),
+    }
+
+
 # ── /octo_doctor ──────────────────────────────────────────────────────────
 
 
@@ -112,21 +150,26 @@ def doctor(_raw_args: str) -> str:
     adapter = _resolve_adapter()
     if adapter is None:
         return _no_adapter()
+    runtimes = getattr(adapter, "runtimes", ()) or ()
+    runtime = _resolve_runtime()
     info = {
-        "connected": getattr(adapter, "_connected", False),
-        "need_reconnect": getattr(adapter, "_need_reconnect", False),
-        "reconnect_attempts": getattr(adapter, "_reconnect_attempts", 0),
-        "reconnect_in_progress": getattr(adapter, "_reconnect_in_progress", False),
-        "robot_id": getattr(adapter, "_robot_id", ""),
-        "owner_uid": getattr(adapter, "_owner_uid", ""),
+        "connected": bool(getattr(adapter, "is_connected", False)),
         "api_url": getattr(adapter, "_api_url", ""),
-        "known_groups": len(getattr(adapter, "_known_group_ids", set())),
-        "cached_member_names": len(getattr(adapter, "_uid_to_name", {})),
-        "cached_group_md": len(getattr(adapter, "_group_md_cache", {})),
-        "cached_chat_kinds": len(getattr(adapter, "_chat_kind", {})),
-        "cache_activity_entries": len(getattr(adapter, "_cache_activity", {})),
+        "identities": len(runtimes),
+        "identity_phase": getattr(adapter, "identity_phase", ""),
+        "sole_identity_mode": bool(getattr(adapter, "sole_identity_mode", True)),
         "calling_platform": _session_platform() or "<none>",
+        # Never emit tokens or token-derived values: only the stable robot_id.
+        "runtimes": [_runtime_snapshot(runtime)] if runtime is not None else [],
     }
+    if not getattr(adapter, "sole_identity_mode", True):
+        routes = getattr(adapter, "routes", None)
+        if routes is not None:
+            info["target_routes"] = routes.route_count()
+            info["session_routes"] = routes.session_count()
+            info["route_capacity"] = routes.capacity()
+            info["route_capacity_remaining"] = routes.remaining_capacity()
+            info["route_capacity_exhausted"] = routes.capacity_exhausted()
     return "Octo doctor:\n" + json.dumps(info, ensure_ascii=False, indent=2)
 
 
@@ -144,13 +187,24 @@ def info(_raw_args: str) -> str:
         "plugin_version": plugin_version,
     }
     if adapter is not None:
-        reg = getattr(adapter, "_registration", None)
-        payload["robot_id"] = getattr(adapter, "_robot_id", "")
-        payload["owner_uid"] = getattr(adapter, "_owner_uid", "")
         payload["api_url"] = getattr(adapter, "_api_url", "")
-        if reg is not None:
-            payload["ws_url"] = getattr(reg, "ws_url", "")
-            payload["owner_channel_id"] = getattr(reg, "owner_channel_id", "")
+        runtime = _resolve_runtime()
+        identities = []
+        if runtime is not None:
+            reg = getattr(runtime, "_registration", None)
+            entry = {
+                "robot_id": getattr(runtime, "_robot_id", ""),
+                "owner_uid": getattr(runtime, "_owner_uid", ""),
+            }
+            if reg is not None:
+                entry["ws_url"] = getattr(reg, "ws_url", "")
+                entry["owner_channel_id"] = getattr(
+                    reg,
+                    "owner_channel_id",
+                    "",
+                )
+            identities.append(entry)
+        payload["identities"] = identities
     else:
         payload["adapter"] = "not running"
     return "Octo info:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -160,7 +214,7 @@ def info(_raw_args: str) -> str:
 
 
 def groups(_raw_args: str) -> str:
-    """List the groups the bot is currently known to be a member of.
+    """List the groups the calling conversation's identity belongs to.
 
     Source is the in-memory cache (populated by startup prefetch + inbound
     self-heal). If no groups are known yet, suggests running /octo_refresh.
@@ -168,8 +222,11 @@ def groups(_raw_args: str) -> str:
     adapter = _resolve_adapter()
     if adapter is None:
         return _no_adapter()
-    names = getattr(adapter, "_group_names", {}) or {}
-    known = getattr(adapter, "_known_group_ids", set()) or set()
+    runtime = _resolve_runtime()
+    if runtime is None:
+        return _no_identity()
+    names = getattr(runtime, "_group_names", {}) or {}
+    known = getattr(runtime, "_known_group_ids", set()) or set()
     # Merge: groups with names go first, then any ids known but not yet named.
     all_ids = sorted(known | set(names))
     if not all_ids:
@@ -203,7 +260,10 @@ def show_md(raw_args: str) -> str:
     adapter = _resolve_adapter()
     if adapter is None:
         return _no_adapter()
-    cache = getattr(adapter, "_group_md_cache", {}) or {}
+    runtime = _resolve_runtime()
+    if runtime is None:
+        return _no_identity()
+    cache = getattr(runtime, "_group_md_cache", {}) or {}
     entry = cache.get(key)
     if not entry:
         return (
@@ -224,35 +284,108 @@ async def refresh_caches(_raw_args: str) -> str:
     """Force a full prefetch of group list + GROUP.md + member roster.
 
     Owner-only because it triggers N API calls and resets caches that may
-    be in active use by other handlers. Returns immediately after kicking
-    off the prefetch task; check ``/octo_doctor`` afterwards to see the
-    new counts.
+    be in active use by other handlers. Refreshes only the identity that owns
+    the calling conversation, since each identity holds its own authenticated
+    caches. Returns immediately after kicking off the prefetch task; check
+    ``/octo_doctor`` afterwards to see the new counts.
     """
     adapter = _resolve_adapter()
     if adapter is None:
         return _no_adapter()
-    err = _gate_owner(adapter)
+    runtime = _resolve_runtime()
+    if runtime is None:
+        return _no_identity()
+    err = _gate_owner(runtime)
     if err:
         return err
     # Reset the check-once guards so prefetch actually re-fetches.
     try:
-        adapter._group_md_checked.clear()
+        runtime._group_md_checked.clear()
     except Exception:
         pass
     try:
-        adapter._group_cache_timestamps.clear()
+        runtime._group_cache_timestamps.clear()
     except Exception:
         pass
     # Fire-and-forget; prefetch is bounded and logs its own progress.
     try:
         import asyncio
-        asyncio.create_task(adapter._prefetch_groups_and_members())
+        asyncio.create_task(runtime._prefetch_groups_and_members())
     except Exception as e:
         return f"❌ refresh failed to schedule: {e}"
     return (
         "✅ Refresh scheduled. GROUP.md, member rosters, and known-group "
         "set will be re-fetched in the background. Run `/octo_doctor` "
         "in a few seconds to verify updated counts."
+    )
+
+
+# ── /octo-route-forget <dm|group> <chat_id>  (owner-only) ─────────────────
+
+
+async def forget_route(raw_args: str) -> str:
+    """Durably forget one exact stale route owned by the calling bot."""
+    confirmation = "--confirm-transcript-inheritance"
+    parts = raw_args.strip().split()
+    if (
+        len(parts) not in {2, 3}
+        or parts[0].lower() not in {"dm", "group"}
+        or (len(parts) == 3 and parts[2] != confirmation)
+    ):
+        return (
+            "Usage: /octo-route-forget <dm|group> <chat_id> "
+            f"[{confirmation}]"
+        )
+    chat_type = parts[0].lower()
+    chat_id = parts[1].strip()
+    if not chat_id:
+        return (
+            "Usage: /octo-route-forget <dm|group> <chat_id> "
+            f"[{confirmation}]"
+        )
+    adapter = _resolve_adapter()
+    if adapter is None:
+        return _no_adapter()
+    runtime = _resolve_runtime()
+    if runtime is None:
+        return _no_identity()
+    err = _gate_owner(runtime)
+    if err:
+        return err
+    if chat_type == "group" and len(parts) != 3:
+        return (
+            "❌ releasing a group route can let another Octo identity claim "
+            "the same Hermes session and inherit its existing transcript. "
+            f"Re-run with `{confirmation}` only after accepting that consequence."
+        )
+    try:
+        removed = await asyncio.to_thread(
+            adapter.routes.forget_target,
+            robot_id=runtime._robot_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+        )
+    except IdentityStateError:
+        return (
+            "❌ route was not forgotten: the deletion could not be persisted; "
+            "its existing ownership remains unchanged"
+        )
+    if not removed:
+        return (
+            "❌ route was not forgotten: it is absent, owned by another "
+            "identity, or conflicted"
+        )
+    if chat_type == "group":
+        return (
+            f"✅ forgot route `{chat_type}:{chat_id}` durably. Its linked "
+            "SessionRoutes were removed, but the existing Hermes transcript "
+            "was not deleted; the next identity to receive trusted inbound "
+            "may claim and inherit that session."
+        )
+    return (
+        f"✅ forgot route `{chat_type}:{chat_id}` durably. Its linked "
+        "SessionRoutes were removed; the next trusted inbound may establish "
+        "new ownership."
     )
 
 
@@ -269,7 +402,10 @@ def tail_audit(raw_args: str) -> str:
     adapter = _resolve_adapter()
     if adapter is None:
         return _no_adapter()
-    err = _gate_owner(adapter)
+    runtime = _resolve_runtime()
+    if runtime is None:
+        return _no_identity()
+    err = _gate_owner(runtime)
     if err:
         return err
     n = 20
@@ -338,6 +474,12 @@ def register_all(ctx) -> None:
             refresh_caches,
             "(owner) Force re-fetch of group list / GROUP.md / members.",
             "",
+        ),
+        (
+            "octo-route-forget",
+            forget_route,
+            "(owner) Forget one exact stale route owned by this bot.",
+            "<dm|group> <chat_id> [--confirm-transcript-inheritance]",
         ),
         (
             "octo-audit",

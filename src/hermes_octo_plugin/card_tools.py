@@ -12,7 +12,7 @@ from typing import Any
 from . import api, cards
 from .agent_tools import (
     _new_guarded_http_session,
-    _resolve_adapter,
+    _resolve_runtime,
     _valid_target_channel_id,
 )
 from .types import (
@@ -241,6 +241,14 @@ def _error(message: str) -> str:
     return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
 
 
+#: Returned when the gateway has no live Octo adapter, or when the adapter
+#: carries several identities and this conversation has no trusted route to one
+#: of them. Never falls back to an arbitrary token.
+_NO_IDENTITY_ERROR = (
+    "Octo adapter is not connected for this conversation's identity"
+)
+
+
 def _trusted_route(adapter: Any, *, require_session_key: bool) -> TrustedOctoRoute | None:
     try:
         from gateway.session_context import get_session_env
@@ -256,8 +264,19 @@ def _trusted_route(adapter: Any, *, require_session_key: bool) -> TrustedOctoRou
     if require_session_key and not session_key:
         return None
     try:
-        channel_type = adapter._resolve_channel_type(chat_id)
-        channel_id = adapter._outbound_channel_id(chat_id, channel_type)
+        parent = getattr(adapter, "adapter", None)
+        routes = getattr(parent, "routes", None)
+        lookup = routes.lookup_chat_id(chat_id) if routes is not None else None
+        if lookup is not None:
+            if lookup.robot_id != getattr(adapter, "robot_id", ""):
+                return None
+            channel_type = ChannelType(lookup.channel_type)
+            channel_id = lookup.wire_chat_id
+        else:
+            if routes is not None and routes.chat_id_has_state(chat_id):
+                return None
+            channel_type = adapter._resolve_channel_type(chat_id)
+            channel_id = adapter._outbound_channel_id(chat_id, channel_type)
     except Exception:
         return None
     if not _valid_target_channel_id(channel_id, channel_type):
@@ -344,9 +363,9 @@ async def octo_send_display_card_handler(args: dict[str, Any], **_kwargs: Any) -
     rejected = _reject_trusted_fields(args)
     if rejected is not None:
         return rejected
-    adapter = _resolve_adapter()
+    adapter = _resolve_runtime()
     if adapter is None:
-        return _error("Octo adapter is not connected")
+        return _error(_NO_IDENTITY_ERROR)
     route = _trusted_route(adapter, require_session_key=False)
     if route is None:
         return _error("trusted Octo conversation context is unavailable")
@@ -401,9 +420,9 @@ async def octo_send_interactive_card_handler(
     rejected = _reject_trusted_fields(args)
     if rejected is not None:
         return rejected
-    adapter = _resolve_adapter()
+    adapter = _resolve_runtime()
     if adapter is None:
-        return _error("Octo adapter is not connected")
+        return _error(_NO_IDENTITY_ERROR)
     route = _trusted_route(adapter, require_session_key=True)
     if route is None:
         return _error("trusted Octo session context is unavailable")

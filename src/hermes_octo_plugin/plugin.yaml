@@ -16,8 +16,8 @@ requires_env:
     prompt: "Octo API URL"
     password: false
   - name: OCTO_BOT_TOKEN
-    description: "Octo bot authentication token"
-    prompt: "Octo Bot Token"
+    description: "Octo bot token(s); separate with ';'. On the first multi-token upgrade, list the profile's existing token first"
+    prompt: "Octo Bot Token(s)"
     password: true
 optional_env:
   - name: OCTO_CDN_URL

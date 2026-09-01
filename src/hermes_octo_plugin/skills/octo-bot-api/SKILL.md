@@ -114,11 +114,33 @@ Features:
 
 ### Multi-Bot Setup
 
-A single hermes-agent install hosts exactly one bot per `OCTO_BOT_TOKEN`.
-To run multiple bots, deploy multiple hermes-agent instances (one per bot)
-and point each at its own bot token. Each instance keeps an independent
-WebSocket connection and isolated session state, so messages never cross
-between bots.
+One hermes-agent install can host several bot identities on a single `octo`
+platform. Octo issues one token per Space, so join them with `;`:
+
+```bash
+export OCTO_BOT_TOKEN="bf_space_one;bf_space_two"
+```
+
+On the first upgrade from the old single-token plugin, the token this profile
+already used must be the first entry (or use its rotated replacement if it
+registers as the same `robot_id`). Legacy sessions do not yet carry an identity
+route, so that first-entry rule is their only safe migration signal. Token order
+is irrelevant after the one-time migration completes.
+
+Each token registers separately and keeps its own WebSocket connection,
+heartbeat, event cursor and caches, while all identities share the profile's
+model, persona, memory, sessions and tools. Each conversation is pinned to the
+identity that first received it and always answers through that identity, so
+messages never cross between bots. Rotating a token preserves those bindings
+because the replacement registers as the same `robot_id`.
+
+Octo may expose the same bare DM uid in more than one Space. The adapter scopes
+those non-primary conversations internally using the receiving bot's stable
+identity and restores the bare wire uid on send. Do not put a bot token or
+identity selector into a tool call or SessionKey.
+
+Deploy separate hermes-agent instances only when the bots must not share a
+profile (different persona, memory or workspace).
 
 ## Step 3: Send Messages
 
@@ -803,10 +825,10 @@ Save detailed explanations for DM conversations.
 | Bot shows "offline" | Heartbeat stopped | Send POST /v1/bot/heartbeat every 30s |
 | No messages received | WS not connected | Check wsUrl and bot token; adapter auto-reconnects |
 | WS connection drops | Network issue | SDK auto-reconnects; verify wsUrl |
-| Duplicate replies | Multiple gateway instances sharing a bot_token | Ensure only one hermes-agent instance per bot_token. |
+| Duplicate replies | Two gateway processes sharing a bot_token | Run one hermes-agent process per token; the same token listed twice in `OCTO_BOT_TOKEN` is rejected as a configuration error. |
 | 401 on API calls | Token expired/invalid | Re-register with POST /v1/bot/register |
 | Slow AI responses | High concurrency | Implement response queue, consider caching |
-| Bot-to-bot message loop | Bots replying to each other | The adapter auto-filters self-messages by from_uid. Ensure each bot runs as a separate hermes-agent instance. |
+| Bot-to-bot message loop | Bots replying to each other | The adapter auto-filters self-messages by from_uid, per identity. |
 | Messages out of order | Async processing | Use message_seq for ordering |
 
 ## GROUP.md Management
@@ -889,7 +911,7 @@ Each API Key is bound to a specific Space. When you run /quickstart in a Space, 
 ### Quickstart Flow
 
 1. Get your User API Key from BotFather `/quickstart` command (key is bound to your current Space)
-2. Use the User API endpoints below to programmatically create bots, retrieve their tokens, and configure each one against a separate hermes-agent instance via `OCTO_API_URL` / `OCTO_BOT_TOKEN`
+2. Use the User API endpoints below to programmatically create bots and retrieve their tokens. Set `OCTO_API_URL` once and put the tokens in `OCTO_BOT_TOKEN`, joined with `;`, to serve several Spaces from one profile — or give each bot its own hermes-agent instance when they must not share persona, memory or workspace
 3. The CLI automatically creates bots for all agents, writes config, and sends greetings
 4. Verify by sending a message to the bot in Octo
 

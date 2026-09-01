@@ -16,6 +16,7 @@ import unicodedata
 
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -35,6 +36,30 @@ from . import api, cards
 from .clarify import (
     deliver as _deliver_clarify,
     native_clarify_supported as _native_clarify_supported,
+)
+from .identity import (
+    BIND_BOUND,
+    BIND_CAPACITY,
+    BIND_CONFLICT,
+    CHAT_TYPE_DM,
+    CHAT_TYPE_GROUP,
+    PHASE_MIGRATED,
+    PHASE_PENDING,
+    PHASE_SINGLE,
+    CardBindingStore,
+    IdentityConflictError,
+    IdentityRouteRegistry,
+    IdentityStartup,
+    IdentityStateError,
+    IdentityStateStore,
+    PlannedRoute,
+    TokenConfigError,
+    chat_type_for_channel,
+    current_robot_id,
+    derive_session_key,
+    parse_bot_tokens,
+    scoped_dm_chat_id,
+    valid_robot_id,
 )
 from .mention import (
     STRUCTURED_MENTION_UID_PATTERN,
@@ -567,6 +592,19 @@ def _extract_space_id(channel_id: str) -> str | None:
     candidate = first_part[1:last_us]
     return candidate if candidate.isdigit() else None
 
+def _resolved_wire_chat_id(
+    internal_chat_id: str,
+    channel_type: int,
+    persisted_wire_chat_id: str,
+) -> str:
+    """Recover snapshots written before ``wire_chat_id`` was explicit."""
+    if (
+        channel_type == int(ChannelType.DM)
+        and persisted_wire_chat_id == internal_chat_id
+    ):
+        return _extract_base_uid(internal_chat_id)
+    return persisted_wire_chat_id
+
 
 def _strip_emoji(s: str) -> str:
     """Remove common emoji ranges from *s*. Used for emoji-tolerant member
@@ -618,6 +656,102 @@ def _env_enablement() -> dict | None:
     return result
 
 
+def _configured_home_chat_id(config: Any) -> str:
+    home = getattr(config, "home_channel", None)
+    if isinstance(home, Mapping):
+        value = home.get("chat_id")
+    else:
+        value = getattr(home, "chat_id", None)
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def _standalone_route(
+    api_url: str,
+    raw_bot_token: str,
+    *,
+    chat_id: str,
+    home_chat_id: str,
+) -> tuple[str, ChannelType | None, str | None, str]:
+    """Resolve an out-of-process delivery from durable identity state."""
+    tokens = parse_bot_tokens(raw_bot_token)
+    if not tokens:
+        return "", None, None, "OCTO_BOT_TOKEN is not configured"
+
+    state = IdentityStateStore()
+    try:
+        metadata = await asyncio.to_thread(state.load_metadata)
+        await asyncio.to_thread(state.routes.load)
+    except IdentityStateError:
+        logger.error("[Octo] standalone identity metadata is unusable")
+        return "", None, None, "Octo identity routing state is unusable"
+    if metadata is None and state.has_routing_evidence():
+        logger.error(
+            "[Octo] standalone identity metadata is missing while route state exists"
+        )
+        return "", None, None, "Octo identity routing state is ambiguous"
+
+    routing_mode = len(tokens) > 1 or (
+        metadata is not None and metadata.phase != PHASE_SINGLE
+    )
+    if not routing_mode:
+        return next(iter(tokens)), None, chat_id, ""
+
+    lookup = state.routes.lookup_chat_id(chat_id)
+    channel_type: ChannelType | None = None
+    wire_chat_id: str | None = chat_id
+    if lookup is not None:
+        expected_robot_id = lookup.robot_id
+        channel_type = ChannelType(lookup.channel_type)
+        wire_chat_id = _resolved_wire_chat_id(
+            chat_id, lookup.channel_type, lookup.wire_chat_id
+        )
+    elif state.routes.chat_id_has_state(chat_id):
+        return (
+            "",
+            None,
+            None,
+            "Octo identity route is not established for this conversation; "
+            "no other identity was used",
+        )
+    elif (
+        home_chat_id
+        and chat_id == home_chat_id
+        and metadata is not None
+    ):
+        expected_robot_id = metadata.legacy_robot_id
+    else:
+        return (
+            "",
+            None,
+            None,
+            "Octo identity route is not established for this conversation; "
+            "no other identity was used",
+        )
+
+    if not expected_robot_id:
+        return "", None, None, "Octo legacy primary identity is not available"
+
+    async with _new_guarded_http_session(api_url) as session:
+        for token in tokens:
+            try:
+                registration = await api.register_bot(session, api_url, token)
+            except Exception as exc:
+                logger.warning(
+                    "[Octo] standalone identity probe failed (%s)",
+                    type(exc).__name__,
+                )
+                continue
+            if registration.robot_id == expected_robot_id:
+                return token, channel_type, wire_chat_id, ""
+    return (
+        "",
+        None,
+        None,
+        f"Octo identity {expected_robot_id} is offline or no longer configured; "
+        "the message was not routed through another identity",
+    )
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -638,7 +772,7 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", None) or {}
     api_url = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
-    bot_token = (
+    raw_bot_token = (
         extra.get("bot_token")
         or getattr(pconfig, "token", "")
         or os.getenv("OCTO_BOT_TOKEN", "")
@@ -653,7 +787,7 @@ async def _standalone_send(
     ):
         return {"error": "on_behalf_of must be a string"}
     on_behalf_of = configured_on_behalf_of.strip() if configured_on_behalf_of else None
-    if not api_url or not bot_token:
+    if not api_url or not raw_bot_token:
         return {"error": "OCTO_API_URL and OCTO_BOT_TOKEN must be configured"}
 
     try:
@@ -663,6 +797,24 @@ async def _standalone_send(
 
     if not _OCTO_CHAT_ID_RE.fullmatch(str(chat_id)):
         return {"error": f"invalid chat_id format: {chat_id!r}"}
+
+    try:
+        (
+            bot_token,
+            resolved_channel_type,
+            resolved_wire_chat_id,
+            route_error,
+        ) = await _standalone_route(
+            api_url,
+            raw_bot_token,
+            chat_id=str(chat_id),
+            home_chat_id=_configured_home_chat_id(pconfig),
+        )
+    except (TokenConfigError, ValueError) as exc:
+        return {"error": str(exc)}
+    if not bot_token:
+        return {"error": route_error}
+    delivery_chat_id = resolved_wire_chat_id or str(chat_id)
 
     try:
         async with _new_guarded_http_session(api_url) as session:
@@ -676,7 +828,7 @@ async def _standalone_send(
                 parse_structured_mentions as _parse_sm,
             )
 
-            channel_type = (
+            channel_type = resolved_channel_type or (
                 _ChannelType.CommunityTopic
                 if "____" in str(chat_id)
                 else _ChannelType.Group
@@ -686,7 +838,7 @@ async def _standalone_send(
             send_entities = None
             structured = _parse_sm(message)
             if structured:
-                parent_group_no = str(chat_id).split("____", 1)[0]
+                parent_group_no = delivery_chat_id.split("____", 1)[0]
                 try:
                     members = await api.get_group_members(
                         session,
@@ -723,7 +875,7 @@ async def _standalone_send(
                 session,
                 api_url,
                 bot_token,
-                channel_id=chat_id,
+                channel_id=delivery_chat_id,
                 channel_type=channel_type,
                 content=send_content,
                 mention_uids=send_uids,
@@ -794,12 +946,43 @@ class LRUCache:
         return len(self._cache)
 
 
-class OctoAdapter(BasePlatformAdapter):
-    """
-    Octo (WuKongIM) platform adapter for Hermes Agent.
+@dataclass(frozen=True, slots=True)
+class SharedOctoConfig:
+    """Profile-level Octo configuration shared by every identity runtime.
 
-    Connects via WuKongIM WebSocket binary protocol for message reception
-    and HTTP API for message sending.
+    Parsed once by :class:`OctoAdapter`.  Nothing here is identity-scoped, so
+    every runtime receives the same values; the bot token is deliberately
+    absent.
+    """
+
+    api_url: str = ""
+    ws_url: str = ""
+    cdn_url: str = ""
+    on_behalf_of: str = ""
+    command_menu_max_chars: object = DEFAULT_COMMAND_MENU_MAX_CHARS
+    history_limit: int = DEFAULT_HISTORY_LIMIT
+    require_mention: bool = True
+    ignore_mention_all: bool = False
+    history_prompt_template: str = DEFAULT_HISTORY_PROMPT_TEMPLATE
+    heartbeat_interval_s: float = float(HEARTBEAT_INTERVAL)
+    ping_max_retry: int = PING_MAX_RETRY
+    event_poll_interval_s: float = 2.0
+    event_poll_wait_s: int = 25
+    event_poll_limit: int = 50
+    progress_card_renderer: str = "local"
+
+
+class IdentityRuntime:
+    """One Octo bot identity: its token, connection, crypto state and caches.
+
+    Everything that depends on the bot token, the registered ``robot_id`` or
+    the WebSocket lives here, so several identities can share a single Hermes
+    profile — model, persona, memory, sessions, tools and filesystem — without
+    sharing a connection, an event cursor, an owner or an authenticated cache.
+
+    Hermes integration (platform registration, session keys, message dispatch)
+    stays on :class:`OctoAdapter`; this object reaches it through
+    ``self._adapter``.
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -809,38 +992,38 @@ class OctoAdapter(BasePlatformAdapter):
     # first token fragment and suppressing the authoritative final response.
     SUPPORTS_MESSAGE_EDITING: bool = False
 
-    def __init__(self, config: PlatformConfig) -> None:
-        super().__init__(config, _octo_platform())
+    def __init__(
+        self,
+        adapter: OctoAdapter,
+        bot_token: str,
+        shared: SharedOctoConfig,
+        *,
+        state_base_dir: Any | None = None,
+    ) -> None:
+        self._adapter = adapter
+        self._state_base_dir = state_base_dir
 
-        extra = config.extra or {}
-        self._api_url: str = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
-        self._bot_token: str = extra.get("bot_token") or os.getenv("OCTO_BOT_TOKEN", "")
-        self._ws_url: str = extra.get("ws_url") or os.getenv("OCTO_WS_URL", "")
-        configured_on_behalf_of = extra.get("on_behalf_of")
-        if configured_on_behalf_of is None:
-            configured_on_behalf_of = os.getenv("OCTO_ON_BEHALF_OF", "")
-        if not isinstance(configured_on_behalf_of, str):
-            raise ValueError("on_behalf_of must be a string")
-        self._on_behalf_of = configured_on_behalf_of.strip()
-        # Optional CDN base URL. When set, _build_media_url returns
-        # <cdn_url>/<relative_path> instead of <api_url>/file/<relative_path>
-        # — lets the agent fetch media from a public-read CDN without
-        # routing every download through the bot API server.
-        self._cdn_url: str = extra.get("cdn_url") or os.getenv("OCTO_CDN_URL", "")
-        configured_menu_max_chars = extra.get("command_menu_max_chars")
-        if configured_menu_max_chars is None:
-            configured_menu_max_chars = os.getenv(
-                "OCTO_COMMAND_MENU_MAX_CHARS",
-                str(DEFAULT_COMMAND_MENU_MAX_CHARS),
-            )
-        self._command_menu_max_chars_config = configured_menu_max_chars
+        # Identity credential. Rotated by editing OCTO_BOT_TOKEN and restarting
+        # the gateway; the stable robot_id below is what routes point at.
+        self._bot_token: str = bot_token
 
-        if self._api_url:
-            _validate_octo_url(self._api_url, "OCTO_API_URL")
-        if self._cdn_url:
-            _validate_octo_url(self._cdn_url, "OCTO_CDN_URL")
-        if self._ws_url:
-            _validate_octo_ws_url(self._ws_url)
+        # Profile-level configuration, copied by value so a runtime never has
+        # to reach back through the adapter on a hot path.
+        self._api_url: str = shared.api_url
+        self._ws_url: str = shared.ws_url
+        self._cdn_url: str = shared.cdn_url
+        self._on_behalf_of: str = shared.on_behalf_of
+        self._command_menu_max_chars_config = shared.command_menu_max_chars
+        self._history_limit: int = shared.history_limit
+        self._require_mention: bool = shared.require_mention
+        self._ignore_mention_all: bool = shared.ignore_mention_all
+        self._history_prompt_template: str = shared.history_prompt_template
+        self._heartbeat_interval_s: float = shared.heartbeat_interval_s
+        self._ping_max_retry: int = shared.ping_max_retry
+        self._event_poll_interval_s: float = shared.event_poll_interval_s
+        self._event_poll_wait_s: int = shared.event_poll_wait_s
+        self._event_poll_limit: int = shared.event_poll_limit
+        self._progress_card_renderer: str = shared.progress_card_renderer
 
         # Connection state
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -872,6 +1055,9 @@ class OctoAdapter(BasePlatformAdapter):
         self._event_poller: Any | None = None
         self._event_task: asyncio.Task[Any] | None = None
         self._card_sessions = CardSessionRegistry()
+        # robot_id whose durable card bindings are already attached, so a
+        # reconnect does not re-restore them on top of live state.
+        self._card_store_robot_id: str = ""
         self._card_profile_cache = cards.CardProfileCache()
         self._native_clarify_enabled = _native_clarify_supported()
 
@@ -903,6 +1089,7 @@ class OctoAdapter(BasePlatformAdapter):
         # Heartbeat
         self._ping_retry_count: int = 0
         self._http_heartbeat_disabled: bool = False
+
 
         # Sticky packet buffer
         self._temp_buffer: bytearray = bytearray()
@@ -965,50 +1152,53 @@ class OctoAdapter(BasePlatformAdapter):
         # eviction bumps the value so an older response cannot resurrect data.
         self._group_scope_generations: dict[str, int] = {}
 
-        # Config
-        self._history_limit: int = extra.get("history_limit", DEFAULT_HISTORY_LIMIT)
-        self._require_mention: bool = extra.get("require_mention", True)
-        # When True, group @all (mention.all) does NOT trigger this bot.
-        # Useful when many bots share a group — operators @all to notify
-        # humans, not to fan-out to every assistant.
-        self._ignore_mention_all: bool = bool(extra.get("ignore_mention_all", False))
-        # Per-account override for the prompt template used to inject group
-        # chat history. {messages} (JSON-encoded list) and {count} (int)
-        # placeholders are substituted. Falls back to the module-level
-        # default when not set.
-        self._history_prompt_template: str = (
-            extra.get("history_prompt_template") or DEFAULT_HISTORY_PROMPT_TEMPLATE
-        )
-        # Per-account heartbeat / reconnect tuning. Bots on flaky links can
-        # raise ping_max_retry; bots in latency-sensitive deployments can
-        # lower heartbeat_interval_s. Falls back to module defaults.
-        self._heartbeat_interval_s: float = float(
-            extra.get("heartbeat_interval_s", HEARTBEAT_INTERVAL)
-        )
-        self._ping_max_retry: int = int(extra.get("ping_max_retry", PING_MAX_RETRY))
-        event_interval = extra.get("event_poll_interval_s")
-        if event_interval is None:
-            event_interval = os.getenv("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
-        event_wait = extra.get("event_poll_wait_s")
-        if event_wait is None:
-            event_wait = os.getenv("OCTO_EVENT_POLL_WAIT_S", "25")
-        event_limit = extra.get("event_poll_limit")
-        if event_limit is None:
-            event_limit = os.getenv("OCTO_EVENT_POLL_LIMIT", "50")
-        self._event_poll_interval_s = float(event_interval)
-        self._event_poll_wait_s = int(event_wait)
-        self._event_poll_limit = int(event_limit)
-        progress_renderer = extra.get("progress_card_renderer")
-        if progress_renderer is None:
-            progress_renderer = os.getenv("OCTO_PROGRESS_CARD_RENDERER", "local")
-        if (
-            not isinstance(progress_renderer, str)
-            or progress_renderer not in PROGRESS_CARD_RENDERERS
-        ):
-            raise ValueError(
-                "progress_card_renderer must be 'local' or 'registry'"
-            )
-        self._progress_card_renderer = progress_renderer
+    # ── Hermes integration, owned by the adapter ──────────────────────────
+
+    @property
+    def adapter(self) -> OctoAdapter:
+        """The single ``octo`` platform adapter that owns this identity."""
+        return self._adapter
+
+    @property
+    def config(self) -> PlatformConfig:
+        return self._adapter.config
+
+    @property
+    def _message_handler(self):
+        return self._adapter._message_handler
+
+    def build_source(self, *args: Any, **kwargs: Any):
+        return self._adapter.build_source(*args, **kwargs)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        await self._adapter.handle_message(event)
+
+    def truncate_message(self, content: str, limit: int) -> list[str]:
+        return self._adapter.truncate_message(content, limit)
+
+    def _mark_connected(self) -> None:
+        self._adapter._refresh_connection_state()
+
+    def _mark_disconnected(self) -> None:
+        self._adapter._refresh_connection_state()
+
+    @property
+    def bot_token(self) -> str:
+        """Current credential. Never logged, persisted, or hashed into state."""
+        return self._bot_token
+
+    @property
+    def robot_id(self) -> str:
+        """Stable Octo identity, empty until this runtime has registered."""
+        return self._robot_id
+
+    @property
+    def owner_uid(self) -> str:
+        return self._owner_uid
+
+    @property
+    def is_runtime_connected(self) -> bool:
+        return self._connected
 
     @property
     def on_behalf_of(self) -> str | None:
@@ -1088,6 +1278,79 @@ class OctoAdapter(BasePlatformAdapter):
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
 
+
+    def _reset_identity_scoped_state(self) -> None:
+        """Drop every cache and card binding owned by the previous robot."""
+        self._stop_card_event_poller()
+        try:
+            from .card_progress import cancel_adapter_progress
+
+            cancel_adapter_progress(self)
+        except Exception:
+            logger.debug("[%s] progress state cleanup failed", self.name, exc_info=True)
+        prefetch_task = self._prefetch_task
+        self._prefetch_task = None
+        if prefetch_task is not None and not prefetch_task.done():
+            prefetch_task.cancel()
+        for task in self._progress_tasks:
+            if not task.done():
+                task.cancel()
+        self._progress_tasks.clear()
+        from .card_sessions import CardSessionRegistry
+
+        self._command_menu_published_digest = None
+        self._command_menu_force_pending = False
+        self._command_menu_force_event.clear()
+        self._card_sessions = CardSessionRegistry()
+        self._card_store_robot_id = ""
+        self._card_profile_cache = cards.CardProfileCache()
+        self._cache_activity.clear()
+        self._known_group_ids.clear()
+        self._name_cache = LRUCache(max_size=NAME_CACHE_MAX_SIZE)
+        self._uid_to_name.clear()
+        self._base_uid_to_name.clear()
+        self._member_map.clear()
+        self._group_member_rosters.clear()
+        self._group_robot_map.clear()
+        self._group_cache_timestamps.clear()
+        self._user_group_index.clear()
+        self._group_names.clear()
+        self._group_histories.clear()
+        self._unknown_message_type_counts.clear()
+        self._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
+        self._chat_kind.clear()
+        self._space_dm_targets.clear()
+        self._group_md_cache.clear()
+        self._group_md_checked.clear()
+        self._group_scope_generations.clear()
+
+    def _attach_card_binding_store(self) -> None:
+        """Restore this identity's durable card bindings before polling starts.
+
+        Bindings are sharded per ``robot_id``, so a runtime only ever sees the
+        bindings it created.  A rotated token that registers as the same
+        identity keeps them; a genuinely new identity starts empty.
+        """
+        robot_id = self._registration.robot_id if self._registration else ""
+        if not robot_id or robot_id == self._card_store_robot_id:
+            return
+        try:
+            store = CardBindingStore(
+                robot_id=robot_id, base_dir=self._state_base_dir
+            )
+        except ValueError:
+            logger.error("[%s] refusing card-session store for malformed identity", self.name)
+            return
+        restored = self._card_sessions.attach_persistence(store)
+        self._card_store_robot_id = robot_id
+        if restored:
+            logger.info(
+                "[%s] restored %d card binding(s) for robot_id=%s",
+                self.name,
+                restored,
+                robot_id,
+            )
+
     async def _handle_card_action_event(self, action: CardAction) -> str:
         from .card_events import (
             dispatch_card_session_action,
@@ -1105,6 +1368,55 @@ class OctoAdapter(BasePlatformAdapter):
                     action.action_id,
                 )
             return reasoning_status
+
+        async def dispatch_bound_action(
+            session: CardSession,
+            claimed: CardAction,
+        ) -> bool | str:
+            """Treat a model-bound card action as trusted identity inbound."""
+            # Native clarify controls resolve an already-owned in-memory Hermes
+            # entry and deliberately never inject a MessageEvent. They have no
+            # outbound turn to route and are not persisted across restarts.
+            if session.clarify is not None:
+                return await dispatch_card_session_action(self, session, claimed)
+            chat_type = (
+                "dm" if session.channel_type == ChannelType.DM else "group"
+            )
+            source = self.build_source(
+                chat_id=session.chat_id,
+                chat_type=chat_type,
+                user_id=session.requester_uid,
+                user_name=session.requester_uid,
+            )
+            try:
+                derived_session_key = self._adapter.session_key_for_source(source)
+            except Exception:
+                logger.error("[%s] card action session key derivation failed", self.name)
+                return "failed"
+            if derived_session_key != session.session_key:
+                return "failed"
+            if not self._adapter.bind_inbound_route(
+                robot_id=self._robot_id,
+                source=source,
+                channel_type=session.channel_type,
+                wire_chat_id=(
+                    session.channel_id
+                    if session.channel_type == ChannelType.DM
+                    else session.chat_id
+                ),
+            ):
+                logger.error(
+                    "[%s] refusing card action: identity route conflict "
+                    "robot_id=%s",
+                    self.name,
+                    self._robot_id,
+                )
+                return "failed"
+            identity_token = current_robot_id.set(self._robot_id)
+            try:
+                return await dispatch_card_session_action(self, session, claimed)
+            finally:
+                current_robot_id.reset(identity_token)
 
         async def update_status(
             session: CardSession,
@@ -1136,11 +1448,7 @@ class OctoAdapter(BasePlatformAdapter):
         status = await handle_card_action(
             self._card_sessions,
             action,
-            lambda session, claimed: dispatch_card_session_action(
-                self,
-                session,
-                claimed,
-            ),
+            dispatch_bound_action,
             update_status=update_status,
         )
         if status == "dead_letter":
@@ -1225,11 +1533,18 @@ class OctoAdapter(BasePlatformAdapter):
             if cancellation is not None:
                 raise cancellation
             raise
+        except IdentityConflictError:
+            cancellation = await self._finalize_disconnect_resources_shielded()
+            if cancellation is not None:
+                raise cancellation
+            raise
         except Exception as exc:
             logger.error("[%s] Connection failed (%s)", self.name, type(exc).__name__)
             cancellation = await self._finalize_disconnect_resources_shielded()
             if cancellation is not None:
                 raise cancellation
+            if self._need_reconnect and not self._disconnecting:
+                self._spawn_reconnect_task()
             return False
 
     async def _do_connect(self) -> bool:
@@ -1265,14 +1580,33 @@ class OctoAdapter(BasePlatformAdapter):
                 self._bot_token,
                 force_refresh=should_force_refresh,
             )
-            self._robot_id = self._registration.robot_id
+            robot_id = self._registration.robot_id
+            if not valid_robot_id(robot_id):
+                raise RuntimeError("Octo registration returned a malformed robot_id")
+            # Claim the stable identity before any listener, poller or menu
+            # task starts, so a duplicate identity can never open a second
+            # connection and persisted routes resolve to exactly one runtime.
+            self._adapter._claim_identity(self, robot_id)
+            self._robot_id = robot_id
             self._owner_uid = self._registration.owner_uid or ""
-            logger.info("[%s] Bot registered", self.name)
+            self._attach_card_binding_store()
+            logger.info("[%s] Bot registered (robot_id=%s)", self.name, self._robot_id)
+        except IdentityConflictError:
+            # Two configured tokens resolved to the same stable identity, or a
+            # runtime came back as a different identity. Never start a second
+            # connection for the same bot: they would kick each other forever.
+            self._need_reconnect = False
+            raise
         except Exception as e:
             logger.error(
                 "[%s] Bot registration failed: %s", self.name, redact_log(str(e))
             )
             raise
+
+        # Durable identity bookkeeping: record a single-identity profile's stable
+        # id, or apply the frozen legacy-migration plan once the verified legacy
+        # primary is back. Runs before this identity accepts inbound traffic.
+        await self._adapter._on_runtime_registered(self)
 
         ws_url = self._ws_url or self._registration.ws_url
         _validate_octo_ws_url(ws_url)
@@ -1368,10 +1702,6 @@ class OctoAdapter(BasePlatformAdapter):
                         self.name,
                         self._server_version,
                     )
-                elif result.reason_code == 0:
-                    logger.error("[%s] Kicked by server", self.name)
-                    self._need_reconnect = False
-                    raise RuntimeError("Kicked by server")
                 else:
                     logger.error(
                         "[%s] Connect failed: reasonCode=%d",
@@ -2472,6 +2802,7 @@ class OctoAdapter(BasePlatformAdapter):
         finally:
             if self._recv_task is asyncio.current_task():
                 self._connected = False
+                self._mark_disconnected()
                 if self._need_reconnect:
                     logger.debug(
                         "[%s] Receive loop exited — scheduling reconnect",
@@ -2504,6 +2835,7 @@ class OctoAdapter(BasePlatformAdapter):
                 "[%s] Server sent DISCONNECT — will attempt reconnect", self.name
             )
             self._connected = False
+            self._mark_disconnected()
             if self._ws:
                 try:
                     await self._ws.close()
@@ -2571,13 +2903,23 @@ class OctoAdapter(BasePlatformAdapter):
                 asyncio.create_task(self._refresh_group_md(msg.channel_id))
             return
 
+        wire_chat_id = msg.channel_id
         if is_group:
             channel_id = msg.channel_id
-        elif _extract_space_id(msg.channel_id) is not None:
-            channel_id = msg.channel_id
-            self._space_dm_targets[channel_id] = _extract_base_uid(msg.from_uid)
         else:
-            channel_id = msg.from_uid
+            wire_chat_id = _extract_base_uid(msg.from_uid)
+            if _extract_space_id(msg.channel_id) is not None:
+                channel_id = msg.channel_id
+            elif (
+                self._adapter.sole_identity_mode
+                or self._robot_id == self._adapter.legacy_primary_robot_id
+            ):
+                # Preserve every pre-multi-token DM SessionKey on the verified
+                # legacy primary.
+                channel_id = msg.from_uid
+            else:
+                channel_id = scoped_dm_chat_id(self._robot_id, wire_chat_id)
+            self._space_dm_targets[channel_id] = wire_chat_id
         channel_type_enum = (
             (msg.channel_type or ChannelType.Group) if is_group else ChannelType.DM
         )
@@ -2887,9 +3229,6 @@ class OctoAdapter(BasePlatformAdapter):
             if media_urls:
                 hermes_msg_type = MessageType.PHOTO
 
-        # Send typing indicator (fire-and-forget)
-        asyncio.create_task(self._send_typing_safe(channel_id, channel_type_enum))
-
         # Inject history + member list into channel_context when available
         # (hermes v0.13+), otherwise prepend to text body so older hermes
         # versions still work. Member list is built fresh per turn so it
@@ -2921,6 +3260,28 @@ class OctoAdapter(BasePlatformAdapter):
             channel_prompt=group_system_prompt,
             **event_kwargs,
         )
+
+        # Bind this conversation to *this* identity before session lookup or
+        # slash-command dispatch. Every inbound path — plain messages, /new,
+        # /reset — therefore has a stable robot_id before Hermes can create or
+        # reset a session, and a route claimed by another identity fails closed
+        # instead of being silently taken over.
+        if not self._adapter.bind_inbound_route(
+            robot_id=self._robot_id,
+            source=source,
+            channel_type=channel_type_enum,
+            wire_chat_id=wire_chat_id,
+        ):
+            logger.error(
+                "[%s] refusing inbound message: identity route conflict or "
+                "unavailable for chat=%s robot_id=%s",
+                self.name,
+                channel_id,
+                self._robot_id,
+            )
+            return
+        # Send typing indicator (fire-and-forget).
+        asyncio.create_task(self._send_typing_safe(channel_id, channel_type_enum))
 
         # Pre-populate hermes' session_context ContextVars BEFORE handing
         # the event over. hermes itself sets these later in its agent flow
@@ -2956,9 +3317,14 @@ class OctoAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+        # Trusted, adapter-internal turn identity. Outbound paths prefer it over
+        # any route lookup, and it is never visible to the model or to a tool
+        # schema.
+        identity_token = current_robot_id.set(self._robot_id)
         try:
             await self.handle_message(event)
         finally:
+            current_robot_id.reset(identity_token)
             if _session_tokens is not None:
                 try:
                     from gateway.session_context import clear_session_vars
@@ -3591,6 +3957,7 @@ class OctoAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] Typing indicator failed: %s", self.name, e)
 
+
     # ── Heartbeat ─────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
@@ -3601,6 +3968,7 @@ class OctoAdapter(BasePlatformAdapter):
                 if self._ping_retry_count > self._ping_max_retry:
                     logger.warning("[%s] Ping timeout, reconnecting...", self.name)
                     self._connected = False
+                    self._mark_disconnected()
                     if self._ws:
                         try:
                             await self._ws.close()
@@ -3970,7 +4338,11 @@ class OctoAdapter(BasePlatformAdapter):
             question = (
                 f"{question}\n\n请在回复时 @{bot_name}，否则群聊消息不会被机器人接收。"
             )
-        return await super().send_clarify(
+        # Hermes' generic clarify renderer lives on BasePlatformAdapter and
+        # sends through ``adapter.send()``, which re-resolves this identity from
+        # the trusted turn/session route rather than guessing a token.
+        return await BasePlatformAdapter.send_clarify(
+            self._adapter,
             chat_id,
             question,
             choices,
@@ -4679,6 +5051,922 @@ class OctoAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] get_chat_info failed: %s", self.name, e)
             return {"name": chat_id, "type": "unknown", "chat_id": chat_id}
+
+
+class OctoAdapter(BasePlatformAdapter):
+    """One Hermes ``octo`` platform carrying one or more Octo bot identities.
+
+    ``OCTO_BOT_TOKEN`` accepts a single token or a ``;``-separated list.  Each
+    token becomes an :class:`IdentityRuntime` with its own registration,
+    WebSocket, crypto state, heartbeat, event cursor, command menu and
+    authenticated caches, while every identity shares this profile's model,
+    persona, memory, session store, tools and filesystem.
+
+    Identity selection is a trusted transport concern: it comes from the
+    inbound listener that decrypted the message, from a trusted Hermes session
+    context, or from a persisted route — never from the model, and never from a
+    tool argument.  An unknown or conflicting route fails closed instead of
+    silently falling back to the first token, which would misdeliver across
+    Octo Spaces.
+    """
+
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    SUPPORTS_MESSAGE_EDITING: bool = False
+
+    def __init__(
+        self,
+        config: PlatformConfig,
+        *,
+        state_base_dir: Path | None = None,
+    ) -> None:
+        super().__init__(config, _octo_platform())
+
+        extra = config.extra or {}
+        api_url: str = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
+        ws_url: str = extra.get("ws_url") or os.getenv("OCTO_WS_URL", "")
+        # Optional CDN base URL. When set, _build_media_url returns
+        # <cdn_url>/<relative_path> instead of <api_url>/file/<relative_path>
+        # — lets the agent fetch media from a public-read CDN without
+        # routing every download through the bot API server.
+        cdn_url: str = extra.get("cdn_url") or os.getenv("OCTO_CDN_URL", "")
+
+        raw_bot_token = extra.get("bot_token")
+        if raw_bot_token is None:
+            raw_bot_token = os.getenv("OCTO_BOT_TOKEN", "")
+        # Raises TokenConfigError (never echoing a token) for empty entries and
+        # repeated tokens; an absent value yields () so an unconfigured platform
+        # still constructs and reports "must be set" at connect time.
+        self._bot_tokens: tuple[str, ...] = parse_bot_tokens(raw_bot_token)
+
+        configured_on_behalf_of = extra.get("on_behalf_of")
+        if configured_on_behalf_of is None:
+            configured_on_behalf_of = os.getenv("OCTO_ON_BEHALF_OF", "")
+        if not isinstance(configured_on_behalf_of, str):
+            raise ValueError("on_behalf_of must be a string")
+
+        configured_menu_max_chars = extra.get("command_menu_max_chars")
+        if configured_menu_max_chars is None:
+            configured_menu_max_chars = os.getenv(
+                "OCTO_COMMAND_MENU_MAX_CHARS",
+                str(DEFAULT_COMMAND_MENU_MAX_CHARS),
+            )
+
+        if api_url:
+            _validate_octo_url(api_url, "OCTO_API_URL")
+        if cdn_url:
+            _validate_octo_url(cdn_url, "OCTO_CDN_URL")
+        if ws_url:
+            _validate_octo_ws_url(ws_url)
+
+        event_interval = extra.get("event_poll_interval_s")
+        if event_interval is None:
+            event_interval = os.getenv("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
+        event_wait = extra.get("event_poll_wait_s")
+        if event_wait is None:
+            event_wait = os.getenv("OCTO_EVENT_POLL_WAIT_S", "25")
+        event_limit = extra.get("event_poll_limit")
+        if event_limit is None:
+            event_limit = os.getenv("OCTO_EVENT_POLL_LIMIT", "50")
+        progress_renderer = extra.get("progress_card_renderer")
+        if progress_renderer is None:
+            progress_renderer = os.getenv("OCTO_PROGRESS_CARD_RENDERER", "local")
+        if (
+            not isinstance(progress_renderer, str)
+            or progress_renderer not in PROGRESS_CARD_RENDERERS
+        ):
+            raise ValueError("progress_card_renderer must be 'local' or 'registry'")
+
+        self._shared = SharedOctoConfig(
+            api_url=api_url,
+            ws_url=ws_url,
+            cdn_url=cdn_url,
+            on_behalf_of=configured_on_behalf_of.strip(),
+            command_menu_max_chars=configured_menu_max_chars,
+            history_limit=extra.get("history_limit", DEFAULT_HISTORY_LIMIT),
+            require_mention=extra.get("require_mention", True),
+            # When True, group @all (mention.all) does NOT trigger this bot.
+            # Useful when many bots share a group — operators @all to notify
+            # humans, not to fan-out to every assistant.
+            ignore_mention_all=bool(extra.get("ignore_mention_all", False)),
+            history_prompt_template=(
+                extra.get("history_prompt_template") or DEFAULT_HISTORY_PROMPT_TEMPLATE
+            ),
+            heartbeat_interval_s=float(
+                extra.get("heartbeat_interval_s", HEARTBEAT_INTERVAL)
+            ),
+            ping_max_retry=int(extra.get("ping_max_retry", PING_MAX_RETRY)),
+            event_poll_interval_s=float(event_interval),
+            event_poll_wait_s=int(event_wait),
+            event_poll_limit=int(event_limit),
+            progress_card_renderer=progress_renderer,
+        )
+        # Endpoint is also read directly by diagnostics that never send.
+        self._api_url = api_url
+
+        self._state_base_dir = state_base_dir
+        self._identity_state = IdentityStateStore(
+            base_dir=None if state_base_dir is None else Path(state_base_dir) / "identity"
+        )
+        self._runtimes: tuple[IdentityRuntime, ...] = tuple(
+            IdentityRuntime(self, token, self._shared, state_base_dir=state_base_dir)
+            for token in self._bot_tokens
+        )
+        self._runtimes_by_robot_id: dict[str, IdentityRuntime] = {}
+        # Until durable state says otherwise, a lone token keeps the historical
+        # fast path: no route lookup, no route snapshot, identical semantics.
+        self._sole_identity_mode: bool = len(self._runtimes) <= 1
+        self._startup: IdentityStartup | None = None
+        self._legacy_plan: tuple[PlannedRoute, ...] = ()
+        self._legacy_plan_targets: set[tuple[str, str]] = set()
+        self._gateway_loop: asyncio.AbstractEventLoop | None = None
+        self._disconnecting: bool = False
+        self._route_flush_tasks: set[asyncio.Task[Any]] = set()
+
+    # ── Identity inventory ────────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return "Octo"
+
+    @property
+    def on_behalf_of(self) -> str | None:
+        """Trusted configured grantor identity for outbound delivery."""
+        return self._shared.on_behalf_of or None
+
+    @property
+    def progress_card_renderer(self) -> str:
+        """Configured renderer for lifecycle-driven progress cards."""
+        return self._shared.progress_card_renderer
+
+    @property
+    def runtimes(self) -> tuple[IdentityRuntime, ...]:
+        """Every configured identity, in ``OCTO_BOT_TOKEN`` order."""
+        return self._runtimes
+
+    @property
+    def identity_state(self) -> IdentityStateStore:
+        return self._identity_state
+
+    @property
+    def routes(self) -> IdentityRouteRegistry:
+        return self._identity_state.routes
+
+    @property
+    def sole_identity_mode(self) -> bool:
+        """Is this profile still on the single-identity fast path?"""
+        return self._sole_identity_mode
+
+    @property
+    def identity_phase(self) -> str:
+        return self._startup.phase if self._startup is not None else PHASE_SINGLE
+
+    @property
+    def legacy_primary_robot_id(self) -> str:
+        return self._startup.legacy_robot_id if self._startup is not None else ""
+
+    def _refresh_connection_state(self) -> None:
+        """The platform is online while at least one identity is connected."""
+        if any(runtime.is_runtime_connected for runtime in self._runtimes):
+            self._mark_connected()
+        else:
+            self._mark_disconnected()
+
+    def _claim_identity(self, runtime: IdentityRuntime, robot_id: str) -> None:
+        """Register a freshly-registered runtime under its stable identity."""
+        owner = self._runtimes_by_robot_id.get(robot_id)
+        if owner is not None and owner is not runtime:
+            raise IdentityConflictError(
+                f"two configured Octo tokens registered as the same identity "
+                f"({robot_id}); remove the duplicate token"
+            )
+        previous = runtime.robot_id
+        if previous and previous != robot_id:
+            runtime._reset_identity_scoped_state()
+            # This token now belongs to a different bot. Treat it as a new
+            # identity: routes for the old one stay put and fail closed.
+            _ = self._runtimes_by_robot_id.pop(previous, None)
+            logger.warning(
+                "[%s] identity changed for a configured token: %s → %s; "
+                "existing routes for %s are not migrated",
+                self.name,
+                previous,
+                robot_id,
+                previous,
+            )
+        self._runtimes_by_robot_id[robot_id] = runtime
+
+    async def _on_runtime_registered(self, runtime: IdentityRuntime) -> None:
+        """Advance durable identity state now that *runtime* has an identity."""
+        robot_id = runtime.robot_id
+        # ``_startup`` is only set once ``connect()`` has initialised durable
+        # identity state. A runtime driven directly (embedding, tests) has no
+        # state machine to advance and must not create profile state as a
+        # side effect.
+        if not robot_id or self._startup is None:
+            return
+        if self._sole_identity_mode:
+            previous_robot_id = self.legacy_primary_robot_id
+            try:
+                if previous_robot_id and previous_robot_id != robot_id:
+                    await asyncio.to_thread(
+                        self._identity_state.protect_replaced_single_identity,
+                        previous_robot_id=previous_robot_id,
+                        enumerate_legacy_sessions=self._enumerate_legacy_octo_sessions,
+                    )
+                    self._startup = IdentityStartup(
+                        phase=PHASE_MIGRATED,
+                        legacy_robot_id=previous_robot_id,
+                        plan=(),
+                        sole_identity_mode=False,
+                    )
+                    self._legacy_plan = ()
+                    self._legacy_plan_targets.clear()
+                    self._sole_identity_mode = False
+                    logger.warning(
+                        "[%s] configured single token now registers as %s; "
+                        "legacy routes remain pinned to offline identity %s",
+                        self.name,
+                        robot_id,
+                        previous_robot_id,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self._identity_state.record_single_identity, robot_id
+                    )
+            except (IdentityStateError, OSError):
+                logger.error(
+                    "[%s] could not protect the stable single Octo identity",
+                    self.name,
+                )
+                raise IdentityStateError(
+                    "could not persist the stable Octo identity"
+                ) from None
+            return
+        if self.identity_phase != PHASE_PENDING:
+            return
+        if self._runtimes and runtime is not self._runtimes[0]:
+            return
+        await self._apply_legacy_migration(robot_id)
+
+    async def _apply_legacy_migration(self, robot_id: str) -> None:
+        """Bind the frozen plan to the verified legacy primary, exactly once."""
+        expected = self.legacy_primary_robot_id
+        if expected != robot_id:
+            logger.error(
+                "[%s] first OCTO_BOT_TOKEN registered as %s but this profile's "
+                "previous identity was %s; legacy session migration stays "
+                "pending and no session is reassigned",
+                self.name,
+                robot_id,
+                expected,
+            )
+            return
+        plan = self._legacy_plan
+        try:
+            await asyncio.to_thread(
+                self._identity_state.apply_legacy_plan,
+                robot_id=robot_id,
+                plan=plan,
+            )
+        except (IdentityStateError, OSError):
+            logger.error(
+                "[%s] legacy identity migration could not be committed; it "
+                "stays pending",
+                self.name,
+            )
+            return
+        self._legacy_plan = ()
+        self._startup = IdentityStartup(
+            phase=PHASE_MIGRATED,
+            legacy_robot_id=robot_id,
+            plan=(),
+            sole_identity_mode=False,
+        )
+        self._legacy_plan_targets.clear()
+
+    # ── Legacy session enumeration ────────────────────────────────────────
+
+    def _enumerate_legacy_octo_sessions(self) -> list[tuple[str, str, str]]:
+        """Read existing ``octo`` sessions through the public session store.
+
+        Only entries with a structured ``origin`` are returned: a serialized
+        session key is never parsed back into a transport target.  Records
+        without one are bound by their next trusted inbound message instead.
+        """
+        store = getattr(self, "_session_store", None)
+        lister = getattr(store, "list_sessions", None)
+        if lister is None:
+            return []
+        try:
+            entries = lister()
+        except Exception:
+            logger.error("[%s] session enumeration failed", self.name, exc_info=True)
+            return []
+        planned: list[tuple[str, str, str]] = []
+        skipped = 0
+        for entry in entries:
+            origin = getattr(entry, "origin", None)
+            session_key = getattr(entry, "session_key", None)
+            if not isinstance(session_key, str) or not session_key:
+                continue
+            platform = getattr(origin, "platform", None)
+            platform_value = getattr(platform, "value", platform)
+            if str(platform_value or "").lower() != "octo":
+                continue
+            chat_id = getattr(origin, "chat_id", None)
+            chat_type = getattr(origin, "chat_type", None)
+            if not isinstance(chat_id, str) or not chat_id:
+                skipped += 1
+                continue
+            normalized = CHAT_TYPE_DM if chat_type == CHAT_TYPE_DM else CHAT_TYPE_GROUP
+            planned.append((session_key, normalized, chat_id))
+        if skipped:
+            logger.info(
+                "[%s] %d legacy Octo session(s) lack a structured origin; they "
+                "bind on their next inbound message",
+                self.name,
+                skipped,
+            )
+        return planned
+
+    # ── Connection lifecycle ──────────────────────────────────────────────
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Start every configured identity; one failure never cancels the rest."""
+        del is_reconnect
+        self._gateway_loop = asyncio.get_running_loop()
+        self._disconnecting = False
+        if not self._shared.api_url or not self._bot_tokens:
+            logger.error("[%s] OCTO_API_URL and OCTO_BOT_TOKEN must be set", self.name)
+            return False
+
+        if not await self._initialize_identity_state():
+            return False
+
+        if self.identity_phase == PHASE_PENDING and self._runtimes:
+            primary = await asyncio.gather(
+                self._runtimes[0].connect(),
+                return_exceptions=True,
+            )
+            secondary = await asyncio.gather(
+                *(runtime.connect() for runtime in self._runtimes[1:]),
+                return_exceptions=True,
+            )
+            results = [*primary, *secondary]
+        else:
+            results = await asyncio.gather(
+                *(runtime.connect() for runtime in self._runtimes),
+                return_exceptions=True,
+            )
+        for runtime, result in zip(self._runtimes, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                # Only ``IdentityConflictError`` carries a message this adapter
+                # composed itself, so it is the one failure whose text is known
+                # not to embed a credential from a transport or API layer.
+                detail = (
+                    str(result)
+                    if isinstance(result, IdentityConflictError)
+                    else type(result).__name__
+                )
+                logger.error(
+                    "[%s] identity %d/%d failed to connect (%s)",
+                    self.name,
+                    self._runtimes.index(runtime) + 1,
+                    len(self._runtimes),
+                    detail,
+                )
+        connected = [
+            runtime for runtime in self._runtimes if runtime.is_runtime_connected
+        ]
+        self._refresh_connection_state()
+        if not connected:
+            return False
+        if len(self._runtimes) > 1:
+            logger.info(
+                "[%s] %d/%d Octo identities online (%s)",
+                self.name,
+                len(connected),
+                len(self._runtimes),
+                ", ".join(runtime.robot_id for runtime in connected),
+            )
+        return True
+
+    async def _initialize_identity_state(self) -> bool:
+        """Persist the identity sentinel and any frozen plan before listening.
+
+        Nothing may receive inbound traffic until this succeeds: a message that
+        arrives without an identity route in place could bind the wrong bot or
+        be absorbed into the legacy migration set.
+        """
+        try:
+            startup = await asyncio.to_thread(
+                self._identity_state.begin,
+                token_count=len(self._bot_tokens),
+                enumerate_legacy_sessions=self._enumerate_legacy_octo_sessions,
+            )
+        except IdentityStateError as exc:
+            logger.error("[%s] %s", self.name, exc)
+            return False
+        except OSError:
+            logger.error(
+                "[%s] Octo identity state could not be written; refusing to "
+                "start any identity",
+                self.name,
+                exc_info=True,
+            )
+            return False
+        self._startup = startup
+        self._legacy_plan = startup.plan
+        self._legacy_plan_targets = {
+            (route.chat_type, route.chat_id) for route in startup.plan
+        }
+        self._sole_identity_mode = startup.sole_identity_mode
+        if not self._sole_identity_mode:
+            logger.info(
+                "[%s] identity routing active (phase=%s, tokens=%d, routes=%d)",
+                self.name,
+                startup.phase,
+                len(self._bot_tokens),
+                self.routes.route_count(),
+            )
+        return True
+
+    async def disconnect(self) -> None:
+        """Stop, cancel and drain every identity, then flush route state."""
+        self._disconnecting = True
+        cancellation: asyncio.CancelledError | None = None
+        drain = asyncio.gather(
+            *(runtime.disconnect() for runtime in self._runtimes),
+            return_exceptions=True,
+        )
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError as exc:
+                # Repeated caller cancellation must never abandon transport
+                # teardown for the identities that are still open.
+                cancellation = cancellation or exc
+                continue
+        for result in drain.result():
+            if isinstance(result, asyncio.CancelledError):
+                cancellation = cancellation or result
+            elif isinstance(result, BaseException):
+                logger.error(
+                    "[%s] identity shutdown failed (%s)",
+                    self.name,
+                    type(result).__name__,
+                )
+        await self._drain_route_flushes()
+        if not self._sole_identity_mode:
+            try:
+                _ = await asyncio.to_thread(self.routes.flush)
+            except OSError:
+                logger.error("[%s] final route snapshot write failed", self.name)
+        self._runtimes_by_robot_id.clear()
+        self._mark_disconnected()
+        if cancellation is not None:
+            raise cancellation
+
+    # ── Route binding and resolution ──────────────────────────────────────
+
+    def session_key_for_source(self, source: Any) -> str:
+        extra = getattr(self.config, "extra", None) or {}
+        return derive_session_key(
+            source,
+            group_sessions_per_user=bool(extra.get("group_sessions_per_user", True)),
+            thread_sessions_per_user=bool(
+                extra.get("thread_sessions_per_user", False)
+            ),
+        )
+
+    def bind_inbound_route(
+        self,
+        *,
+        robot_id: str,
+        source: Any,
+        channel_type: ChannelType | int,
+        wire_chat_id: str | None = None,
+    ) -> bool:
+        """Claim this conversation for *robot_id*; False means route conflict."""
+        if self._sole_identity_mode:
+            return True
+        if not robot_id:
+            return False
+        try:
+            session_key = self.session_key_for_source(source)
+        except Exception:
+            logger.error("[%s] session key derivation failed", self.name, exc_info=True)
+            return False
+        chat_type = chat_type_for_channel(channel_type)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if (
+            self.identity_phase == PHASE_PENDING
+            and (chat_type, chat_id) in self._legacy_plan_targets
+        ):
+            primary_robot_id = self.legacy_primary_robot_id
+            if not primary_robot_id and self._runtimes:
+                primary_robot_id = self._runtimes[0].robot_id
+            if not primary_robot_id or robot_id != primary_robot_id:
+                logger.error(
+                    "[%s] refusing inbound route for a frozen legacy target "
+                    "while migration is pending",
+                    self.name,
+                )
+                return False
+        result = self.routes.bind(
+            robot_id=robot_id,
+            session_key=session_key,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            channel_type=int(channel_type),
+            wire_chat_id=wire_chat_id,
+        )
+        if result == BIND_CAPACITY:
+            logger.error(
+                "[%s] route capacity exhausted (%d targets); refusing new "
+                "chat=%s without evicting established ownership",
+                self.name,
+                self.routes.capacity(),
+                chat_id,
+            )
+            return False
+        if result == BIND_CONFLICT:
+            self._schedule_route_flush()
+            return False
+        if result == BIND_BOUND:
+            self._schedule_route_flush()
+        return True
+
+    def _schedule_route_flush(self) -> None:
+        """Persist the route snapshot off the event loop, coalescing writes."""
+        loop = self._gateway_loop
+        if loop is None or loop.is_closed() or self._sole_identity_mode:
+            return
+        if self._route_flush_tasks:
+            return
+        try:
+            task = loop.create_task(self._flush_routes())
+        except RuntimeError:
+            return
+        self._route_flush_tasks.add(task)
+
+        def done(completed: asyncio.Task[Any]) -> None:
+            self._route_flush_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                failure = completed.exception()
+            except Exception:
+                failure = None
+            if failure is not None:
+                logger.error(
+                    "[%s] route snapshot task failed (%s)",
+                    self.name,
+                    type(failure).__name__,
+                )
+                return
+            # A bind may have landed after ``flush`` snapshotted and cleared
+            # dirty state. Discard first so the replacement can be scheduled.
+            if self.routes.dirty and not self._disconnecting:
+                self._schedule_route_flush()
+
+        task.add_done_callback(done)
+
+    async def _flush_routes(self) -> None:
+        try:
+            _ = await asyncio.to_thread(self.routes.flush)
+        except OSError:
+            logger.error("[%s] route snapshot write failed", self.name)
+
+    async def _drain_route_flushes(self) -> None:
+        pending = tuple(self._route_flush_tasks)
+        if not pending:
+            return
+        _ = await asyncio.gather(*pending, return_exceptions=True)
+
+    def _trusted_session_key(self) -> str:
+        """Session key of the turn Hermes is currently running, if any."""
+        try:
+            from gateway.session_context import get_session_env
+
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+            if platform and platform != "octo":
+                return ""
+            return get_session_env("HERMES_SESSION_KEY", "").strip()
+        except Exception:
+            return ""
+
+    def runtime_for_robot_id(self, robot_id: str) -> IdentityRuntime | None:
+        return self._runtimes_by_robot_id.get(robot_id)
+
+    def runtime_for_session_key(self, session_key: str) -> IdentityRuntime | None:
+        if self._sole_identity_mode:
+            return self._runtimes[0] if self._runtimes else None
+        robot_id = self.routes.robot_id_for_session(session_key)
+        if not robot_id:
+            return None
+        return self._runtimes_by_robot_id.get(robot_id)
+
+    def resolve_trusted_runtime(self) -> IdentityRuntime | None:
+        """Identity that owns the turn or session currently being served.
+
+        Order: the trusted inbound turn context, then the trusted Hermes session
+        route.  Nothing here consults model input.
+        """
+        if self._sole_identity_mode:
+            return self._runtimes[0] if self._runtimes else None
+        robot_id = current_robot_id.get()
+        if robot_id:
+            runtime = self._runtimes_by_robot_id.get(robot_id)
+            return runtime if runtime and runtime.is_runtime_connected else None
+        session_key = self._trusted_session_key()
+        if session_key:
+            runtime = self.runtime_for_session_key(session_key)
+            return runtime if runtime and runtime.is_runtime_connected else None
+        return None
+
+    _UNKNOWN_ROUTE_ERROR = (
+        "Octo identity route is not established for this conversation; "
+        "no other identity was used"
+    )
+
+    def _home_channel_chat_id(self) -> str:
+        home = getattr(self.config, "home_channel", None)
+        if isinstance(home, Mapping):
+            value = home.get("chat_id")
+        else:
+            value = getattr(home, "chat_id", None)
+        return value.strip() if isinstance(value, str) else ""
+
+    def resolve_outbound(
+        self,
+        chat_id: str,
+        *,
+        session_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[IdentityRuntime | None, dict[str, Any] | None, str]:
+        """Resolve ``(runtime, metadata, error)`` for one outbound delivery."""
+        if not self._runtimes:
+            return None, metadata, "Not connected"
+        if self._sole_identity_mode:
+            return self._runtimes[0], metadata, ""
+
+        robot_id = current_robot_id.get()
+        if not robot_id:
+            key = session_key or self._trusted_session_key()
+            if key:
+                if self.routes.session_conflict(key):
+                    return None, metadata, self._UNKNOWN_ROUTE_ERROR
+                robot_id = self.routes.robot_id_for_session(key) or ""
+        if robot_id:
+            runtime = self._runtimes_by_robot_id.get(robot_id)
+            if runtime is None or not runtime.is_runtime_connected:
+                return None, metadata, self._unavailable_identity_error(robot_id)
+            lookup = self.routes.lookup_chat_id(chat_id)
+            if lookup is not None:
+                if lookup.robot_id != robot_id:
+                    return None, metadata, self._UNKNOWN_ROUTE_ERROR
+                if lookup.channel_type == int(ChannelType.DM):
+                    runtime._space_dm_targets[chat_id] = _resolved_wire_chat_id(
+                        chat_id, lookup.channel_type, lookup.wire_chat_id
+                    )
+                resolved = dict(metadata or {})
+                resolved.setdefault("channel_type", lookup.channel_type)
+                return runtime, resolved, ""
+            if self.routes.chat_id_has_state(chat_id):
+                return None, metadata, self._UNKNOWN_ROUTE_ERROR
+            return runtime, metadata, ""
+
+        # Chat-id-only interfaces (BasePlatformAdapter.send, cron delivery) are
+        # served from the persisted reverse index, which supplies both the exact
+        # channel type and the owning identity. Zero or ambiguous matches fail
+        # closed rather than falling back to a channel-type heuristic.
+        lookup = self.routes.lookup_chat_id(chat_id)
+        if lookup is None:
+            if self.routes.chat_id_has_state(chat_id):
+                return None, metadata, self._UNKNOWN_ROUTE_ERROR
+            home_chat_id = self._home_channel_chat_id()
+            if home_chat_id and chat_id == home_chat_id:
+                robot_id = self.legacy_primary_robot_id
+                if not robot_id:
+                    return None, metadata, self._UNKNOWN_ROUTE_ERROR
+                runtime = self._runtimes_by_robot_id.get(robot_id)
+                if runtime is None or not runtime.is_runtime_connected:
+                    return (
+                        None,
+                        metadata,
+                        self._unavailable_identity_error(robot_id),
+                    )
+                return runtime, metadata, ""
+            return None, metadata, self._UNKNOWN_ROUTE_ERROR
+        runtime = self._runtimes_by_robot_id.get(lookup.robot_id)
+        if runtime is None or not runtime.is_runtime_connected:
+            return None, metadata, self._unavailable_identity_error(lookup.robot_id)
+        if lookup.channel_type == int(ChannelType.DM):
+            runtime._space_dm_targets[chat_id] = _resolved_wire_chat_id(
+                chat_id, lookup.channel_type, lookup.wire_chat_id
+            )
+        resolved = dict(metadata or {})
+        resolved.setdefault("channel_type", lookup.channel_type)
+        return runtime, resolved, ""
+
+    def _unavailable_identity_error(self, robot_id: str) -> str:
+        return (
+            f"Octo identity {robot_id} is offline or no longer configured; "
+            "the message was not routed through another identity"
+        )
+
+    @staticmethod
+    def _merge_media_channel_type(
+        kwargs: dict[str, Any],
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Fold a resolved channel type into media kwargs without overriding it."""
+        channel_type = (metadata or {}).get("channel_type")
+        if channel_type is None:
+            return kwargs
+        raw = kwargs.get("metadata")
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("media metadata must be a dictionary")
+        merged = dict(raw or {})
+        merged.setdefault("channel_type", channel_type)
+        return {**kwargs, "metadata": merged}
+
+    # ── Sending ───────────────────────────────────────────────────────────
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(chat_id, metadata=metadata)
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send(chat_id, content, reply_to, resolved)
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[Any] | None,
+        clarify_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(
+            chat_id, session_key=session_key, metadata=metadata
+        )
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send_clarify(
+            chat_id,
+            question,
+            choices,
+            clarify_id,
+            session_key,
+            resolved,
+        )
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        runtime, resolved, _error = self.resolve_outbound(
+            chat_id, metadata=metadata if isinstance(metadata, dict) else None
+        )
+        if runtime is None:
+            return
+        await runtime.send_typing(chat_id, resolved)
+
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(chat_id, metadata=metadata)
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send_image(chat_id, image_url, caption, reply_to, resolved)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(
+            chat_id, metadata=kwargs.get("metadata")
+        )
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send_document(
+            chat_id,
+            file_path,
+            caption,
+            file_name,
+            reply_to,
+            **self._merge_media_channel_type(kwargs, resolved),
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(
+            chat_id, metadata=kwargs.get("metadata")
+        )
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send_voice(
+            chat_id,
+            audio_path,
+            caption,
+            reply_to,
+            **self._merge_media_channel_type(kwargs, resolved),
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        runtime, resolved, error = self.resolve_outbound(
+            chat_id, metadata=kwargs.get("metadata")
+        )
+        if runtime is None:
+            return SendResult(success=False, error=error)
+        return await runtime.send_video(
+            chat_id,
+            video_path,
+            caption,
+            reply_to,
+            **self._merge_media_channel_type(kwargs, resolved),
+        )
+
+    async def check_read_permission(
+        self,
+        requester_uid: str | None,
+        target: str,
+    ):
+        """Delegate cross-channel authorization to the calling identity."""
+        runtime = self.resolve_trusted_runtime()
+        if runtime is not None:
+            return await runtime.check_read_permission(requester_uid, target)
+        from .permission import PermissionResult, parse_target
+
+        channel_id, channel_type = parse_target(target, known_group_ids=set())
+        return (
+            PermissionResult(
+                False,
+                "Octo identity route is not established for this conversation",
+            ),
+            channel_id,
+            channel_type,
+        )
+
+    async def read_channel_messages(
+        self,
+        *,
+        requester_uid: str | None,
+        target: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Delegate a cross-channel read to the calling identity."""
+        runtime = self.resolve_trusted_runtime()
+        if runtime is None:
+            return {
+                "ok": False,
+                "error": (
+                    "Octo identity route is not established for this "
+                    "conversation"
+                ),
+            }
+        return await runtime.read_channel_messages(
+            requester_uid=requester_uid,
+            target=target,
+            limit=limit,
+        )
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        runtime, _resolved, _error = self.resolve_outbound(chat_id)
+        if runtime is None:
+            return {"name": chat_id, "type": "unknown", "chat_id": chat_id}
+        return await runtime.get_chat_info(chat_id)
 
 
 # ── Plugin Registration ───────────────────────────────────────────────────────
