@@ -14,11 +14,11 @@ Hermes buffers text replies and sends one complete final message.
 
 | hermes-agent | hermes-channel-octo |
 |---|---|
-| `>=0.14,<0.21` | `0.1.x` |
+| `>=0.14,<0.22` | `0.1.x` |
 
 ## Install
 
-The plugin is verified against `hermes-agent==0.20.0`; the lower bound remains
+The plugin is verified against `hermes-agent==0.21.0`; the lower bound remains
 `0.14` for existing installations. Native interactive `send_clarify` cards are
 disabled on every supported Hermes version; clarifies use Hermes' plain-text
 fallback so users are never required to resolve a card action.
@@ -66,7 +66,7 @@ $PIP install 'websockets>=15.0,<16' 'aiohttp>=3.13,<4' \
 ```
 
 The `cryptography>=46,<49` range intentionally supports cryptography 46.x and
-48.x: 46.x remains compatible with supported older runtimes, while Hermes 0.20
+48.x: 46.x remains compatible with supported older runtimes, while Hermes 0.21
 is verified with cryptography 48.0.1. Version 49 is excluded pending a
 dedicated compatibility check.
 

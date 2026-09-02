@@ -20,14 +20,14 @@ classifiers = [
 ]
 dependencies = [
   # Floor follows hermes-agent's pre-1.0 ceiling rule: <0.(current_minor + 1).
-  # Verified against hermes-agent 0.20.0, so accept the 0.20 line while
-  # keeping 0.21+ behind an explicit compatibility validation.
-  "hermes-agent>=0.14,<0.21",
+  # Verified against hermes-agent 0.21.0, so accept the 0.21 line while
+  # keeping 0.22+ behind an explicit compatibility validation.
+  "hermes-agent>=0.14,<0.22",
   # Octo runtime deps. Floor = current pinned upstream version (known-good);
   # ceiling = next major (SemVer-respecting libraries).
   "websockets>=15.0,<16",
   "aiohttp>=3.13,<4",
-  # Keep the 46.x floor for supported older runtimes; Hermes 0.20 is verified
+  # Keep the 46.x floor for supported older runtimes; Hermes 0.21 is verified
   # with 48.0.1. Hold <49 until that next major has compatibility evidence.
   "cryptography>=46.0,<49",
   # Required by ``websockets`` when the runtime declares a SOCKS proxy via

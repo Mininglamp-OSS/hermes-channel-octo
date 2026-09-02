@@ -87,7 +87,7 @@ def test_data_files_ship_in_wheel(tmp_path):
         f"wheel is missing required data files: {missing}\n"
         f"wheel contents:\n  " + "\n  ".join(sorted(names))
     )
-    assert "Requires-Dist: hermes-agent<0.21,>=0.14" in metadata
+    assert "Requires-Dist: hermes-agent<0.22,>=0.14" in metadata
     assert "Requires-Dist: cryptography<49,>=46.0" in metadata
 
 
