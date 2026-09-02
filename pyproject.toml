@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-channel-octo"
-version = "0.1.3"
+version = "0.2.0"
 description = "Octo (WuKongIM-based corporate IM) channel plugin for hermes-agent"
 readme = "README.md"
 requires-python = ">=3.11"
