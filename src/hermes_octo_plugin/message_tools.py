@@ -16,8 +16,9 @@ from .mention import _utf16_length, parse_structured_mentions
 from .card_tools import (
     DISPLAY_BLOCK_SCHEMA,
     TrustedOctoRoute,
+    _NO_IDENTITY_ERROR,
     _new_guarded_http_session,
-    _resolve_adapter,
+    _resolve_runtime,
     _get_card_profile,
     _trusted_route,
 )
@@ -172,9 +173,9 @@ def _error(message: str) -> str:
 
 
 def _context() -> tuple[Any, TrustedOctoRoute] | str:
-    adapter = _resolve_adapter()
+    adapter = _resolve_runtime()
     if adapter is None:
-        return _error("Octo adapter is not running in this process")
+        return _error(_NO_IDENTITY_ERROR)
     if not adapter._api_url or not adapter._bot_token:
         return _error("Octo adapter is not configured")
     route = _trusted_route(adapter, require_session_key=False)

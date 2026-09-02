@@ -2,11 +2,13 @@
 Tests for hermes_octo_plugin.adapter — adapter initialization and config parsing.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+from hermes_octo_plugin import api
 from hermes_octo_plugin.adapter import (
     DEFAULT_HISTORY_LIMIT,
     DEFAULT_HISTORY_PROMPT_TEMPLATE,
@@ -34,12 +36,19 @@ def test_constructor_reads_transport_and_event_poll_overrides():
         )
     )
 
-    assert adapter._ws_url == "wss://socket.example.com/ws"
+    assert adapter._shared.ws_url == "wss://socket.example.com/ws"
     assert adapter.on_behalf_of == "grantor-1"
-    assert adapter._event_poll_interval_s == 3.5
-    assert adapter._event_poll_wait_s == 12
-    assert adapter._event_poll_limit == 80
+    assert adapter._shared.event_poll_interval_s == 3.5
+    assert adapter._shared.event_poll_wait_s == 12
+    assert adapter._shared.event_poll_limit == 80
     assert adapter.progress_card_renderer == "registry"
+    # Shared configuration reaches the identity runtime by value.
+    runtime = adapter.runtimes[0]
+    assert runtime._ws_url == "wss://socket.example.com/ws"
+    assert runtime._event_poll_interval_s == 3.5
+    assert runtime._event_poll_wait_s == 12
+    assert runtime._event_poll_limit == 80
+    assert runtime.progress_card_renderer == "registry"
 
 def test_constructor_reads_command_menu_budget_without_rejecting_runtime_value(
     monkeypatch,
@@ -51,9 +60,9 @@ def test_constructor_reads_command_menu_budget_without_rejecting_runtime_value(
     )
     invalid = OctoAdapter(SimpleNamespace(extra={"command_menu_max_chars": "bad"}))
 
-    assert from_env._command_menu_max_chars_config == "2000"
-    assert from_platform._command_menu_max_chars_config == "750"
-    assert invalid._command_menu_max_chars_config == "bad"
+    assert from_env._shared.command_menu_max_chars == "2000"
+    assert from_platform._shared.command_menu_max_chars == "750"
+    assert invalid._shared.command_menu_max_chars == "bad"
 
 
 def test_constructor_defaults_progress_cards_to_local_renderer():
@@ -342,6 +351,7 @@ class TestInboundSlashCommands:
         event = handle_message.await_args.args[0]
         assert event.text == "/new"
         assert event.get_command() == "new"
+
 
 
 class TestCheckOctoRequirements:

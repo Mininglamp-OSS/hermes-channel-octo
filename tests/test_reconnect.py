@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hermes_octo_plugin.adapter import (
-    OctoAdapter,
+    IdentityRuntime,
     RECONNECT_STAGGER_MAX_S,
     TOKEN_REFRESH_COOLDOWN_S,
 )
@@ -19,9 +19,9 @@ from hermes_octo_plugin.protocol import PacketType
 from tests.conftest import make_bare_adapter
 
 
-def _make_adapter() -> OctoAdapter:
-    """Construct a bare adapter without going through __init__ (which needs
-    a hermes PlatformConfig). Set only the fields _schedule_reconnect /
+def _make_adapter() -> IdentityRuntime:
+    """Construct a bare identity runtime without going through __init__ (which
+    needs a hermes PlatformConfig). Set only the fields _schedule_reconnect /
     _do_connect read so tests stay isolated."""
     a = make_bare_adapter()
     a._need_reconnect = True
@@ -509,14 +509,20 @@ async def test_do_connect_prefers_configured_websocket_url():
 
 
 @pytest.mark.asyncio
-async def test_registration_info_log_omits_robot_and_owner_ids(caplog):
+async def test_registration_info_log_names_identity_but_no_secret(caplog):
+    """Multi-identity operation needs the stable robot_id in logs.
+
+    ``robot_id`` is a rotation-stable identifier, not a credential, and is the
+    only way to tell two identity runtimes apart in a shared gateway log. The
+    owner uid, the IM token and the bot token must still never appear.
+    """
     adapter = _make_adapter()
     robot_id = "stable-robot-id"
     owner_id = "stable-owner-id"
     registration = MagicMock(
         robot_id=robot_id,
         owner_uid=owner_id,
-        im_token="token",
+        im_token="im-secret-token",
         ws_url="wss://server.example/socket",
     )
     caplog.set_level(logging.INFO, logger="hermes_octo_plugin.adapter")
@@ -539,8 +545,10 @@ async def test_registration_info_log_omits_robot_and_owner_ids(caplog):
         await adapter._do_connect()
 
     assert "Bot registered" in caplog.text
-    assert robot_id not in caplog.text
+    assert robot_id in caplog.text
     assert owner_id not in caplog.text
+    assert "im-secret-token" not in caplog.text
+    assert adapter._bot_token not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -648,6 +656,53 @@ async def test_successful_websocket_handoff_does_not_close_guarded_socket():
     assert adapter._ws is websocket
     guarded_socket.close.assert_not_called()
 
+
+
+@pytest.mark.asyncio
+async def test_initial_connack_rejection_keeps_runtime_retryable():
+    adapter = _make_adapter()
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    websocket = MagicMock()
+    websocket.send = AsyncMock()
+    websocket.recv = AsyncMock(return_value=b"connack")
+    connack = MagicMock(reason_code=0)
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            AsyncMock(return_value=guarded_socket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.websockets.connect",
+            AsyncMock(return_value=websocket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.generate_keypair",
+            return_value=(MagicMock(), b"client-public-key"),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.try_unpack_one",
+            return_value=(b"connack", bytearray()),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.decode_packet",
+            return_value=(PacketType.CONNACK, connack),
+        ),
+    ):
+        with pytest.raises(RuntimeError):
+            await adapter._do_connect()
+
+    assert adapter._need_reconnect is True
 
 # ─── Token refresh cooldown ──────────────────────────────────────────────────
 

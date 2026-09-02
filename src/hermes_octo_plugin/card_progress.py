@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import api, cards
-from .agent_tools import _resolve_adapter
+from .agent_tools import _resolve_runtime
 from .api import edit_template_card_message, send_template_card_message
 from .card_sessions import CardSession
 from .card_tools import (
@@ -971,7 +971,7 @@ def _tool_hook_is_octo(kwargs: Mapping[str, Any]) -> bool:
 def on_pre_llm_call(**kwargs: Any) -> None:
     if str(kwargs.get("platform") or "").strip().lower() != "octo":
         return
-    adapter = _resolve_adapter()
+    adapter = _resolve_runtime()
     if adapter is None:
         return
     route = _trusted_route(adapter, require_session_key=False)

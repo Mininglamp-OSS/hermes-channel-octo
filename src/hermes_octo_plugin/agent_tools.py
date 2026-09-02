@@ -87,7 +87,7 @@ def _valid_target_channel_id(channel_id: str, channel_type: ChannelType) -> bool
 
 
 # ---------------------------------------------------------------------------
-# Adapter resolution
+# Adapter / identity-runtime resolution
 # ---------------------------------------------------------------------------
 
 
@@ -105,6 +105,19 @@ def _resolve_adapter():
         return runner.adapters.get(Platform("octo"))
     except Exception:
         return None
+
+
+def _resolve_runtime():
+    """Return the Octo identity runtime that owns the current turn, or None.
+
+    The adapter may carry several bot tokens.  Which one may act is decided by
+    the trusted inbound turn context or the persisted session route — never by
+    the model — so a tool call cannot reach another Space's identity.
+    """
+    adapter = _resolve_adapter()
+    if adapter is None:
+        return None
+    return adapter.resolve_trusted_runtime()
 
 
 # ---------------------------------------------------------------------------
@@ -507,9 +520,15 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
     if error := _validate_management_args(args):
         return error
 
-    adapter = _resolve_adapter()
+    # Management actions authenticate with a bot token, so they must run as the
+    # identity that owns this conversation. Refusing here is the fail-closed
+    # half of never guessing a token.
+    adapter = _resolve_runtime()
     if adapter is None:
-        return _err("Octo adapter is not running in this process")
+        return _err(
+            "Octo adapter is not running in this process, or this conversation "
+            "has no established Octo identity route"
+        )
 
     api_url = adapter._api_url
     bot_token = adapter._bot_token

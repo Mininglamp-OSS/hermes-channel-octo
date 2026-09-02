@@ -12,7 +12,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from tools import clarify_gateway
 
 from hermes_octo_plugin import api, card_events, card_progress, card_tools, clarify
-from hermes_octo_plugin.adapter import OctoAdapter
+from hermes_octo_plugin.adapter import IdentityRuntime
 from hermes_octo_plugin.card_tools import TrustedOctoRoute
 from hermes_octo_plugin.types import CardProfileManifest, ChannelType, SendMessageResult
 from tests.conftest import make_bare_adapter
@@ -37,7 +37,7 @@ _MANIFEST = CardProfileManifest(
 )
 
 
-def _bare_clarify_adapter(*, native: bool) -> OctoAdapter:
+def _bare_clarify_adapter(*, native: bool) -> IdentityRuntime:
     adapter = make_bare_adapter()
     adapter._native_clarify_enabled = native
     adapter._http_session = object()
@@ -73,7 +73,7 @@ async def test_group_clarify_text_fallback_instructs_user_to_mention_bot() -> No
     fallback = AsyncMock(return_value=expected)
 
     with patch.object(BasePlatformAdapter, "send_clarify", fallback):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             "group-1",
             "Which option?",
@@ -83,7 +83,10 @@ async def test_group_clarify_text_fallback_instructs_user_to_mention_bot() -> No
         )
 
     assert result is expected
+    # The generic Hermes renderer runs on the owning adapter, so the identity is
+    # re-resolved from the trusted route instead of a guessed token.
     fallback.assert_awaited_once_with(
+        adapter.adapter,
         "group-1",
         "Which option?\n\n请在回复时 @小爱，否则群聊消息不会被机器人接收。",
         ["A", "B"],
@@ -106,7 +109,7 @@ async def test_native_clarify_host_integration_failure_uses_text_fallback() -> N
             AsyncMock(side_effect=RuntimeError("host integration changed")),
         ),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             "group-1",
             "Which option?",
@@ -156,7 +159,7 @@ async def test_native_clarify_waits_for_scheduled_progress_card() -> None:
                 wait_for_progress,
             ),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -203,7 +206,7 @@ async def test_native_clarify_limits_progress_wait_to_five_seconds() -> None:
                 AsyncMock(return_value=SendMessageResult(message_id="clarify-budget")),
             ),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -243,7 +246,7 @@ async def test_cleared_clarify_while_waiting_for_progress_is_never_posted() -> N
         patch.object(card_progress, "wait_for_initial_delivery", side_effect=clear_pending),
         patch.object(api, "send_card_message", send_card),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             _ROUTE.chat_id,
             "Which option?",
@@ -293,7 +296,7 @@ async def test_native_clarify_timeout_returns_failure_without_text_fallback(
             ),
             patch.object(api, "send_card_message", send_card),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -334,7 +337,7 @@ async def test_cleared_clarify_during_profile_lookup_is_never_posted_or_fallback
         patch.object(api, "get_card_profile", side_effect=profile_then_clear),
         patch.object(api, "send_card_message", send_card),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             _ROUTE.chat_id,
             "Which option?",
@@ -371,7 +374,7 @@ async def test_profile_failure_after_clarify_cancellation_never_sends_text_fallb
         patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
         patch.object(api, "get_card_profile", side_effect=clear_then_fail),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             _ROUTE.chat_id,
             "Which option?",
@@ -408,7 +411,7 @@ async def test_clarify_cleared_during_post_keeps_sent_card_session_owned() -> No
         patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
         patch.object(api, "send_card_message", side_effect=send_then_clear),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             _ROUTE.chat_id,
             "Which option?",
@@ -452,7 +455,7 @@ async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> Non
             patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
             patch.object(api, "send_card_message", send_card),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 "group-1",
                 "Which option?",
@@ -516,7 +519,7 @@ async def test_binding_failure_retires_the_sent_clarify_card() -> None:
                 side_effect=RuntimeError("registry unavailable"),
             ),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -558,7 +561,7 @@ async def test_hermes_020_multi_select_clarify_uses_choiceset_contract() -> None
             patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
             patch.object(api, "send_card_message", send_card),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 "group-1",
                 "Choose several",
@@ -924,7 +927,7 @@ async def test_reused_clarify_id_gets_a_new_delivery_id_per_occurrence() -> None
             )
             entry.multi_select = False
             try:
-                result = await OctoAdapter.send_clarify(
+                result = await IdentityRuntime.send_clarify(
                     adapter,
                     _ROUTE.chat_id,
                     "Which option?",
@@ -1027,7 +1030,7 @@ async def test_ambiguous_card_send_failure_retries_once_without_text_fallback(
             patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
             patch.object(api, "send_card_message", send_card),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -1073,7 +1076,7 @@ async def test_definitive_card_rejection_uses_base_text_fallback() -> None:
             patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
             patch.object(api, "send_card_message", send_card),
         ):
-            result = await OctoAdapter.send_clarify(
+            result = await IdentityRuntime.send_clarify(
                 adapter,
                 _ROUTE.chat_id,
                 "Which option?",
@@ -1112,7 +1115,7 @@ async def test_definitive_rejection_after_cancellation_never_sends_text_fallback
         patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
         patch.object(api, "send_card_message", side_effect=clear_then_reject),
     ):
-        result = await OctoAdapter.send_clarify(
+        result = await IdentityRuntime.send_clarify(
             adapter,
             _ROUTE.chat_id,
             "Which option?",

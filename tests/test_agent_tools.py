@@ -134,7 +134,7 @@ async def test_resource_ids_are_rejected_before_session_or_authorization_io(
     session_factory = MagicMock(side_effect=AssertionError("session must not open"))
     member_lookup = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", session_factory),
         patch.object(agent_tools.api, "get_group_members", member_lookup),
     ):
@@ -154,7 +154,7 @@ async def test_group_target_path_injection_is_rejected_before_membership_io():
     }
     member_lookup = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(
             agent_tools, "_new_guarded_http_session", return_value=_NoIoSession()
         ),
@@ -211,7 +211,7 @@ async def test_management_handler_uses_real_gateway_session_context() -> None:
         with (
             patch.object(
                 agent_tools,
-                "_resolve_adapter",
+                "_resolve_runtime",
                 return_value=_configured_adapter(),
             ),
             patch.object(
@@ -242,7 +242,7 @@ async def test_management_handler_uses_real_gateway_session_context() -> None:
 async def test_management_actions_fail_closed_without_trusted_session(action: str):
     """Every management action requires a trusted Octo session requester."""
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
     ):
         result = json.loads(await _call_handler(_args_for(action), trusted_uid=None))
@@ -271,7 +271,7 @@ async def test_group_and_thread_reads_deny_requester_outside_parent_group(
 ):
     """Group and thread metadata never bypass the parent-group membership gate."""
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -299,7 +299,7 @@ async def test_group_and_thread_reads_allow_current_parent_group_member(action: 
         return_value=GroupInfo(group_no="group-1", name="Test group")
     )
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "get_group_members", member_lookup),
         patch.object(agent_tools.api, "get_group_info", group_info_lookup),
@@ -335,7 +335,7 @@ async def test_space_wide_reads_require_the_explicit_owner(
 ):
     """Space-wide data is visible only to a caller explicitly identified as owner."""
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -359,7 +359,7 @@ async def test_space_wide_reads_require_the_explicit_owner(
 async def test_group_member_lookup_failure_denies_metadata_read():
     """A failed membership lookup is never treated as an empty authorized result."""
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -398,7 +398,7 @@ async def test_failed_md_write_never_updates_local_state_or_leaks_secrets(
     failure = RuntimeError("Bearer secret-token-from-backend")
 
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_resolve_runtime", return_value=adapter),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, api_call, AsyncMock(side_effect=failure)),
     ):
@@ -418,7 +418,7 @@ async def test_failed_md_write_never_updates_local_state_or_leaks_secrets(
 @pytest.mark.asyncio
 async def test_send_message_returns_the_server_message_identity():
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -461,7 +461,7 @@ async def test_management_send_filters_mentions_to_authoritative_target_roster()
         return_value=SendMessageResult(message_id="server-message")
     )
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "get_group_members", member_lookup),
         patch.object(agent_tools.api, "send_message", send_message),
@@ -498,7 +498,7 @@ async def test_management_send_fails_closed_when_permission_skips_requested_rost
     permission = AsyncMock(return_value=SimpleNamespace(allowed=True, reason=None))
     send_message = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools, "check_permission", permission),
         patch.object(agent_tools.api, "send_message", send_message),
@@ -526,7 +526,7 @@ async def test_thread_send_does_not_bypass_owner_only_join_permission():
         return_value=SendMessageResult(message_id="server-thread-message")
     )
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -556,7 +556,7 @@ async def test_thread_send_does_not_bypass_owner_only_join_permission():
 async def test_update_group_without_any_mutation_field_does_not_report_success():
     update_group = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "update_group", update_group),
     ):
@@ -574,7 +574,7 @@ async def test_update_group_without_any_mutation_field_does_not_report_success()
 async def test_claimed_owner_uid_cannot_override_trusted_session_requester():
     update_group = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "update_group", update_group),
     ):
@@ -597,7 +597,7 @@ async def test_claimed_owner_uid_cannot_override_trusted_session_requester():
 async def test_owner_claim_without_trusted_octo_session_is_denied_before_io():
     update_group = AsyncMock()
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "update_group", update_group),
     ):
@@ -651,7 +651,7 @@ async def test_management_rejects_runtime_malformed_values_before_io(
 ):
     session_factory = MagicMock(side_effect=AssertionError("session must not open"))
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", session_factory),
     ):
         result = json.loads(
@@ -677,7 +677,7 @@ async def test_malformed_group_md_update_cannot_poison_adapter_cache():
     adapter._write_md_to_disk = MagicMock()
     session_factory = MagicMock(side_effect=AssertionError("session must not open"))
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_resolve_runtime", return_value=adapter),
         patch.object(agent_tools, "_new_guarded_http_session", session_factory),
     ):
         result = json.loads(
@@ -705,7 +705,7 @@ async def test_owner_mutation_does_not_require_group_membership_read():
         side_effect=AssertionError("owner mutation must not read group membership")
     )
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools, "check_permission", membership_check),
         patch.object(agent_tools.api, "update_group", update_group),
@@ -732,7 +732,7 @@ async def test_malformed_md_response_version_cannot_poison_adapter_cache():
     adapter._write_md_to_disk = MagicMock()
     update_group_md = AsyncMock(return_value={"version": ["malformed"]})
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_resolve_runtime", return_value=adapter),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(agent_tools.api, "update_group_md", update_group_md),
     ):
@@ -764,7 +764,7 @@ async def test_search_audit_omits_requester_and_raw_keyword(caplog):
     caplog.set_level(logging.INFO, logger="hermes_octo_plugin.agent_tools")
 
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=adapter),
+        patch.object(agent_tools, "_resolve_runtime", return_value=adapter),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,
@@ -802,7 +802,7 @@ async def test_read_audit_omits_requester_and_raw_target(caplog):
     caplog.set_level(logging.INFO, logger="hermes_octo_plugin.agent_tools")
 
     with (
-        patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
+        patch.object(agent_tools, "_resolve_runtime", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
         patch.object(
             agent_tools.api,

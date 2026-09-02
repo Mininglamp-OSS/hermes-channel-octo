@@ -14,7 +14,7 @@ from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 
 from hermes_octo_plugin import card_events
-from hermes_octo_plugin.adapter import OctoAdapter
+from hermes_octo_plugin.adapter import IdentityRuntime
 from hermes_octo_plugin.types import ChannelType
 
 
@@ -1111,7 +1111,7 @@ async def test_adapter_consumes_owned_registry_reasoning_control_without_user_tu
     action_id: str,
     label: str,
 ) -> None:
-    adapter = object.__new__(OctoAdapter)
+    adapter = object.__new__(IdentityRuntime)
     adapter._card_sessions = card_events.CardSessionRegistry()
     adapter.handle_message = AsyncMock()
     reasoning_id = "session-1:turn-1:1"
@@ -1138,7 +1138,7 @@ async def test_adapter_consumes_owned_registry_reasoning_control_without_user_tu
 
 @pytest.mark.asyncio
 async def test_registry_reasoning_control_accepts_the_owned_dm_channel_alias() -> None:
-    adapter = object.__new__(OctoAdapter)
+    adapter = object.__new__(IdentityRuntime)
     adapter._card_sessions = card_events.CardSessionRegistry()
     adapter.handle_message = AsyncMock()
     reasoning_id = "session-1:turn-1:1"
@@ -1171,7 +1171,7 @@ async def test_registry_reasoning_control_accepts_the_owned_dm_channel_alias() -
 
 @pytest.mark.asyncio
 async def test_adapter_owns_poller_registry_and_card_action_dispatch() -> None:
-    adapter = object.__new__(OctoAdapter)
+    adapter = object.__new__(IdentityRuntime)
     adapter._http_session = object()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
