@@ -457,6 +457,16 @@ PROGRESS_CARD_RENDERERS = frozenset({"local", "registry"})
 # Group is any of these channel types
 _GROUP_CHANNEL_TYPES = frozenset([ChannelType.Group, ChannelType.CommunityTopic])
 
+# Users who sign in through the Octo OIDC/SSO path get the IdP subject stored
+# verbatim as their octo uid, which is an RFC-4122 UUID
+# (``baf54cde-cbf3-49c5-a43d-7733982b54e6``). Such an id is a *user*, so it must
+# be resolved as a DM — the 32-char-hex heuristic below would otherwise call it
+# a group and every typing/status call ends in ``400 group_status not_found``.
+_UUID_USER_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
 
 # SSRF / injection defenses for OCTO_API_URL, OCTO_CDN_URL, and chat_id.
 # OCTO_* URLs come from env/yaml and would otherwise let a tampered
@@ -4306,6 +4316,11 @@ class IdentityRuntime:
         # Thread channel IDs always contain the "____" separator
         if "____" in chat_id:
             return ChannelType.CommunityTopic
+        # OIDC/SSO users carry a hyphenated UUID uid; recognise it before the
+        # group heuristic, otherwise DMs are sent as channel_type=2 and the
+        # server answers ``400 group_status not_found``.
+        if _UUID_USER_ID_RE.match(chat_id):
+            return ChannelType.DM
         # Heuristic fallback: Octo user uids are 32-char hex strings;
         # anything shorter or with non-hex chars is likely a group_no.
         if len(chat_id) == 32 and all(c in "0123456789abcdef" for c in chat_id.lower()):
