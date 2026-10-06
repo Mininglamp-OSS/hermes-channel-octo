@@ -457,6 +457,17 @@ PROGRESS_CARD_RENDERERS = frozenset({"local", "registry"})
 # Group is any of these channel types
 _GROUP_CHANNEL_TYPES = frozenset([ChannelType.Group, ChannelType.CommunityTopic])
 
+# Octo platform plumbing accounts. These are not real users: ``botfather``
+# provisions bots, ``notification`` delivers platform notices, ``____system``
+# and ``u_10000`` are reserved system identities. None of them owns a bot token
+# or an agent platform, so a DM from one is never addressed to the agent — but
+# delivering it still starts an agent turn, and the reply loops back through the
+# same account, burning model calls until the token budget is gone.
+#
+# Structured events (``group_md_updated`` and friends) still pass: system
+# accounts emit those legitimately and they are handled without the LLM below.
+_OCTO_SYSTEM_UIDS = frozenset({"botfather", "notification", "____system", "u_10000"})
+
 
 # SSRF / injection defenses for OCTO_API_URL, OCTO_CDN_URL, and chat_id.
 # OCTO_* URLs come from env/yaml and would otherwise let a tampered
@@ -2889,6 +2900,14 @@ class IdentityRuntime:
 
         # Skip self-messages
         if msg.from_uid == self._robot_id:
+            return
+
+        # Skip Octo system accounts (``botfather``/``notification``/...): they are
+        # platform plumbing, not users, and an agent reply to one loops back into
+        # the agent. Structured events are exempt — see ``_OCTO_SYSTEM_UIDS``.
+        if msg.from_uid in _OCTO_SYSTEM_UIDS and not (
+            isinstance(payload.event, dict) and payload.event.get("type")
+        ):
             return
 
         is_group = msg.channel_type in _GROUP_CHANNEL_TYPES
