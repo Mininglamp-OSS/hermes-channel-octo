@@ -2893,10 +2893,14 @@ class IdentityRuntime:
 
         is_group = msg.channel_type in _GROUP_CHANNEL_TYPES
 
-        # Handle GROUP.md events — don't pass to LLM
+        # Handle GROUP.md / THREAD.md events — don't pass to LLM
         event_type = (
             payload.event.get("type") if isinstance(payload.event, dict) else None
         )
+        if event_type == "thread_md_updated":
+            event_type = "group_md_updated"
+        elif event_type == "thread_md_deleted":
+            event_type = "group_md_deleted"
         if event_type in ("group_md_updated", "group_md_deleted") and msg.channel_id:
             self._handle_group_md_event(msg.channel_id, event_type)
             if event_type == "group_md_updated" and self._http_session:

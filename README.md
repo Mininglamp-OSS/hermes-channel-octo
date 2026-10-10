@@ -185,6 +185,15 @@ with the original token alone before adding other tokens again. This destructive
 reset discards pending card actions and durable route ownership; conversations
 bind again only from new trusted inbound messages.
 
+## Group and thread context
+
+`group_md_updated` and `thread_md_updated` events mark the target document stale
+and refresh it from the GROUP.md or THREAD.md API. Corresponding
+`group_md_deleted` and `thread_md_deleted` events remove the target document from
+memory and disk. A thread event preserves the parent group's and sibling threads'
+cached documents. These structured system events are handled before mention
+gating and never dispatched to Hermes, even when `mention.uids` includes the bot.
+
 ## Current-conversation tools
 
 When both required credentials are configured, the plugin registers:

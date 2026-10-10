@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hermes_octo_plugin import api
 from hermes_octo_plugin.adapter import OctoAdapter
+from hermes_octo_plugin.protocol import aes_encrypt
+from hermes_octo_plugin.types import ChannelType
 from tests.conftest import make_bare_adapter
 
 
@@ -294,6 +299,160 @@ class TestHandleGroupMdEvent:
         # Parent invalidated, thread record kept
         assert "g1" not in a._group_md_checked
         assert "g1____t1" in a._group_md_checked
+
+
+@pytest.mark.asyncio
+class TestMdEventReception:
+    @pytest.fixture
+    def receiver(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        a = _make_adapter()
+        a._robot_id = "bot1"
+        a._uid_to_name = {"bot1": "Bot", "user1": "User"}
+        a._aes_key = "0123456789abcdef"
+        a._aes_iv = "abcdef0123456789"
+        a._group_md_cache = {
+            "g1": {"content": "old group", "version": 11},
+            "g1____t1": {"content": "old thread", "version": 11},
+            "g1____t2": {"content": "sibling thread", "version": 4},
+        }
+        a._group_md_checked = set(a._group_md_cache)
+        for key, md in a._group_md_cache.items():
+            a._write_md_to_disk(key, md["content"], md["version"])
+        documents = {
+            ("g1", None): {"content": "fresh group", "version": 12},
+            ("g1", "t1"): {"content": "fresh thread", "version": 12},
+        }
+
+        async def get_group_md(_session, _url, _token, group_no):
+            return documents[(group_no, None)]
+
+        async def get_thread_md(_session, _url, _token, *, group_no, short_id):
+            return documents[(group_no, short_id)]
+
+        monkeypatch.setattr(api, "get_group_md", get_group_md)
+        monkeypatch.setattr(api, "get_thread_md", get_thread_md)
+        monkeypatch.setattr(api, "get_group_members", AsyncMock(return_value=[]))
+        monkeypatch.setattr(api, "get_channel_messages", AsyncMock(return_value=[]))
+        monkeypatch.setattr(api, "send_read_receipt", AsyncMock())
+        monkeypatch.setattr(api, "send_typing", AsyncMock())
+        a.build_source = MagicMock(return_value=SimpleNamespace())
+        a.handle_message = AsyncMock()
+
+        async def receive(payload, channel_id="g1____t1"):
+            recv = SimpleNamespace(
+                message_id="md-event",
+                message_seq=1,
+                from_uid="user1",
+                channel_id=channel_id,
+                channel_type=(
+                    ChannelType.CommunityTopic
+                    if "____" in channel_id
+                    else ChannelType.Group
+                ),
+                timestamp=0,
+                encrypted_payload=aes_encrypt(
+                    json.dumps(payload), a._aes_key, a._aes_iv
+                ).encode("ascii"),
+            )
+            tasks = []
+            create_task = asyncio.create_task
+
+            def schedule(coro):
+                task = create_task(coro)
+                tasks.append(task)
+                return task
+
+            with patch("hermes_octo_plugin.adapter.asyncio.create_task", new=schedule):
+                await a._handle_recv(recv)
+            await asyncio.gather(*tasks)
+
+        return a, receive
+
+    @pytest.mark.parametrize("mentioned", [True, False])
+    @pytest.mark.parametrize(
+        "event_type, target, expected_content",
+        [
+            ("thread_md_updated", "g1____t1", "fresh thread"),
+            ("group_md_updated", "g1", "fresh group"),
+            ("group_md_updated", "g1____t1", "fresh thread"),
+        ],
+    )
+    async def test_update_refreshes_target_without_dispatch(
+        self, receiver, event_type, target, expected_content, mentioned
+    ):
+        a, receive = receiver
+        untouched = {key: value for key, value in a._group_md_cache.items() if key != target}
+        payload = {
+            "type": 1,
+            "content": "Thread GROUP.md updated",
+            "event": {
+                "type": event_type,
+                "group_no": "g1",
+                "updated_by": "user1",
+                "version": 12,
+            },
+            "mention": {"uids": ["bot1"]} if mentioned else {},
+        }
+        if target == "g1____t1":
+            payload["event"]["short_id"] = "t1"
+        await receive(payload, target)
+
+        a.handle_message.assert_not_awaited()
+        assert a._group_md_cache[target] == {"content": expected_content, "version": 12}
+        assert a._read_md_from_disk(target) == {"content": expected_content, "version": 12}
+        assert target not in a._group_md_checked
+        assert all(a._group_md_cache[key] == value for key, value in untouched.items())
+        assert all(key in a._group_md_checked for key in untouched)
+        assert target not in a._group_histories
+
+    @pytest.mark.parametrize("mentioned", [True, False])
+    @pytest.mark.parametrize(
+        "event_type, target",
+        [
+            ("thread_md_deleted", "g1____t1"),
+            ("group_md_deleted", "g1"),
+            ("group_md_deleted", "g1____t1"),
+        ],
+    )
+    async def test_delete_clears_target_without_dispatch(
+        self, receiver, event_type, target, mentioned
+    ):
+        a, receive = receiver
+        untouched = {key: value for key, value in a._group_md_cache.items() if key != target}
+        payload = {
+            "type": 1,
+            "content": "Thread GROUP.md deleted",
+            "event": {"type": event_type, "group_no": "g1", "updated_by": "user1"},
+            "mention": {"uids": ["bot1"]} if mentioned else {},
+        }
+        if target == "g1____t1":
+            payload["event"]["short_id"] = "t1"
+        await receive(payload, target)
+
+        a.handle_message.assert_not_awaited()
+        assert target not in a._group_md_cache
+        assert target not in a._group_md_checked
+        assert a._read_md_from_disk(target) is None
+        assert all(a._group_md_cache[key] == value for key, value in untouched.items())
+        assert all(key in a._group_md_checked for key in untouched)
+        assert target not in a._group_histories
+
+    @pytest.mark.parametrize("mentioned", [True, False])
+    async def test_ordinary_message_obeys_mention_gate(self, receiver, mentioned):
+        a, receive = receiver
+        await receive({
+            "type": 1,
+            "content": "hello",
+            "mention": {"uids": ["bot1"]} if mentioned else {},
+        })
+
+        if mentioned:
+            a.handle_message.assert_awaited_once()
+            assert a.handle_message.await_args.args[0].text == "hello"
+        else:
+            a.handle_message.assert_not_awaited()
+            assert a._group_histories["g1____t1"][0]["body"] == "hello"
 
 
 # ─── _refresh_group_md routes to the right API ───────────────────────────────
