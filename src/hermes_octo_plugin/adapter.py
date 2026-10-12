@@ -458,15 +458,22 @@ PROGRESS_CARD_RENDERERS = frozenset({"local", "registry"})
 _GROUP_CHANNEL_TYPES = frozenset([ChannelType.Group, ChannelType.CommunityTopic])
 
 # Octo platform plumbing accounts. These are not real users: ``botfather``
-# provisions bots, ``notification`` delivers platform notices, ``____system``
-# and ``u_10000`` are reserved system identities. None of them owns a bot token
-# or an agent platform, so a DM from one is never addressed to the agent — but
-# delivering it still starts an agent turn, and the reply loops back through the
-# same account, burning model calls until the token budget is gone.
+# provisions bots, ``notification`` delivers platform notices, ``fileHelper``
+# is the file assistant, and ``____system`` / ``u_10000`` are reserved system
+# identities. None of them owns a bot token or an agent platform, so a message
+# from one is never addressed to the agent — but delivering it still starts an
+# agent turn, and the reply loops back through the same account, burning model
+# calls until the token budget is gone.
+#
+# Membership is tested against the *base* uid: Octo carries Space membership
+# inline (``s14_botfather``), so the raw wire uid is normalized first.
 #
 # Structured events (``group_md_updated`` and friends) still pass: system
-# accounts emit those legitimately and they are handled without the LLM below.
-_OCTO_SYSTEM_UIDS = frozenset({"botfather", "notification", "____system", "u_10000"})
+# accounts emit those legitimately, and the guard below sits *after* the
+# structured-event block, so such frames are handled and return before it.
+_OCTO_SYSTEM_UIDS = frozenset(
+    {"botfather", "notification", "fileHelper", "____system", "u_10000"}
+)
 
 
 # SSRF / injection defenses for OCTO_API_URL, OCTO_CDN_URL, and chat_id.
@@ -2902,14 +2909,6 @@ class IdentityRuntime:
         if msg.from_uid == self._robot_id:
             return
 
-        # Skip Octo system accounts (``botfather``/``notification``/...): they are
-        # platform plumbing, not users, and an agent reply to one loops back into
-        # the agent. Structured events are exempt — see ``_OCTO_SYSTEM_UIDS``.
-        if msg.from_uid in _OCTO_SYSTEM_UIDS and not (
-            isinstance(payload.event, dict) and payload.event.get("type")
-        ):
-            return
-
         is_group = msg.channel_type in _GROUP_CHANNEL_TYPES
 
         # Handle GROUP.md events — don't pass to LLM
@@ -2920,6 +2919,23 @@ class IdentityRuntime:
             self._handle_group_md_event(msg.channel_id, event_type)
             if event_type == "group_md_updated" and self._http_session:
                 asyncio.create_task(self._refresh_group_md(msg.channel_id))
+            return
+
+        # Skip Octo system accounts (``botfather``/``notification``/...): they are
+        # platform plumbing, not users, and an agent reply to one loops back into
+        # the agent. This sits *after* the structured-event block above instead of
+        # exempting event frames inside the predicate, so the carve-out is
+        # structural: whatever that block handles has already returned, including
+        # frames it does not know (unknown ``event.type``) or cannot use (empty
+        # ``channel_id``) — both of which used to fall through to the LLM path.
+        # Compared on the base uid, because Octo carries Space membership inline
+        # in the uid (``s14_botfather``) — see ``_extract_base_uid``.
+        if _extract_base_uid(msg.from_uid) in _OCTO_SYSTEM_UIDS:
+            logger.debug(
+                "[%s] Dropping inbound from Octo system account: from_uid=%s",
+                self.name,
+                msg.from_uid,
+            )
             return
 
         wire_chat_id = msg.channel_id
