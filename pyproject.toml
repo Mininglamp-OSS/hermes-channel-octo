@@ -20,9 +20,9 @@ classifiers = [
 ]
 dependencies = [
   # Floor follows hermes-agent's pre-1.0 ceiling rule: <0.(current_minor + 1).
-  # Verified against hermes-agent 0.21.0, so accept the 0.21 line while
-  # keeping 0.22+ behind an explicit compatibility validation.
-  "hermes-agent>=0.14,<0.22",
+  # Verified against hermes-agent 0.22.0, so accept the 0.22 line while
+  # keeping 0.23+ behind an explicit compatibility validation.
+  "hermes-agent>=0.14,<0.23",
   # Octo runtime deps. Floor = current pinned upstream version (known-good);
   # ceiling = next major (SemVer-respecting libraries).
   "websockets>=15.0,<16",

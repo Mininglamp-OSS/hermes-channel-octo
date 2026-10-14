@@ -14,11 +14,11 @@ Hermes buffers text replies and sends one complete final message.
 
 | hermes-agent | hermes-channel-octo |
 |---|---|
-| `>=0.14,<0.22` | `0.1.x` |
+| `>=0.14,<0.23` | `0.1.x` |
 
 ## Install
 
-The plugin is verified against `hermes-agent==0.21.0`; the lower bound remains
+The plugin is verified against `hermes-agent==0.22.0`; the lower bound remains
 `0.14` for existing installations. Native interactive `send_clarify` cards are
 disabled on every supported Hermes version; clarifies use Hermes' plain-text
 fallback so users are never required to resolve a card action.
