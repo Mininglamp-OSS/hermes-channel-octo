@@ -5165,12 +5165,12 @@ class OctoAdapter(BasePlatformAdapter):
         # Endpoint is also read directly by diagnostics that never send.
         self._api_url = api_url
 
-        self._state_base_dir = state_base_dir
         self._identity_state = IdentityStateStore(
             base_dir=None if state_base_dir is None else Path(state_base_dir) / "identity"
         )
+        self._state_base_dir = self._identity_state.directory.parent
         self._runtimes: tuple[IdentityRuntime, ...] = tuple(
-            IdentityRuntime(self, token, self._shared, state_base_dir=state_base_dir)
+            IdentityRuntime(self, token, self._shared, state_base_dir=self._state_base_dir)
             for token in self._bot_tokens
         )
         self._runtimes_by_robot_id: dict[str, IdentityRuntime] = {}

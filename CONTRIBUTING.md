@@ -34,7 +34,7 @@ pytest
 ```
 
 CI runs the same checks across Python 3.11, 3.12, and 3.14, including an
-import check for the Hermes gateway APIs.
+import check for the Hermes gateway APIs. A separate job tests Hermes 0.14.0.
 
 ## Code style
 
