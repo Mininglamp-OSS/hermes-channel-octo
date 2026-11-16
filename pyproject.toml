@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "hermes-agent>=0.14,<0.24; python_version < '3.14'",
+  "hermes-agent>=0.14,<0.24",
   "packaging>=24,<27",
   "pytest>=9.0,<10",
   "pytest-asyncio>=1.3,<2",

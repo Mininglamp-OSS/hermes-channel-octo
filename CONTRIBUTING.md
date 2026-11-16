@@ -33,7 +33,8 @@ ruff check .
 pytest
 ```
 
-CI runs the same two commands across Python 3.11 and 3.12.
+CI runs the same checks across Python 3.11, 3.12, and 3.14, including an
+import check for the Hermes gateway APIs.
 
 ## Code style
 

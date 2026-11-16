@@ -93,6 +93,11 @@ def test_data_files_ship_in_wheel(tmp_path):
         if line.startswith("Requires-Dist: ")
     ]
     assert all(req.name != "hermes-agent" or req.marker is not None for req in requirements)
+    hermes = next(req for req in requirements if req.name == "hermes-agent")
+    assert hermes.marker is not None
+    for version in ("3.11", "3.12", "3.14"):
+        assert hermes.marker.evaluate({"extra": "dev", "python_version": version})
+    assert not hermes.marker.evaluate({"extra": "", "python_version": "3.14"})
     crypto = next(req for req in requirements if req.name == "cryptography")
     assert Version("46.0.7") in crypto.specifier
     assert Version("50.0.2") in crypto.specifier
