@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from typing import Any
 
 
 
 from . import api, cards
+from .env import scoped_env
 from .mention import _utf16_length, parse_structured_mentions
 from .card_tools import (
     DISPLAY_BLOCK_SCHEMA,
@@ -518,7 +518,7 @@ async def octo_send_video_handler(args: dict[str, Any], **_kwargs: Any) -> str:
 
 
 def _edit_profile_enabled(manifest: CardProfileManifest) -> bool:
-    configured = os.getenv("OCTO_CARD_MESSAGE_ENABLED") == "1"
+    configured = scoped_env("OCTO_CARD_MESSAGE_ENABLED", "") == "1"
     if not cards.card_delivery_enabled(manifest, configured_enabled=configured):
         return False
     if manifest.available:

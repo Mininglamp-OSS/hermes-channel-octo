@@ -100,6 +100,27 @@ def test_register_without_env_only_registers_platform(monkeypatch):
     assert ctx.hooks == []
 
 
+def test_register_with_scoped_secondary_credentials(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    pytest.importorskip("gateway.platforms._shared")
+    monkeypatch.delenv("OCTO_API_URL", raising=False)
+    monkeypatch.delenv("OCTO_BOT_TOKEN", raising=False)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({
+        "OCTO_API_URL": "https://secondary.example.test",
+        "OCTO_BOT_TOKEN": "secondary-token",
+    })
+    try:
+        ctx = FakeCtx()
+        hermes_octo_plugin.register(ctx)
+        assert any(tool["name"] == "octo_management" for tool in ctx.tools)
+        assert ctx.skills
+        assert ctx.commands
+    finally:
+        scope.reset_secret_scope(token)
+        scope.set_multiplex_active(False)
+
+
 def test_register_with_env_wires_full_surface(monkeypatch):
     """Configured plugins expose management and current-conversation card tools."""
     monkeypatch.setenv("OCTO_API_URL", "http://localhost:1")
