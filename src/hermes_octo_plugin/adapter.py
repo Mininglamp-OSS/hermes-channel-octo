@@ -37,6 +37,7 @@ from .clarify import (
     deliver as _deliver_clarify,
     native_clarify_supported as _native_clarify_supported,
 )
+from .env import scoped_env
 from .identity import (
     BIND_BOUND,
     BIND_CAPACITY,
@@ -78,6 +79,7 @@ from .transport import (
     is_private_or_metadata_host as _is_private_or_metadata_host,
     new_guarded_http_session as _new_guarded_http_session,
     open_guarded_websocket_socket as _open_guarded_websocket_socket,
+    private_hosts_enabled as _private_hosts_enabled,
 )
 from .protocol import (
     PROTO_VERSION,
@@ -496,11 +498,7 @@ def _validate_octo_endpoint(
         raise ValueError(
             f"{name} points at blocked metadata host {parsed.hostname!r} (SSRF guard)."
         )
-    allow_private = os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    allow_private = _private_hosts_enabled()
     if not allow_private and _is_private_or_metadata_host(hostname):
         raise ValueError(
             f"{name} points at private/loopback host {parsed.hostname!r}. "
@@ -635,21 +633,21 @@ def _is_connected(cfg) -> bool:
     """Is the platform fully configured to connect? Both bot_token and
     api_url must be present — token alone isn't useful without an endpoint."""
     extra = getattr(cfg, "extra", None) or {}
-    has_token = bool(extra.get("bot_token") or os.getenv("OCTO_BOT_TOKEN"))
-    has_url = bool(extra.get("api_url") or os.getenv("OCTO_API_URL"))
+    has_token = bool(extra.get("bot_token") or scoped_env("OCTO_BOT_TOKEN"))
+    has_url = bool(extra.get("api_url") or scoped_env("OCTO_API_URL"))
     return has_token and has_url
 
 
 def _env_enablement() -> dict | None:
-    bot_token = os.getenv("OCTO_BOT_TOKEN")
+    bot_token = scoped_env("OCTO_BOT_TOKEN")
     if not bot_token:
         return None
     result: dict = {"bot_token": bot_token}
-    if api_url := os.getenv("OCTO_API_URL"):
+    if api_url := scoped_env("OCTO_API_URL"):
         result["api_url"] = api_url
-    if cdn_url := os.getenv("OCTO_CDN_URL"):
+    if cdn_url := scoped_env("OCTO_CDN_URL"):
         result["cdn_url"] = cdn_url
-    if home := os.getenv("OCTO_HOME_CHANNEL"):
+    if home := scoped_env("OCTO_HOME_CHANNEL"):
         # gateway/config.py unpacks this into a HomeChannel dataclass when
         # synthesising the platform config from env.
         result["home_channel"] = {"chat_id": home}
@@ -771,16 +769,16 @@ async def _standalone_send(
     from .types import ChannelType as _ChannelType
 
     extra = getattr(pconfig, "extra", None) or {}
-    api_url = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
+    api_url = extra.get("api_url") or scoped_env("OCTO_API_URL", "")
     raw_bot_token = (
         extra.get("bot_token")
         or getattr(pconfig, "token", "")
-        or os.getenv("OCTO_BOT_TOKEN", "")
+        or scoped_env("OCTO_BOT_TOKEN", "")
     )
     configured_on_behalf_of = (
         extra.get("on_behalf_of")
         if "on_behalf_of" in extra
-        else os.getenv("OCTO_ON_BEHALF_OF")
+        else scoped_env("OCTO_ON_BEHALF_OF")
     )
     if configured_on_behalf_of is not None and not isinstance(
         configured_on_behalf_of, str
@@ -5086,17 +5084,17 @@ class OctoAdapter(BasePlatformAdapter):
         super().__init__(config, _octo_platform())
 
         extra = config.extra or {}
-        api_url: str = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
-        ws_url: str = extra.get("ws_url") or os.getenv("OCTO_WS_URL", "")
+        api_url: str = extra.get("api_url") or scoped_env("OCTO_API_URL", "")
+        ws_url: str = extra.get("ws_url") or scoped_env("OCTO_WS_URL", "")
         # Optional CDN base URL. When set, _build_media_url returns
         # <cdn_url>/<relative_path> instead of <api_url>/file/<relative_path>
         # — lets the agent fetch media from a public-read CDN without
         # routing every download through the bot API server.
-        cdn_url: str = extra.get("cdn_url") or os.getenv("OCTO_CDN_URL", "")
+        cdn_url: str = extra.get("cdn_url") or scoped_env("OCTO_CDN_URL", "")
 
         raw_bot_token = extra.get("bot_token")
         if raw_bot_token is None:
-            raw_bot_token = os.getenv("OCTO_BOT_TOKEN", "")
+            raw_bot_token = scoped_env("OCTO_BOT_TOKEN", "")
         # Raises TokenConfigError (never echoing a token) for empty entries and
         # repeated tokens; an absent value yields () so an unconfigured platform
         # still constructs and reports "must be set" at connect time.
@@ -5104,13 +5102,13 @@ class OctoAdapter(BasePlatformAdapter):
 
         configured_on_behalf_of = extra.get("on_behalf_of")
         if configured_on_behalf_of is None:
-            configured_on_behalf_of = os.getenv("OCTO_ON_BEHALF_OF", "")
+            configured_on_behalf_of = scoped_env("OCTO_ON_BEHALF_OF", "")
         if not isinstance(configured_on_behalf_of, str):
             raise ValueError("on_behalf_of must be a string")
 
         configured_menu_max_chars = extra.get("command_menu_max_chars")
         if configured_menu_max_chars is None:
-            configured_menu_max_chars = os.getenv(
+            configured_menu_max_chars = scoped_env(
                 "OCTO_COMMAND_MENU_MAX_CHARS",
                 str(DEFAULT_COMMAND_MENU_MAX_CHARS),
             )
@@ -5124,16 +5122,16 @@ class OctoAdapter(BasePlatformAdapter):
 
         event_interval = extra.get("event_poll_interval_s")
         if event_interval is None:
-            event_interval = os.getenv("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
+            event_interval = scoped_env("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
         event_wait = extra.get("event_poll_wait_s")
         if event_wait is None:
-            event_wait = os.getenv("OCTO_EVENT_POLL_WAIT_S", "25")
+            event_wait = scoped_env("OCTO_EVENT_POLL_WAIT_S", "25")
         event_limit = extra.get("event_poll_limit")
         if event_limit is None:
-            event_limit = os.getenv("OCTO_EVENT_POLL_LIMIT", "50")
+            event_limit = scoped_env("OCTO_EVENT_POLL_LIMIT", "50")
         progress_renderer = extra.get("progress_card_renderer")
         if progress_renderer is None:
-            progress_renderer = os.getenv("OCTO_PROGRESS_CARD_RENDERER", "local")
+            progress_renderer = scoped_env("OCTO_PROGRESS_CARD_RENDERER", "local")
         if (
             not isinstance(progress_renderer, str)
             or progress_renderer not in PROGRESS_CARD_RENDERERS
@@ -5167,12 +5165,12 @@ class OctoAdapter(BasePlatformAdapter):
         # Endpoint is also read directly by diagnostics that never send.
         self._api_url = api_url
 
-        self._state_base_dir = state_base_dir
         self._identity_state = IdentityStateStore(
             base_dir=None if state_base_dir is None else Path(state_base_dir) / "identity"
         )
+        self._state_base_dir = self._identity_state.directory.parent
         self._runtimes: tuple[IdentityRuntime, ...] = tuple(
-            IdentityRuntime(self, token, self._shared, state_base_dir=state_base_dir)
+            IdentityRuntime(self, token, self._shared, state_base_dir=self._state_base_dir)
             for token in self._bot_tokens
         )
         self._runtimes_by_robot_id: dict[str, IdentityRuntime] = {}
@@ -5992,7 +5990,9 @@ def register(ctx) -> None:
     UIs (matching IRC/Teams/Line behaviour). Once both env vars are set,
     a gateway restart will rerun this register() and add the full set.
     """
-    _bot_configured = bool(os.getenv("OCTO_BOT_TOKEN") and os.getenv("OCTO_API_URL"))
+    _bot_configured = bool(
+        scoped_env("OCTO_BOT_TOKEN") and scoped_env("OCTO_API_URL")
+    )
     if not _bot_configured:
         logger.info(
             "[Octo] OCTO_API_URL/OCTO_BOT_TOKEN not both set — skipping "

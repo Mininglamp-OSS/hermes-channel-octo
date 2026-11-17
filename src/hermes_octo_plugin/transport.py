@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import os
 import socket
 import threading
 from typing import Any
@@ -15,6 +14,8 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
 
 from yarl import URL
+
+from .env import scoped_flag
 
 _METADATA_HOSTS = frozenset({
     "169.254.169.254",
@@ -28,7 +29,7 @@ _METADATA_HOSTS = frozenset({
 
 def private_hosts_enabled() -> bool:
     """Return whether the operator explicitly trusts configured private origins."""
-    return os.getenv("OCTO_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes"}
+    return scoped_flag("OCTO_ALLOW_PRIVATE_HOSTS")
 
 
 

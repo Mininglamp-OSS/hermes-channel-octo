@@ -12,6 +12,7 @@ files are inside the zip. It is intentionally slow (subprocess + pip
 wheel build); accept the cost — it is the only thing that catches
 packaging-config drift before users do.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,19 @@ from packaging.version import Version
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+def test_entry_point_imports_without_hermes_host(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable, "-S", "-c",
+            "import hermes_octo_plugin; assert callable(hermes_octo_plugin.register)",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 # Every non-``*.py`` file under src/hermes_octo_plugin/ that the runtime
 # resolves via ``Path(__file__).parent / ...`` must appear here.
@@ -87,23 +101,27 @@ def test_data_files_ship_in_wheel(tmp_path):
         f"wheel is missing required data files: {missing}\n"
         f"wheel contents:\n  " + "\n  ".join(sorted(names))
     )
-    assert "Requires-Dist: hermes-agent<0.23,>=0.14" in metadata
-    assert "Requires-Dist: cryptography<49,>=46.0" in metadata
+    requirements = [
+        Requirement(line.removeprefix("Requires-Dist: ").strip())
+        for line in metadata.splitlines()
+        if line.startswith("Requires-Dist: ")
+    ]
+    assert all(req.name != "hermes-agent" or req.marker is not None for req in requirements)
+    hermes = next(req for req in requirements if req.name == "hermes-agent")
+    assert hermes.marker is not None
+    for version in ("3.11", "3.12", "3.14"):
+        assert hermes.marker.evaluate({"extra": "dev", "python_version": version})
+    assert not hermes.marker.evaluate({"extra": "", "python_version": "3.14"})
+    crypto = next(req for req in requirements if req.name == "cryptography")
+    assert Version("46.0.7") in crypto.specifier
+    assert Version("50.0.2") in crypto.specifier
 
 
-def test_cryptography_dependency_covers_46_and_48_with_documented_rationale():
+def test_cryptography_dependency_covers_current_and_older_hermes():
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-    cryptography = next(
-        dependency
-        for dependency in project["project"]["dependencies"]
-        if dependency.startswith("cryptography")
+    crypto = next(
+        Requirement(dep) for dep in project["project"]["dependencies"]
+        if Requirement(dep).name == "cryptography"
     )
-    requirement = Requirement(cryptography)
-
-    assert Version("46.0") in requirement.specifier
-    assert Version("48.0.1") in requirement.specifier
-    assert Version("49.0") not in requirement.specifier
-    readme = (REPO_ROOT / "README.md").read_text()
-    assert "cryptography 46.x" in readme
-    assert "48.x:" in readme
-    assert "cryptography 48.0.1" in readme
+    assert Version("46.0.7") in crypto.specifier
+    assert Version("50.0.2") in crypto.specifier

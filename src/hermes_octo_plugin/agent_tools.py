@@ -92,19 +92,47 @@ def _valid_target_channel_id(channel_id: str, channel_type: ChannelType) -> bool
 
 
 def _resolve_adapter():
-    """Return the live Octo adapter from the running gateway, or None."""
+    """Return the Octo adapter that answers the current turn, or None.
+
+    Multi-profile Hermes binds the trusted route and session key of the
+    calling turn; the adapter that owns that conversation must answer it,
+    never the process-wide default.  A turn with no trusted source, or one
+    from another platform, fails closed; so does a route-aware runner whose
+    trusted-route API is absent.  Only a runner without the delivery seam —
+    single-profile Hermes — keeps its per-platform adapter map authoritative.
+    """
     try:
         from gateway.config import Platform
         from gateway.run import _gateway_runner_ref
+
+        platform = Platform("octo")
     except Exception:
         return None
     runner = _gateway_runner_ref()
     if runner is None:
         return None
+    delivery_adapter_for = getattr(runner, "_delivery_adapter_for", None)
+    if delivery_adapter_for is None:
+        return runner.adapters.get(platform)
     try:
-        return runner.adapters.get(Platform("octo"))
-    except Exception:
+        from gateway.plugin_messages import bound_route
+        from gateway.session_context import bound_session_key
+    except ImportError:
         return None
+    route = bound_route()
+    session_key = bound_session_key()
+    entry = runner.session_store.lookup_by_session_key(session_key)
+    if entry is not None and entry.origin is not None:
+        from gateway.session_identity import replace_source
+
+        source = replace_source(runner._restored_source(entry))
+    elif route is not None and runner._session_key_for_source(route) == session_key:
+        source = route
+    else:
+        return None
+    if source.platform != platform:
+        return None
+    return delivery_adapter_for(source)
 
 
 def _resolve_runtime():

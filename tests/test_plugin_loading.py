@@ -79,6 +79,12 @@ def test_entry_point_loads_to_register_callable():
     assert callable(getattr(loaded, "register", None))
 
 
+def test_public_adapter_export_resolves_to_host_adapter():
+    from hermes_octo_plugin.adapter import OctoAdapter
+
+    assert hermes_octo_plugin.OctoAdapter is OctoAdapter
+
+
 # ---------- register() behaviour ----------
 
 
@@ -98,6 +104,27 @@ def test_register_without_env_only_registers_platform(monkeypatch):
     assert ctx.skills == []
     assert ctx.commands == []
     assert ctx.hooks == []
+
+
+def test_register_with_scoped_secondary_credentials(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    pytest.importorskip("gateway.platforms._shared")
+    monkeypatch.delenv("OCTO_API_URL", raising=False)
+    monkeypatch.delenv("OCTO_BOT_TOKEN", raising=False)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({
+        "OCTO_API_URL": "https://secondary.example.test",
+        "OCTO_BOT_TOKEN": "secondary-token",
+    })
+    try:
+        ctx = FakeCtx()
+        hermes_octo_plugin.register(ctx)
+        assert any(tool["name"] == "octo_management" for tool in ctx.tools)
+        assert ctx.skills
+        assert ctx.commands
+    finally:
+        scope.reset_secret_scope(token)
+        scope.set_multiplex_active(False)
 
 
 def test_register_with_env_wires_full_surface(monkeypatch):

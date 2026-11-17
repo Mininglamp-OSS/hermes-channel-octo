@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +14,7 @@ from .agent_tools import (
     _resolve_runtime,
     _valid_target_channel_id,
 )
+from .env import scoped_env
 from .types import (
     CARD_PROFILE_V1,
     CARD_PROFILE_V2,
@@ -306,7 +306,7 @@ async def _get_card_profile(adapter: Any, session: Any) -> CardProfileManifest:
 
 
 def _profile_enabled(manifest: CardProfileManifest, profile: str) -> bool:
-    configured_enabled = os.getenv("OCTO_CARD_MESSAGE_ENABLED") == "1"
+    configured_enabled = scoped_env("OCTO_CARD_MESSAGE_ENABLED", "") == "1"
     if not cards.card_delivery_enabled(
         manifest,
         configured_enabled=configured_enabled,

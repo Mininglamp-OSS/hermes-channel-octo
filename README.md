@@ -14,14 +14,17 @@ Hermes buffers text replies and sends one complete final message.
 
 | hermes-agent | hermes-channel-octo |
 |---|---|
-| `>=0.14,<0.23` | `0.1.x` |
+| `>=0.14` and current source installations | `0.2.x` |
 
 ## Install
 
-The plugin is verified against `hermes-agent==0.22.0`; the lower bound remains
-`0.14` for existing installations. Native interactive `send_clarify` cards are
-disabled on every supported Hermes version; clarifies use Hermes' plain-text
-fallback so users are never required to resolve a card action.
+The lower bound remains `0.14` for existing installations. Native interactive
+`send_clarify` cards use Hermes' plain-text fallback.
+
+Install the plugin into an existing Hermes environment. Hermes is supplied by
+the host rather than installed as a runtime dependency.
+The package entry point can be imported independently; registering the channel
+requires the Hermes host.
 
 All commands below assume `HERMES_HOME` points at the hermes install you
 want to wire the plugin into, and that you invoke the matching `hermes`
@@ -60,15 +63,13 @@ $HERMES plugins enable octo
 
 # bundled-plugin protocol does NOT install pyproject deps — install manually:
 $PIP install 'websockets>=15.0,<16' 'aiohttp>=3.13,<4' \
-             'cryptography>=46.0,<49' 'python-socks>=2.8,<3' \
+             'cryptography>=46.0,<51' 'python-socks>=2.8,<3' \
              'packaging>=24,<27'
 
 ```
 
-The `cryptography>=46,<49` range intentionally supports cryptography 46.x and
-48.x: 46.x remains compatible with supported older runtimes, while Hermes 0.21
-is verified with cryptography 48.0.1. Version 49 is excluded pending a
-dedicated compatibility check.
+The `cryptography>=46,<51` range accommodates both older Hermes installations
+and current Hermes releases that pin cryptography 50.x.
 
 `hermes plugins install` clones into `$HERMES_HOME/plugins/octo/` (the
 directory name comes from `plugin.yaml`'s `name:` field, not the repo
@@ -79,7 +80,8 @@ Prefer the pip path unless you need the in-tree clone for local hacking.
 
 ## Configuration
 
-Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
+Set the following in each profile's `$HERMES_HOME/.env` (or via `hermes config`).
+For a multiplexed gateway, configure each served profile separately.
 
 | Variable | Required | Purpose |
 |---|---|---|
