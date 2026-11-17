@@ -79,6 +79,12 @@ def test_entry_point_loads_to_register_callable():
     assert callable(getattr(loaded, "register", None))
 
 
+def test_public_adapter_export_resolves_to_host_adapter():
+    from hermes_octo_plugin.adapter import OctoAdapter
+
+    assert hermes_octo_plugin.OctoAdapter is OctoAdapter
+
+
 # ---------- register() behaviour ----------
 
 

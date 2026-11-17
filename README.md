@@ -23,6 +23,8 @@ The lower bound remains `0.14` for existing installations. Native interactive
 
 Install the plugin into an existing Hermes environment. Hermes is supplied by
 the host rather than installed as a runtime dependency.
+The package entry point can be imported independently; registering the channel
+requires the Hermes host.
 
 All commands below assume `HERMES_HOME` points at the hermes install you
 want to wire the plugin into, and that you invoke the matching `hermes`

@@ -46,3 +46,15 @@ jobs:
         run: pip install -e ".[dev]" "hermes-agent==0.14.0"
       - name: Test (pytest)
         run: pytest
+
+  production-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install production package
+        run: pip install .
+      - name: Load plugin entry point
+        run: python -c "from importlib.metadata import entry_points; ep = next(ep for ep in entry_points(group='hermes_agent.plugins') if ep.name == 'octo'); assert callable(ep.load().register)"

@@ -12,6 +12,7 @@ files are inside the zip. It is intentionally slow (subprocess + pip
 wheel build); accept the cost — it is the only thing that catches
 packaging-config drift before users do.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,19 @@ from packaging.version import Version
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+def test_entry_point_imports_without_hermes_host(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable, "-S", "-c",
+            "import hermes_octo_plugin; assert callable(hermes_octo_plugin.register)",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 # Every non-``*.py`` file under src/hermes_octo_plugin/ that the runtime
 # resolves via ``Path(__file__).parent / ...`` must appear here.
